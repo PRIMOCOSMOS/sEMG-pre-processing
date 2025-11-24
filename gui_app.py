@@ -232,7 +232,7 @@ def create_gui():
     
     processor = EMGProcessorGUI()
     
-    with gr.Blocks(title="sEMG Signal Preprocessing", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="sEMG Signal Preprocessing") as app:
         gr.Markdown("""
         # 🔬 sEMG Signal Preprocessing Toolkit
         ## 表面肌电信号预处理工具
