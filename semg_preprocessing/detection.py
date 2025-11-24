@@ -204,7 +204,7 @@ def _detect_combined(
     amplitude_threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
-    **ruptures_kwargs
+    **kwargs
 ) -> List[Tuple[int, int]]:
     """
     Detect muscle activity using combined ruptures and amplitude approach.
@@ -224,14 +224,19 @@ def _detect_combined(
         Window size for envelope calculation
     min_duration : float
         Minimum activity duration in seconds
-    **ruptures_kwargs : dict
-        Additional arguments for ruptures
+    **kwargs : dict
+        Additional arguments for ruptures (model, pen, min_size)
+        Note: use_clustering and adaptive_pen are ignored for this method
     
     Returns:
     --------
     List[Tuple[int, int]]
         Detected activity periods
     """
+    # Filter kwargs to only pass valid ruptures parameters
+    valid_ruptures_params = {'model', 'pen', 'min_size'}
+    ruptures_kwargs = {k: v for k, v in kwargs.items() if k in valid_ruptures_params}
+    
     # Get segments from both methods
     ruptures_segments = _detect_ruptures(data, fs, **ruptures_kwargs)
     amplitude_segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration)
@@ -529,7 +534,7 @@ def _extract_multi_features(data: np.ndarray, window_size: int) -> np.ndarray:
 
 def _calculate_sliding_variance(data: np.ndarray, window_size: int) -> np.ndarray:
     """
-    Calculate sliding window variance of the signal.
+    Calculate sliding window variance of the signal using efficient convolution.
     
     Parameters:
     -----------
@@ -543,14 +548,21 @@ def _calculate_sliding_variance(data: np.ndarray, window_size: int) -> np.ndarra
     np.ndarray
         Sliding variance
     """
-    variance = np.zeros(len(data))
-    half_window = window_size // 2
+    # Use convolution for efficient calculation
+    # Var(X) = E[X^2] - E[X]^2
+    kernel = np.ones(window_size) / window_size
     
-    for i in range(len(data)):
-        start = max(0, i - half_window)
-        end = min(len(data), i + half_window + 1)
-        window_data = data[start:end]
-        variance[i] = np.var(window_data)
+    # Calculate E[X] - mean
+    mean = np.convolve(data, kernel, mode='same')
+    
+    # Calculate E[X^2] - mean of squares
+    mean_sq = np.convolve(data ** 2, kernel, mode='same')
+    
+    # Variance = E[X^2] - E[X]^2
+    variance = mean_sq - mean ** 2
+    
+    # Handle numerical errors (variance should be >= 0)
+    variance = np.maximum(variance, 0)
     
     return variance
 

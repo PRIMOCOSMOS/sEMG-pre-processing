@@ -324,7 +324,15 @@ def create_gui():
             
             # Tab 3: Detect Activity
             with gr.Tab("🎯 Detect Activity / 检测肌肉活动"):
-                gr.Markdown("### Detect muscle activity segments")
+                gr.Markdown("""
+                ### Detect muscle activity segments
+                
+                **Note**: Detection time varies by method:
+                - `multi_feature`: ~1-2 seconds (recommended)
+                - `amplitude`: <1 second (fast)
+                - `combined`: ~8-10 seconds (slower but accurate)
+                - `ruptures`: ~8-10 seconds (change-point only)
+                """)
                 
                 with gr.Row():
                     with gr.Column(scale=1):
