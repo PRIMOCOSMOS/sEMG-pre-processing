@@ -36,7 +36,7 @@ def detect_muscle_activity(
     method : str, optional
         Detection method: 'ruptures', 'amplitude', or 'combined' (default: 'combined')
     amplitude_threshold : float, optional
-        Threshold for amplitude-based detection (default: auto-calculated as 3*std)
+        Threshold for amplitude-based detection (default: auto-calculated as 2*RMS)
     window_size : int, optional
         Window size for amplitude envelope calculation (default: fs/10)
     min_duration : float, optional

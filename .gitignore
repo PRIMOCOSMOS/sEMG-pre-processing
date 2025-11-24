@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Generated data files (keep sample data for examples)
+# Uncomment the following lines if you want to ignore all data files:
+# data/*.csv
+# data/*.png
