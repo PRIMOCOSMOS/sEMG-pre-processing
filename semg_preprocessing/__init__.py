@@ -23,6 +23,7 @@ from .detection import (
 from .utils import (
     load_csv_data,
     save_processed_data,
+    export_segments_to_csv,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "segment_signal",
     "load_csv_data",
     "save_processed_data",
+    "export_segments_to_csv",
 ]

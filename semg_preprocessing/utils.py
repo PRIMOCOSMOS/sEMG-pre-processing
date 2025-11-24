@@ -241,3 +241,103 @@ def split_into_windows(
         windows.append(window)
     
     return np.array(windows)
+
+
+def export_segments_to_csv(
+    data: np.ndarray,
+    segments: list,
+    fs: float,
+    output_dir: str,
+    prefix: str = "segment",
+    include_time: bool = True,
+    original_df: Optional[pd.DataFrame] = None
+) -> list:
+    """
+    Export detected muscle activity segments as individual CSV files.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal data
+    segments : list
+        List of (start_index, end_index) tuples or list of segment dicts
+    fs : float
+        Sampling frequency in Hz
+    output_dir : str
+        Directory to save segment CSV files
+    prefix : str, optional
+        Prefix for output filenames (default: 'segment')
+    include_time : bool, optional
+        Include time column in output (default: True)
+    original_df : pd.DataFrame, optional
+        Original dataframe to preserve additional columns
+    
+    Returns:
+    --------
+    list
+        List of saved file paths
+        
+    Examples:
+    ---------
+    >>> from semg_preprocessing import detect_muscle_activity, export_segments_to_csv
+    >>> segments = detect_muscle_activity(filtered_signal, fs=1000)
+    >>> files = export_segments_to_csv(filtered_signal, segments, fs=1000, 
+    ...                                 output_dir='./segments')
+    >>> print(f"Saved {len(files)} segment files")
+    """
+    import os
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    saved_files = []
+    
+    # Handle both list of tuples and list of dicts
+    for i, seg in enumerate(segments, 1):
+        if isinstance(seg, tuple):
+            start_idx, end_idx = seg
+            segment_data = data[start_idx:end_idx]
+        elif isinstance(seg, dict):
+            start_idx = seg['start_index']
+            end_idx = seg['end_index']
+            segment_data = seg['data']
+        else:
+            raise ValueError("Segments must be tuples (start, end) or dicts with 'start_index', 'end_index', 'data'")
+        
+        # Create filename
+        filename = f"{prefix}_{i:03d}.csv"
+        filepath = os.path.join(output_dir, filename)
+        
+        # Prepare data
+        output_df = pd.DataFrame()
+        
+        if include_time:
+            # Create time array relative to segment start
+            time = np.arange(len(segment_data)) / fs
+            output_df['Time (s)'] = time
+        
+        output_df['Signal'] = segment_data
+        
+        # Add metadata as header comments if segment is a dict
+        if isinstance(seg, dict) and 'duration' in seg:
+            # Write metadata as comments at the top
+            with open(filepath, 'w') as f:
+                f.write(f"# Segment {i}\n")
+                f.write(f"# Start time: {seg.get('start_time', start_idx/fs):.3f} s\n")
+                f.write(f"# End time: {seg.get('end_time', end_idx/fs):.3f} s\n")
+                f.write(f"# Duration: {seg.get('duration', (end_idx-start_idx)/fs):.3f} s\n")
+                if 'peak_amplitude' in seg:
+                    f.write(f"# Peak amplitude: {seg['peak_amplitude']:.4f}\n")
+                if 'rms' in seg:
+                    f.write(f"# RMS: {seg['rms']:.4f}\n")
+                f.write("#\n")
+                # Write the dataframe
+                output_df.to_csv(f, index=False)
+        else:
+            # Simple CSV without metadata
+            output_df.to_csv(filepath, index=False)
+        
+        saved_files.append(filepath)
+        print(f"Saved segment {i} to: {filepath}")
+    
+    return saved_files

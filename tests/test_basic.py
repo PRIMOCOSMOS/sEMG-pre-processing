@@ -76,7 +76,7 @@ def test_detection():
     burst2_end = int(1.7 * fs)
     signal[burst2_start:burst2_end] += 2.5 * np.random.randn(burst2_end - burst2_start)
     
-    # Detect activity with manual threshold
+    # Test amplitude method with manual threshold
     segments = detect_muscle_activity(
         signal, fs, 
         method='amplitude', 
@@ -88,7 +88,19 @@ def test_detection():
     assert all(isinstance(s, tuple) and len(s) == 2 for s in segments), "Segments should be tuples of (start, end)"
     assert all(s[1] > s[0] for s in segments), "End should be after start"
     
-    print(f"✓ Detection test passed ({len(segments)} segments detected)")
+    print(f"✓ Amplitude detection test passed ({len(segments)} segments detected)")
+    
+    # Test multi-feature method
+    segments_multi = detect_muscle_activity(
+        signal, fs,
+        method='multi_feature',
+        min_duration=0.1,
+        use_clustering=False,
+        adaptive_pen=True
+    )
+    
+    assert len(segments_multi) > 0, "Multi-feature should detect at least one segment"
+    print(f"✓ Multi-feature detection test passed ({len(segments_multi)} segments detected)")
 
 
 def test_segmentation():
@@ -138,6 +150,39 @@ def test_filter_parameters():
     print("✓ Parameter validation tests passed")
 
 
+def test_export_segments():
+    """Test segment export functionality."""
+    import tempfile
+    import shutil
+    
+    fs = 1000.0
+    signal = np.random.randn(5000)
+    segments = [(500, 1000), (2000, 3000)]
+    
+    # Create temp directory
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        from semg_preprocessing import export_segments_to_csv
+        
+        # Export segments
+        files = export_segments_to_csv(
+            signal, segments, fs, temp_dir, prefix='test'
+        )
+        
+        assert len(files) == len(segments), "Should create one file per segment"
+        
+        # Verify files exist
+        import os
+        for f in files:
+            assert os.path.exists(f), f"File should exist: {f}"
+        
+        print(f"✓ Export segments test passed ({len(files)} files created)")
+    finally:
+        # Cleanup
+        shutil.rmtree(temp_dir)
+
+
 def run_all_tests():
     """Run all tests."""
     print("=" * 60)
@@ -149,6 +194,7 @@ def run_all_tests():
     test_detection()
     test_segmentation()
     test_filter_parameters()
+    test_export_segments()
     
     print()
     print("=" * 60)
