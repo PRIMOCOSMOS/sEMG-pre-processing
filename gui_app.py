@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 import gradio as gr
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Ensure semg_preprocessing is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from semg_preprocessing import (
     load_csv_data,

@@ -635,7 +635,13 @@ def _filter_segments_by_clustering(
     segment_features = np.array(segment_features)
     
     # Apply K-means clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    try:
+        # Try using n_init='auto' for sklearn >= 1.4, fallback to 10 for older versions
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+    except TypeError:
+        # Older sklearn versions don't support n_init='auto'
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    
     labels = kmeans.fit_predict(segment_features)
     
     # Identify the activity cluster (higher feature values)

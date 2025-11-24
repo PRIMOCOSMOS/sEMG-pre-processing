@@ -7,6 +7,9 @@ Or: python tests/test_basic.py
 
 import sys
 import os
+import tempfile
+import shutil
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
@@ -18,6 +21,7 @@ from semg_preprocessing import (
     remove_powerline_dft,
     detect_muscle_activity,
     segment_signal,
+    export_segments_to_csv,
 )
 
 
@@ -152,9 +156,6 @@ def test_filter_parameters():
 
 def test_export_segments():
     """Test segment export functionality."""
-    import tempfile
-    import shutil
-    
     fs = 1000.0
     signal = np.random.randn(5000)
     segments = [(500, 1000), (2000, 3000)]
@@ -163,8 +164,6 @@ def test_export_segments():
     temp_dir = tempfile.mkdtemp()
     
     try:
-        from semg_preprocessing import export_segments_to_csv
-        
         # Export segments
         files = export_segments_to_csv(
             signal, segments, fs, temp_dir, prefix='test'
@@ -173,7 +172,6 @@ def test_export_segments():
         assert len(files) == len(segments), "Should create one file per segment"
         
         # Verify files exist
-        import os
         for f in files:
             assert os.path.exists(f), f"File should exist: {f}"
         
