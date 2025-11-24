@@ -13,7 +13,12 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+
+# Set matplotlib to use non-interactive backend before importing pyplot
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for thread safety with Gradio
 import matplotlib.pyplot as plt
+
 import gradio as gr
 from pathlib import Path
 
@@ -131,13 +136,22 @@ class EMGProcessorGUI:
         except Exception as e:
             return f"❌ Error applying filters: {str(e)}", None
     
-    def detect_activity(self, method, min_duration, use_clustering, adaptive_pen):
+    def detect_activity(self, method, min_duration, use_clustering, adaptive_pen, progress=gr.Progress()):
         """Detect muscle activity segments."""
         try:
             if self.filtered_signal is None:
-                return "Please apply filters first", None
+                return "❌ Please apply filters first", None
+            
+            # Debug info
+            print(f"[DEBUG] Starting detection with method={method}, min_duration={min_duration}")
+            print(f"[DEBUG] Signal length: {len(self.filtered_signal)}, fs={self.fs}")
+            print(f"[DEBUG] use_clustering={use_clustering}, adaptive_pen={adaptive_pen}")
+            
+            # Update progress
+            progress(0.1, desc="Initializing detection...")
             
             # Detect muscle activity
+            progress(0.3, desc="Detecting muscle activity...")
             self.segments = detect_muscle_activity(
                 self.filtered_signal,
                 fs=self.fs,
@@ -147,7 +161,10 @@ class EMGProcessorGUI:
                 adaptive_pen=adaptive_pen
             )
             
+            print(f"[DEBUG] Detection complete. Found {len(self.segments)} segments")
+            
             # Get detailed segment information
+            progress(0.6, desc="Extracting segment information...")
             segment_info = segment_signal(
                 self.filtered_signal,
                 self.segments,
@@ -155,7 +172,10 @@ class EMGProcessorGUI:
                 include_metadata=True
             )
             
+            print(f"[DEBUG] Segment info created")
+            
             # Create visualization
+            progress(0.8, desc="Creating visualization...")
             fig, ax = plt.subplots(figsize=(12, 6))
             time = np.arange(len(self.filtered_signal)) / self.fs
             
@@ -170,11 +190,15 @@ class EMGProcessorGUI:
             ax.set_ylabel('Amplitude')
             ax.set_title(f'Muscle Activity Detection ({len(self.segments)} segments detected)')
             ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper right')
+            if self.segments:
+                ax.legend(loc='upper right')
             
             plt.tight_layout()
             
+            print(f"[DEBUG] Plot created")
+            
             # Create info text
+            progress(0.9, desc="Formatting results...")
             info = f"✅ Detected {len(self.segments)} muscle activity segments:\n\n"
             for i, seg in enumerate(segment_info[:10], 1):  # Show first 10
                 info += f"Segment {i}: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
@@ -183,9 +207,15 @@ class EMGProcessorGUI:
             if len(segment_info) > 10:
                 info += f"\n... and {len(segment_info) - 10} more segments"
             
+            progress(1.0, desc="Complete!")
+            print(f"[DEBUG] Returning results")
             return info.strip(), fig
         except Exception as e:
-            return f"❌ Error detecting activity: {str(e)}", None
+            import traceback
+            error_msg = f"❌ Error detecting activity: {str(e)}\n\n"
+            error_msg += "Traceback:\n" + traceback.format_exc()
+            print(f"[ERROR] {error_msg}")
+            return error_msg, None
     
     def export_data(self, output_dir, export_full, export_segments):
         """Export processed data and segments."""
@@ -403,9 +433,14 @@ def create_gui():
 
 if __name__ == "__main__":
     app = create_gui()
+    
+    # Enable queue for better handling of concurrent requests
+    app.queue(default_concurrency_limit=4)
+    
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
-        show_error=True
+        show_error=True,
+        debug=False  # Set to True for more verbose logging
     )
