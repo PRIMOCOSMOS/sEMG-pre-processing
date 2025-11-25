@@ -15,9 +15,6 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-import tempfile
-import zipfile
-from io import BytesIO
 
 # Set matplotlib to use non-interactive backend before importing pyplot
 import matplotlib
@@ -388,10 +385,10 @@ class EMGProcessorGUI:
 - Max frequency: {max_freq if max_freq > 0 else self.fs/2} Hz
 """
             
-            return info.strip(), fig, None
+            return info.strip(), fig
         except Exception as e:
             import traceback
-            return f"❌ Error in HHT analysis: {str(e)}\n{traceback.format_exc()}", None, None
+            return f"❌ Error in HHT analysis: {str(e)}\n{traceback.format_exc()}", None
     
     def perform_augmentation(self, augmentation_method, n_augmented, perturbation, 
                             segment_index, progress=gr.Progress()):
@@ -750,12 +747,11 @@ def create_gui():
                     with gr.Column(scale=2):
                         hht_info = gr.Textbox(label="HHT Results", lines=10)
                         hht_plot = gr.Plot(label="Hilbert Spectrum")
-                        hht_download = gr.File(label="Download Results", visible=False)
                 
                 hht_btn.click(
                     fn=processor.perform_hht_analysis,
                     inputs=[hht_segment_input, hht_freq_bins, hht_max_freq, hht_norm_length, hht_normalize],
-                    outputs=[hht_info, hht_plot, hht_download]
+                    outputs=[hht_info, hht_plot]
                 )
             
             # Tab 5: Data Augmentation

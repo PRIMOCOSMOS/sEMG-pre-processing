@@ -319,8 +319,7 @@ def export_segments_to_csv(
     output_dir: str,
     prefix: str = "segment",
     include_time: bool = True,
-    annotations: Optional[Dict] = None,
-    original_df: Optional[pd.DataFrame] = None
+    annotations: Optional[Dict] = None
 ) -> list:
     """
     Export detected muscle activity segments as individual CSV files.
@@ -346,8 +345,6 @@ def export_segments_to_csv(
         - quality_rating: Motion quality (e.g., 1-5)
         - action_type: Type of muscle action
         - notes: Additional notes
-    original_df : pd.DataFrame, optional
-        Original dataframe to preserve additional columns
     
     Returns:
     --------
