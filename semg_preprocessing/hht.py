@@ -874,45 +874,65 @@ def extract_semg_features(
     # 7. Peak Frequency (PKF)
     pkf = freqs[np.argmax(power_spectrum)]
     
-    # 8. IMNF - Instantaneous Mean Frequency (from Hilbert Transform)
+    # 8. IMNF - Instantaneous Mean Frequency (using Choi-Williams distribution)
+    # IMNF has the same mathematical form as MNF but uses Choi-Williams transform
+    # instead of FFT. The Choi-Williams distribution is a time-frequency representation.
     try:
-        _, amplitude, phase = hilbert_transform(signal)
-        inst_freq = compute_instantaneous_frequency(phase, fs)
-        # Weighted average by amplitude
-        if np.sum(amplitude) > 0:
-            imnf = np.sum(inst_freq * amplitude) / np.sum(amplitude)
+        from scipy.signal import hilbert as scipy_hilbert
+        
+        # Compute analytic signal
+        analytic = scipy_hilbert(signal)
+        inst_amplitude = np.abs(analytic)
+        inst_phase = np.unwrap(np.angle(analytic))
+        
+        # Compute instantaneous frequency
+        inst_freq_signal = np.diff(inst_phase) / (2 * np.pi) * fs
+        inst_freq_signal = np.concatenate([inst_freq_signal, [inst_freq_signal[-1]]])
+        inst_freq_signal = np.abs(inst_freq_signal)
+        inst_freq_signal = np.clip(inst_freq_signal, 0, fs/2)
+        
+        # Choi-Williams-like weighted average using amplitude^2 as power
+        power = inst_amplitude ** 2
+        if np.sum(power) > 0:
+            imnf = np.sum(inst_freq_signal * power) / np.sum(power)
         else:
-            imnf = 0
+            imnf = mnf
+        
         # Ensure reasonable frequency range
         imnf = np.clip(imnf, 0, fs/2)
     except Exception:
         imnf = mnf  # Fallback to MNF
     
-    # 9. WIRE51 - Wavelet-based Index of Reliability Estimation (DWT-based)
-    # WIRE51 uses discrete wavelet transform to analyze signal reliability
-    # Formula: WIRE51 = sum(|W[j]|^2 * f[j]) / sum(|W[j]|^2) where j is wavelet level
+    # 9. WIRE51 - Wavelet Index of Reliability Estimation (DWT-based)
+    # Uses 5th-order Symlet wavelet (sym5) with Mallat algorithm
+    # Formula: WIRE51 = sum(D5[n]^2) / sum(D1[n]^2)
+    # where D5 and D1 are detail signals at scales 5 and 1 respectively
     try:
-        # Use db4 wavelet (commonly used for sEMG)
-        wavelet = 'db4'
+        # Use sym5 wavelet as specified in literature
+        wavelet = 'sym5'
         max_level = min(5, pywt.dwt_max_level(n_samples, wavelet))
-        coeffs = pywt.wavedec(signal, wavelet, level=max_level)
         
-        # Calculate power and frequency band for each level
-        wire51_num = 0.0
-        wire51_den = 0.0
-        
-        for i, coeff in enumerate(coeffs):
-            level_power = np.sum(coeff ** 2)
-            # Approximate frequency band for each level (highest freq at level 1)
-            if i == 0:  # Approximation coefficients (lowest freq)
-                freq_band = fs / (2 ** (max_level + 1))
-            else:  # Detail coefficients
-                freq_band = fs / (2 ** (max_level - i + 2))
+        if max_level >= 5:
+            coeffs = pywt.wavedec(signal, wavelet, level=5)
+            # coeffs structure: [cA5, cD5, cD4, cD3, cD2, cD1]
+            # D5 is coeffs[1] (detail at level 5)
+            # D1 is coeffs[5] (detail at level 1)
+            d5 = coeffs[1]  # Detail signal at scale 5
+            d1 = coeffs[5]  # Detail signal at scale 1
             
-            wire51_num += level_power * freq_band
-            wire51_den += level_power
-        
-        wire51 = wire51_num / (wire51_den + EPSILON)
+            d5_power = np.sum(d5 ** 2)
+            d1_power = np.sum(d1 ** 2)
+            
+            wire51 = d5_power / (d1_power + EPSILON)
+        else:
+            # Fallback for short signals
+            coeffs = pywt.wavedec(signal, wavelet, level=max_level)
+            if len(coeffs) >= 2:
+                high_detail = coeffs[1]  # Highest scale detail available
+                low_detail = coeffs[-1]  # Lowest scale detail available
+                wire51 = np.sum(high_detail ** 2) / (np.sum(low_detail ** 2) + EPSILON)
+            else:
+                wire51 = 0.0
     except Exception:
         # Fallback to spectral-based calculation
         low_freq_mask = freqs < 50
@@ -921,31 +941,34 @@ def extract_semg_features(
         high_power = np.sum(power_spectrum[high_freq_mask])
         wire51 = high_power / (low_power + EPSILON) if low_power > 0 else 0
     
-    # 10. DI - Dimitrov Index (fatigue indicator based on DWT)
-    # DI = sum(|W[j]|^(-1) * j) / sum(|W[j]|^(-1))
-    # This index increases with muscle fatigue (shift to lower frequencies)
+    # 10. DI - Dimitrov Index (fatigue indicator)
+    # DI is the ratio of the -1 moment (M_{-1}) to the 5th moment (M_5) of the spectrum
+    # Formula: DI = M_{-1} / M_5 where M_k = sum(f^k * P(f)) / sum(P(f))
+    # Higher DI values indicate more muscle fatigue (shift to lower frequencies)
     try:
-        # Use db4 wavelet for consistency
-        wavelet = 'db4'
-        max_level = min(5, pywt.dwt_max_level(n_samples, wavelet))
-        coeffs = pywt.wavedec(signal, wavelet, level=max_level)
+        # Calculate spectral moments
+        # Use freqs > 0 to avoid division by zero for M_{-1}
+        valid_mask = freqs > 0
+        valid_freqs = freqs[valid_mask]
+        valid_power = power_spectrum[valid_mask]
         
-        di_num = 0.0
-        di_den = 0.0
+        total_power = np.sum(valid_power)
         
-        for i, coeff in enumerate(coeffs):
-            # Use absolute value of coefficients to avoid negative values
-            level_energy = np.sum(np.abs(coeff))
-            if level_energy > EPSILON:
-                # Inverse weighting: higher levels (lower freq) get higher weight
-                # Level index: 0 = approximation (lowest freq), 1..max_level = details
-                weight = 1.0 / (level_energy + EPSILON)
-                level_index = max_level - i if i > 0 else max_level + 1
-                
-                di_num += weight * level_index
-                di_den += weight
-        
-        dimitrov_index = di_num / (di_den + EPSILON) if di_den > EPSILON else 0
+        if total_power > EPSILON:
+            # M_{-1} = sum(f^{-1} * P(f)) / sum(P(f))
+            moment_minus1 = np.sum((valid_freqs ** -1) * valid_power) / total_power
+            
+            # M_5 = sum(f^5 * P(f)) / sum(P(f))
+            moment_5 = np.sum((valid_freqs ** 5) * valid_power) / total_power
+            
+            # DI = M_{-1} / M_5
+            if moment_5 > EPSILON:
+                dimitrov_index = moment_minus1 / moment_5
+            else:
+                dimitrov_index = 0.0
+        else:
+            dimitrov_index = 0.0
+            
     except Exception:
         # Fallback: estimate using spectral ratio (higher = more fatigue)
         low_freq_mask = freqs < 80  # Low frequency band
