@@ -6,7 +6,7 @@ including filtering, noise removal, muscle activity detection, HHT analysis,
 CEEMDAN decomposition, feature extraction, and data augmentation.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .filters import (
     apply_highpass_filter,
@@ -38,12 +38,15 @@ from .hht import (
     hht_analysis_enhanced,
     batch_hht_analysis,
     extract_semg_features,
+    export_features_to_csv,
     save_hilbert_spectrum,
 )
 
 from .augmentation import (
     augment_by_imf_mixing,
     augment_by_imf_recombination,
+    augment_ceemdan_random_imf,
+    trim_signals_to_equal_length,
     augment_by_imf_scaling,
     augment_by_noise_injection,
     augment_by_time_warping,
@@ -76,10 +79,13 @@ __all__ = [
     "hht_analysis_enhanced",
     "batch_hht_analysis",
     "extract_semg_features",
+    "export_features_to_csv",
     "save_hilbert_spectrum",
     # Augmentation
     "augment_by_imf_mixing",
     "augment_by_imf_recombination",
+    "augment_ceemdan_random_imf",
+    "trim_signals_to_equal_length",
     "augment_by_imf_scaling",
     "augment_by_noise_injection",
     "augment_by_time_warping",

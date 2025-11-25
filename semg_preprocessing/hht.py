@@ -811,13 +811,16 @@ def extract_semg_features(
         - MDF: Median Frequency
         - MNF: Mean Frequency
         - IMNF: Instantaneous Mean Frequency (from HHT)
-        - WIRE51: Wavelet-based Index of Reliability Estimation
+        - WIRE51: Wavelet-based Index of Reliability Estimation (DWT-based)
+        - DI: Dimitrov Index (fatigue indicator, DWT-based)
         - RMS: Root Mean Square
         - MAV: Mean Absolute Value
         - VAR: Variance
         - PKF: Peak Frequency
         - TTP: Total Power
     """
+    import pywt
+    
     n_samples = len(signal)
     
     # Time domain features
@@ -885,21 +888,71 @@ def extract_semg_features(
     except Exception:
         imnf = mnf  # Fallback to MNF
     
-    # 9. WIRE51 - Wavelet Index of Reliability Estimation (simplified version)
-    # Uses a ratio of high to low frequency power
-    # True WIRE51 requires wavelet decomposition; this is a simplified spectral version
-    low_freq_mask = freqs < 50
-    mid_freq_mask = (freqs >= 50) & (freqs < 150)
-    high_freq_mask = freqs >= 150
+    # 9. WIRE51 - Wavelet-based Index of Reliability Estimation (DWT-based)
+    # WIRE51 uses discrete wavelet transform to analyze signal reliability
+    # Formula: WIRE51 = sum(|W[j]|^2 * f[j]) / sum(|W[j]|^2) where j is wavelet level
+    try:
+        # Use db4 wavelet (commonly used for sEMG)
+        wavelet = 'db4'
+        max_level = min(5, pywt.dwt_max_level(n_samples, wavelet))
+        coeffs = pywt.wavedec(signal, wavelet, level=max_level)
+        
+        # Calculate power and frequency band for each level
+        wire51_num = 0.0
+        wire51_den = 0.0
+        
+        for i, coeff in enumerate(coeffs):
+            level_power = np.sum(coeff ** 2)
+            # Approximate frequency band for each level (highest freq at level 1)
+            if i == 0:  # Approximation coefficients (lowest freq)
+                freq_band = fs / (2 ** (max_level + 1))
+            else:  # Detail coefficients
+                freq_band = fs / (2 ** (max_level - i + 2))
+            
+            wire51_num += level_power * freq_band
+            wire51_den += level_power
+        
+        wire51 = wire51_num / (wire51_den + EPSILON)
+    except Exception:
+        # Fallback to spectral-based calculation
+        low_freq_mask = freqs < 50
+        high_freq_mask = freqs >= 50
+        low_power = np.sum(power_spectrum[low_freq_mask])
+        high_power = np.sum(power_spectrum[high_freq_mask])
+        wire51 = high_power / (low_power + EPSILON) if low_power > 0 else 0
     
-    low_power = np.sum(power_spectrum[low_freq_mask])
-    mid_power = np.sum(power_spectrum[mid_freq_mask])
-    high_power = np.sum(power_spectrum[high_freq_mask])
-    
-    if low_power > 0:
-        wire51 = (mid_power + high_power) / (low_power + EPSILON)
-    else:
-        wire51 = 0
+    # 10. DI - Dimitrov Index (fatigue indicator based on DWT)
+    # DI = sum(|W[j]|^(-1) * j) / sum(|W[j]|^(-1))
+    # This index increases with muscle fatigue (shift to lower frequencies)
+    try:
+        # Use db4 wavelet for consistency
+        wavelet = 'db4'
+        max_level = min(5, pywt.dwt_max_level(n_samples, wavelet))
+        coeffs = pywt.wavedec(signal, wavelet, level=max_level)
+        
+        di_num = 0.0
+        di_den = 0.0
+        
+        for i, coeff in enumerate(coeffs):
+            # Use absolute value of coefficients to avoid negative values
+            level_energy = np.sum(np.abs(coeff))
+            if level_energy > EPSILON:
+                # Inverse weighting: higher levels (lower freq) get higher weight
+                # Level index: 0 = approximation (lowest freq), 1..max_level = details
+                weight = 1.0 / (level_energy + EPSILON)
+                level_index = max_level - i if i > 0 else max_level + 1
+                
+                di_num += weight * level_index
+                di_den += weight
+        
+        dimitrov_index = di_num / (di_den + EPSILON) if di_den > EPSILON else 0
+    except Exception:
+        # Fallback: estimate using spectral ratio (higher = more fatigue)
+        low_freq_mask = freqs < 80  # Low frequency band
+        high_freq_mask = freqs >= 80  # High frequency band
+        low_power = np.sum(power_spectrum[low_freq_mask])
+        high_power = np.sum(power_spectrum[high_freq_mask])
+        dimitrov_index = low_power / (high_power + EPSILON) if high_power > 0 else 0
     
     return {
         'WL': float(wl),
@@ -909,6 +962,7 @@ def extract_semg_features(
         'MNF': float(mnf),
         'IMNF': float(imnf),
         'WIRE51': float(wire51),
+        'DI': float(dimitrov_index),
         'RMS': float(rms),
         'MAV': float(mav),
         'VAR': float(var),
@@ -1114,3 +1168,70 @@ def hht_analysis_enhanced(
         result['features'] = extract_semg_features(signal, fs)
     
     return result
+
+
+def export_features_to_csv(
+    features_list: List[Dict[str, float]],
+    filepath: str,
+    segment_names: Optional[List[str]] = None,
+    annotations: Optional[Dict[str, str]] = None
+) -> None:
+    """
+    Export sEMG features from multiple segments to a CSV file.
+    
+    Parameters:
+    -----------
+    features_list : List[Dict[str, float]]
+        List of feature dictionaries from extract_semg_features()
+    filepath : str
+        Output file path for CSV
+    segment_names : List[str], optional
+        Names for each segment (default: Segment_001, Segment_002, ...)
+    annotations : Dict[str, str], optional
+        Additional annotation columns to include (e.g., subject, fatigue_level)
+    
+    Returns:
+    --------
+    None
+        Saves features to CSV file
+        
+    Examples:
+    ---------
+    >>> features = [extract_semg_features(seg, fs=1000) for seg in segments]
+    >>> export_features_to_csv(features, 'features.csv')
+    """
+    import pandas as pd
+    
+    if not features_list:
+        raise ValueError("features_list cannot be empty")
+    
+    # Create segment names if not provided
+    if segment_names is None:
+        segment_names = [f"Segment_{i+1:03d}" for i in range(len(features_list))]
+    
+    # Build dataframe
+    df = pd.DataFrame(features_list)
+    df.insert(0, 'Segment', segment_names)
+    
+    # Add annotation columns if provided
+    if annotations:
+        for key, value in annotations.items():
+            df.insert(1, key, value)
+    
+    # Define column order for readability
+    priority_cols = ['Segment']
+    if annotations:
+        priority_cols.extend(list(annotations.keys()))
+    
+    # Feature columns in logical order
+    feature_order = ['WL', 'ZC', 'SSC', 'RMS', 'MAV', 'VAR', 
+                     'MDF', 'MNF', 'IMNF', 'PKF', 'TTP', 'WIRE51', 'DI']
+    
+    # Reorder columns
+    ordered_cols = priority_cols + [c for c in feature_order if c in df.columns]
+    other_cols = [c for c in df.columns if c not in ordered_cols]
+    df = df[ordered_cols + other_cols]
+    
+    # Save to CSV
+    df.to_csv(filepath, index=False, float_format='%.6f')
+    print(f"Features exported to: {filepath}")

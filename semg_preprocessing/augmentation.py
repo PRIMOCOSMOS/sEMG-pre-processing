@@ -177,6 +177,198 @@ def augment_by_imf_recombination(
     return augmented
 
 
+# Standard number of IMFs to pad to (as mentioned in user's description)
+STANDARD_NUM_IMFS = 8
+
+
+def augment_ceemdan_random_imf(
+    signals: List[np.ndarray],
+    n_augmented: int = 10,
+    target_length: Optional[int] = None,
+    use_ceemdan: bool = True,
+    seed: Optional[int] = None
+) -> List[np.ndarray]:
+    """
+    Generate synthetic sEMG signals using CEEMDAN-based random IMF combination.
+    
+    This implements the algorithm described in literature for sEMG data augmentation:
+    1. Decompose each signal using CEEMDAN to get IMFs
+    2. Pad IMFs to 8 components (add zero-value IMFs if less than 8)
+    3. For each new signal, randomly select m=8 signals
+    4. From each selected signal, take one random IMF at a unique position
+    5. Sum all selected IMFs to create the artificial signal
+    
+    Parameters:
+    -----------
+    signals : List[np.ndarray]
+        List of input sEMG signals (should be from same case/category)
+    n_augmented : int, optional
+        Number of augmented signals to generate (default: 10)
+    target_length : int, optional
+        Target length for all signals (default: minimum length among signals)
+        Signals are intelligently trimmed from center to preserve activity
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
+    seed : int, optional
+        Random seed for reproducibility
+    
+    Returns:
+    --------
+    List[np.ndarray]
+        List of generated artificial sEMG signals
+        
+    Examples:
+    ---------
+    >>> signals = [seg1, seg2, seg3, seg4, seg5]  # From same fatigue/action category
+    >>> artificial = augment_ceemdan_random_imf(signals, n_augmented=20)
+    >>> print(f"Generated {len(artificial)} artificial signals")
+    
+    References:
+    -----------
+    "In the CEEMDAN decomposition procedure, we obtain several IMFs of the original 
+    signal by CEEMDAN. For our sEMG signal, we find that the decomposed signals have 
+    at most eight IMFs. Therefore, we take m as 8..."
+    """
+    from scipy.signal import resample
+    
+    if seed is not None:
+        np.random.seed(seed)
+    
+    if len(signals) < 2:
+        raise ValueError("Need at least 2 signals for CEEMDAN-based augmentation")
+    
+    # Step 1: Determine target length
+    if target_length is None:
+        target_length = min(len(sig) for sig in signals)
+    
+    # Step 2: Normalize lengths by intelligent trimming (preserve center)
+    normalized_signals = []
+    for sig in signals:
+        if len(sig) > target_length:
+            # Trim from center to preserve muscle activity
+            excess = len(sig) - target_length
+            start = excess // 2
+            sig = sig[start:start + target_length]
+        elif len(sig) < target_length:
+            # Resample if shorter (should rarely happen with center trim)
+            sig = resample(sig, target_length)
+        normalized_signals.append(sig)
+    
+    # Step 3: Decompose all signals and pad to STANDARD_NUM_IMFS
+    all_imfs_padded = []
+    for sig in normalized_signals:
+        if use_ceemdan:
+            imfs = ceemdan_decomposition(sig, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
+        else:
+            imfs = emd_decomposition(sig)
+        
+        # Pad to STANDARD_NUM_IMFS (add zero IMFs if needed)
+        n_actual_imfs = len(imfs) - 1  # Exclude residue
+        padded_imfs = []
+        
+        for i in range(STANDARD_NUM_IMFS):
+            if i < n_actual_imfs:
+                padded_imfs.append(imfs[i])
+            else:
+                # Add zero-valued IMF
+                padded_imfs.append(np.zeros(target_length))
+        
+        # Add residue as the last element
+        padded_imfs.append(imfs[-1])
+        all_imfs_padded.append(padded_imfs)
+    
+    # Step 4: Generate artificial signals
+    augmented = []
+    n_signals = len(all_imfs_padded)
+    
+    for _ in range(n_augmented):
+        new_signal = np.zeros(target_length)
+        used_positions = set()
+        
+        # Randomly select m=STANDARD_NUM_IMFS signals (with replacement if not enough signals)
+        if n_signals >= STANDARD_NUM_IMFS:
+            selected_signal_indices = np.random.choice(n_signals, STANDARD_NUM_IMFS, replace=False)
+        else:
+            # If fewer signals than STANDARD_NUM_IMFS, use replacement
+            selected_signal_indices = np.random.choice(n_signals, STANDARD_NUM_IMFS, replace=True)
+        
+        # From each selected signal, take one random IMF at a unique position
+        for sig_idx in selected_signal_indices:
+            # Get available positions (not yet used)
+            available_positions = [p for p in range(STANDARD_NUM_IMFS) if p not in used_positions]
+            
+            if not available_positions:
+                # All positions used, skip
+                continue
+            
+            # Randomly select an IMF position
+            imf_position = np.random.choice(available_positions)
+            used_positions.add(imf_position)
+            
+            # Add the selected IMF to the new signal
+            new_signal += all_imfs_padded[sig_idx][imf_position]
+        
+        # Optionally add a residue from a random signal
+        residue_source = np.random.randint(n_signals)
+        new_signal += all_imfs_padded[residue_source][-1] * 0.5  # Add half residue for stability
+        
+        augmented.append(new_signal)
+    
+    return augmented
+
+
+def trim_signals_to_equal_length(
+    signals: List[np.ndarray],
+    method: str = 'center'
+) -> Tuple[List[np.ndarray], int]:
+    """
+    Trim signals to equal length using intelligent trimming.
+    
+    Parameters:
+    -----------
+    signals : List[np.ndarray]
+        List of signals with potentially different lengths
+    method : str, optional
+        Trimming method: 'center' (preserve center), 'start' (from beginning),
+        'end' (from end) (default: 'center')
+    
+    Returns:
+    --------
+    Tuple[List[np.ndarray], int]
+        - List of trimmed signals with equal length
+        - Target length used
+        
+    Examples:
+    ---------
+    >>> trimmed, length = trim_signals_to_equal_length([sig1, sig2, sig3])
+    >>> print(f"All signals now have length: {length}")
+    """
+    if not signals:
+        raise ValueError("signals list cannot be empty")
+    
+    # Find minimum length
+    target_length = min(len(sig) for sig in signals)
+    
+    trimmed = []
+    for sig in signals:
+        if len(sig) > target_length:
+            excess = len(sig) - target_length
+            if method == 'center':
+                start = excess // 2
+            elif method == 'start':
+                start = 0
+            elif method == 'end':
+                start = excess
+            else:
+                raise ValueError(f"Unknown method: {method}. Use 'center', 'start', or 'end'")
+            
+            sig = sig[start:start + target_length]
+        
+        trimmed.append(sig)
+    
+    return trimmed, target_length
+
+
 def augment_by_imf_scaling(
     signal: np.ndarray,
     n_augmented: int = 5,

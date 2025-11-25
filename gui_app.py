@@ -44,10 +44,13 @@ from semg_preprocessing import (
     hht_analysis_enhanced,
     batch_hht_analysis,
     extract_semg_features,
+    export_features_to_csv,
     save_hilbert_spectrum,
     # Augmentation functions
     augment_by_imf_mixing,
     augment_by_imf_recombination,
+    augment_ceemdan_random_imf,
+    trim_signals_to_equal_length,
     augment_by_imf_scaling,
     augment_by_noise_injection,
     augment_by_time_warping,
@@ -450,6 +453,19 @@ class EMGProcessorGUI:
                     segment, n_augmented=int(n_augmented),
                     warp_factor=float(perturbation)
                 )
+            elif augmentation_method == 'ceemdan_random_imf':
+                # Use all detected segments for CEEMDAN random IMF combination
+                all_segments = [seg['data'] for seg in self.segment_data]
+                if len(all_segments) < 2:
+                    return "❌ Need at least 2 segments for CEEMDAN random IMF method", None
+                
+                self.augmented_signals = [segment.copy()]  # Include original
+                generated = augment_ceemdan_random_imf(
+                    all_segments, 
+                    n_augmented=int(n_augmented),
+                    use_ceemdan=use_ceemdan
+                )
+                self.augmented_signals.extend(generated)
             elif augmentation_method == 'comprehensive':
                 results = comprehensive_augmentation(
                     segment, n_per_method=max(1, int(n_augmented) // 4),
@@ -562,7 +578,7 @@ class EMGProcessorGUI:
                 features_summary += f"\n*Segment {i+1}:*\n"
                 features_summary += f"  WL={features['WL']:.2f}, ZC={features['ZC']}, SSC={features['SSC']}\n"
                 features_summary += f"  MDF={features['MDF']:.1f}Hz, MNF={features['MNF']:.1f}Hz, IMNF={features['IMNF']:.1f}Hz\n"
-                features_summary += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}\n"
+                features_summary += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}, DI={features.get('DI', 0):.4f}\n"
             
             info = f"""
 ✅ Batch HHT Analysis Complete!
@@ -582,6 +598,43 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
         except Exception as e:
             import traceback
             return f"❌ Error in batch HHT: {str(e)}\n{traceback.format_exc()}", None
+    
+    def export_features_csv(self, output_path, subject_id, fatigue_level, progress=gr.Progress()):
+        """Export all segment features to a CSV file."""
+        try:
+            if self.segment_data is None or len(self.segment_data) == 0:
+                return "❌ Please detect segments first"
+            
+            progress(0.2, desc="Extracting features from all segments...")
+            
+            # Extract features from all segments
+            features_list = []
+            segment_names = []
+            
+            for i, seg in enumerate(self.segment_data):
+                features = extract_semg_features(seg['data'], self.fs)
+                features_list.append(features)
+                segment_names.append(f"Segment_{i+1:03d}")
+            
+            progress(0.7, desc="Exporting to CSV...")
+            
+            # Build annotations
+            annotations = {}
+            if subject_id:
+                annotations['Subject'] = subject_id
+            if fatigue_level:
+                annotations['Fatigue_Level'] = fatigue_level
+            
+            # Export
+            export_features_to_csv(features_list, output_path, segment_names, annotations)
+            
+            progress(1.0, desc="Complete!")
+            
+            return f"✅ Features exported to: {output_path}\n\nExported {len(features_list)} segments with {len(features_list[0])} features each."
+        
+        except Exception as e:
+            import traceback
+            return f"❌ Error exporting features: {str(e)}\n{traceback.format_exc()}"
     
     def export_data(self, output_dir, export_full, export_segments, 
                    subject_id, fatigue_level, quality_rating, action_type, notes,
@@ -904,20 +957,24 @@ def create_gui():
                 
                 Generate synthetic sEMG signals using **CEEMDAN** decomposition for more stable
                 and physically meaningful IMF components.
+                
+                **Recommended**: `ceemdan_random_imf` for dataset building (uses all segments to generate new signals).
                 """)
                 
                 with gr.Row():
                     with gr.Column(scale=1):
                         aug_segment_input = gr.Number(value=1, label="Segment Index", precision=0)
                         aug_method_input = gr.Radio(
-                            ["imf_mixing", "imf_scaling", "noise_injection", "time_warping", "comprehensive"],
-                            value="imf_mixing",
-                            label="Augmentation Method"
+                            ["imf_mixing", "imf_scaling", "noise_injection", "time_warping", 
+                             "ceemdan_random_imf", "comprehensive"],
+                            value="ceemdan_random_imf",
+                            label="Augmentation Method",
+                            info="ceemdan_random_imf: Uses all segments to generate new signals (best for dataset building)"
                         )
                         aug_use_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
-                        aug_n_input = gr.Slider(1, 20, value=5, step=1, label="Number of augmented signals")
+                        aug_n_input = gr.Slider(1, 50, value=10, step=1, label="Number of augmented signals")
                         aug_perturbation = gr.Slider(0.01, 0.5, value=0.1, step=0.01,
-                                                    label="Perturbation factor")
+                                                    label="Perturbation factor (for mixing/scaling/noise)")
                         
                         aug_btn = gr.Button("Generate Augmented Data", variant="primary")
                     
@@ -933,7 +990,7 @@ def create_gui():
             
             # Tab 6: Export Results
             with gr.Tab("💾 Export Results / 导出结果"):
-                gr.Markdown("### Export processed data, segments, and analysis results")
+                gr.Markdown("### Export processed data, segments, analysis results, and features")
                 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -958,6 +1015,18 @@ def create_gui():
                         notes_input = gr.Textbox(value="", label="Notes (备注)", lines=2)
                         
                         export_btn = gr.Button("Export Data", variant="primary")
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("**Feature Export / 特征导出**")
+                        features_output_path = gr.Textbox(value="./output/segment_features.csv", 
+                                                         label="Features CSV Path")
+                        features_subject = gr.Textbox(value="", label="Subject ID for features")
+                        features_fatigue = gr.Dropdown(
+                            choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
+                            value="", label="Fatigue Level for features"
+                        )
+                        export_features_btn = gr.Button("📊 Export All Segment Features", variant="secondary")
+                        features_export_info = gr.Textbox(label="Features Export Status", lines=3)
                     
                     with gr.Column(scale=2):
                         export_info = gr.Textbox(label="Export Status", lines=15)
@@ -968,6 +1037,12 @@ def create_gui():
                            subject_input, fatigue_input, quality_input, action_input, notes_input,
                            export_hht_input, export_augmented_input, custom_prefix_input],
                     outputs=[export_info]
+                )
+                
+                export_features_btn.click(
+                    fn=processor.export_features_csv,
+                    inputs=[features_output_path, features_subject, features_fatigue],
+                    outputs=[features_export_info]
                 )
             
             # Tab 7: Help
@@ -992,11 +1067,12 @@ def create_gui():
                 - Generates Hilbert spectrum (time-frequency representation)
                 - **Batch HHT**: One-click analysis of all segments
                 - **Time normalization**: Uniform spectra sizes for CNN input
-                - **Feature extraction**: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51
+                - **Feature extraction**: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51, DI
                 
                 ### 5. Data Augmentation (数据增强)
                 - **CEEMDAN-based** methods for better stability
-                - **imf_mixing**: Perturb IMF components
+                - **ceemdan_random_imf**: (Recommended) Use all segments to generate new signals via random IMF combination
+                - **imf_mixing**: Perturb IMF components of a single segment
                 - **imf_scaling**: Scale IMF amplitudes
                 - **noise_injection**: Add controlled noise
                 - **time_warping**: Apply time distortion
@@ -1004,6 +1080,7 @@ def create_gui():
                 
                 ### 6. Export (导出)
                 - Add annotations: subject ID, fatigue level, quality rating
+                - **Export Features**: Export all segment features (WL, ZC, SSC, MDF, MNF, IMNF, DI, WIRE51) to CSV
                 - Export segments, HHT spectra, and augmented signals
                 - Custom filename prefixes for organization
                 
@@ -1015,7 +1092,8 @@ def create_gui():
                 - **MDF** (Median Frequency): 中值频率，疲劳指标
                 - **MNF** (Mean Frequency): 平均频率
                 - **IMNF** (Instantaneous Mean Freq): 瞬时平均频率
-                - **WIRE51**: 小波可靠性指数
+                - **WIRE51**: 小波可靠性指数 (基于DWT离散小波变换)
+                - **DI** (Dimitrov Index): 迪米特罗夫指数，疲劳指标 (基于DWT)
                 - **RMS**: 均方根值，反映信号幅度
                 
                 ## Parameter Guide / 参数指南
@@ -1028,7 +1106,7 @@ def create_gui():
         
         gr.Markdown("""
         ---
-        **sEMG Preprocessing Toolkit v0.3.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
+        **sEMG Preprocessing Toolkit v0.4.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
         """)
     
     return app
