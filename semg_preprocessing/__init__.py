@@ -3,10 +3,10 @@ sEMG Preprocessing Toolkit
 
 A comprehensive toolkit for surface electromyography (sEMG) signal preprocessing,
 including filtering, noise removal, muscle activity detection, HHT analysis,
-and data augmentation.
+CEEMDAN decomposition, feature extraction, and data augmentation.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .filters import (
     apply_highpass_filter,
@@ -29,10 +29,15 @@ from .utils import (
 
 from .hht import (
     emd_decomposition,
+    ceemdan_decomposition,
     hilbert_transform,
     compute_instantaneous_frequency,
     compute_hilbert_spectrum,
+    compute_hilbert_spectrum_enhanced,
     hht_analysis,
+    hht_analysis_enhanced,
+    batch_hht_analysis,
+    extract_semg_features,
     save_hilbert_spectrum,
 )
 
@@ -62,10 +67,15 @@ __all__ = [
     "export_segments_to_csv",
     # HHT
     "emd_decomposition",
+    "ceemdan_decomposition",
     "hilbert_transform",
     "compute_instantaneous_frequency",
     "compute_hilbert_spectrum",
+    "compute_hilbert_spectrum_enhanced",
     "hht_analysis",
+    "hht_analysis_enhanced",
+    "batch_hht_analysis",
+    "extract_semg_features",
     "save_hilbert_spectrum",
     # Augmentation
     "augment_by_imf_mixing",

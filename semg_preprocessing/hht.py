@@ -2,13 +2,14 @@
 Hilbert-Huang Transform (HHT) module for sEMG signal analysis.
 
 This module implements:
-1. Empirical Mode Decomposition (EMD) for signal decomposition into IMFs
+1. CEEMDAN (Complete Ensemble EMD with Adaptive Noise) for signal decomposition into IMFs
 2. Hilbert Transform for instantaneous frequency and amplitude
 3. Hilbert Spectrum generation for time-frequency analysis
+4. sEMG feature extraction (WL, ZC, SSC, Median/Mean Frequency, IMNF, WIRE51)
 """
 
 import numpy as np
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 from scipy.signal import hilbert
 from scipy.interpolate import interp1d
 
@@ -553,3 +554,559 @@ def save_hilbert_spectrum(
         raise ValueError(f"Unknown format: {format}. Use 'npz', 'csv', or 'npy'")
     
     print(f"Hilbert spectrum saved to: {filepath}")
+
+
+def ceemdan_decomposition(
+    signal: np.ndarray,
+    max_imfs: int = 10,
+    n_ensembles: int = 50,
+    noise_std: float = 0.2,
+    max_iterations: int = 1000,
+    sift_threshold: float = 0.05,
+    seed: Optional[int] = None
+) -> List[np.ndarray]:
+    """
+    Perform Complete Ensemble EMD with Adaptive Noise (CEEMDAN) decomposition.
+    
+    CEEMDAN is an improved version of EMD that provides more robust decomposition
+    by adding noise-assisted analysis. It produces more stable and physically
+    meaningful IMFs compared to standard EMD.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal (1D array)
+    max_imfs : int, optional
+        Maximum number of IMFs to extract (default: 10)
+    n_ensembles : int, optional
+        Number of ensemble trials (default: 50)
+    noise_std : float, optional
+        Standard deviation of added noise relative to signal std (default: 0.2)
+    max_iterations : int, optional
+        Maximum iterations for sifting process (default: 1000)
+    sift_threshold : float, optional
+        Threshold for stopping sifting (default: 0.05)
+    seed : int, optional
+        Random seed for reproducibility
+    
+    Returns:
+    --------
+    List[np.ndarray]
+        List of IMFs, from highest to lowest frequency,
+        plus the residue as the last element
+        
+    Examples:
+    ---------
+    >>> imfs = ceemdan_decomposition(signal)
+    >>> print(f"Number of IMFs: {len(imfs) - 1}")  # -1 for residue
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    n_samples = len(signal)
+    signal_std = np.std(signal)
+    
+    # Store all ensemble IMFs
+    all_imfs = []
+    
+    # Phase 1: Get first IMF through ensemble averaging
+    first_imfs = []
+    for i in range(n_ensembles):
+        # Add white noise scaled adaptively
+        noise = np.random.randn(n_samples) * noise_std * signal_std
+        noisy_signal = signal + noise
+        
+        # Extract first IMF using standard EMD
+        imfs = emd_decomposition(noisy_signal, max_imfs=1, max_iterations=max_iterations, 
+                                  sift_threshold=sift_threshold)
+        if len(imfs) > 0:
+            first_imfs.append(imfs[0])
+    
+    if first_imfs:
+        # Average the first IMFs
+        first_imf = np.mean(first_imfs, axis=0)
+        all_imfs.append(first_imf)
+        residue = signal - first_imf
+    else:
+        residue = signal.copy()
+    
+    # Phase 2: Extract subsequent IMFs
+    for k in range(1, max_imfs):
+        # Check if residue is monotonic
+        if _is_monotonic(residue):
+            break
+        
+        # Generate ensemble IMFs for this level
+        level_imfs = []
+        for i in range(n_ensembles):
+            # Add noise to residue
+            noise = np.random.randn(n_samples) * noise_std * signal_std / (k + 1)
+            noisy_residue = residue + noise
+            
+            # Extract first IMF from noisy residue
+            imfs = emd_decomposition(noisy_residue, max_imfs=1, max_iterations=max_iterations,
+                                      sift_threshold=sift_threshold)
+            if len(imfs) > 0:
+                level_imfs.append(imfs[0])
+        
+        if level_imfs:
+            # Average to get the k-th IMF
+            kth_imf = np.mean(level_imfs, axis=0)
+            all_imfs.append(kth_imf)
+            residue = residue - kth_imf
+        else:
+            break
+    
+    # Add final residue
+    all_imfs.append(residue)
+    
+    return all_imfs
+
+
+def compute_hilbert_spectrum_enhanced(
+    signal: np.ndarray,
+    fs: float,
+    n_freq_bins: int = 256,
+    max_freq: Optional[float] = None,
+    normalize_length: Optional[int] = None,
+    normalize_time: bool = True,
+    normalize_amplitude: bool = False,
+    use_ceemdan: bool = True,
+    log_scale: bool = True,
+    min_amplitude_percentile: float = 5.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute enhanced Hilbert Spectrum with improved visualization for sEMG.
+    
+    This function addresses the issue of mostly black spectrograms by:
+    1. Using log-scale amplitude representation
+    2. Applying adaptive thresholding
+    3. Normalizing time axis for uniform matrix sizes
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal (1D array)
+    fs : float
+        Sampling frequency in Hz
+    n_freq_bins : int, optional
+        Number of frequency bins (default: 256)
+    max_freq : float, optional
+        Maximum frequency to display (default: fs/2)
+    normalize_length : int, optional
+        If provided, resample signal to this length before HHT
+    normalize_time : bool, optional
+        If True, normalize time axis to [0, 1] (default: True)
+    normalize_amplitude : bool, optional
+        If True, normalize amplitude to [0, 1] (default: False)
+    use_ceemdan : bool, optional
+        If True, use CEEMDAN instead of EMD (default: True)
+    log_scale : bool, optional
+        If True, apply log scaling to spectrum (default: True)
+    min_amplitude_percentile : float, optional
+        Percentile threshold for minimum amplitude display (default: 5.0)
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        - Hilbert spectrum matrix (shape: n_freq_bins x normalize_length or n_samples)
+        - Time axis (normalized to [0, 1] if normalize_time=True)
+        - Frequency axis
+    """
+    from scipy.signal import resample
+    
+    # Optionally normalize length
+    original_length = len(signal)
+    if normalize_length is not None and len(signal) != normalize_length:
+        signal = resample(signal, normalize_length)
+    
+    n_samples = len(signal)
+    
+    if max_freq is None:
+        max_freq = fs / 2
+    
+    # Create time axis (normalized or absolute)
+    if normalize_time:
+        time_axis = np.linspace(0, 1, n_samples)
+    else:
+        time_axis = np.arange(n_samples) / fs
+    
+    freq_axis = np.linspace(0, max_freq, n_freq_bins)
+    
+    # Initialize spectrum
+    spectrum = np.zeros((n_freq_bins, n_samples))
+    
+    # Perform decomposition
+    if use_ceemdan:
+        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+    else:
+        imfs = emd_decomposition(signal)
+    
+    # Process each IMF
+    for imf in imfs[:-1]:  # Exclude residue
+        # Compute Hilbert transform
+        _, amplitude, phase = hilbert_transform(imf)
+        
+        # Compute instantaneous frequency
+        inst_freq = compute_instantaneous_frequency(phase, fs)
+        
+        # Map to spectrum with Gaussian smoothing
+        for t in range(n_samples):
+            freq = inst_freq[t]
+            amp = amplitude[t]
+            
+            if 0 <= freq <= max_freq:
+                # Find nearest frequency bin
+                freq_bin = int(freq / max_freq * (n_freq_bins - 1))
+                freq_bin = min(freq_bin, n_freq_bins - 1)
+                
+                # Add to spectrum with slight frequency spreading for smoother display
+                spread = 2  # Frequency bins to spread
+                for df in range(-spread, spread + 1):
+                    fb = freq_bin + df
+                    if 0 <= fb < n_freq_bins:
+                        weight = np.exp(-0.5 * (df / 1.0) ** 2)  # Gaussian weight
+                        spectrum[fb, t] += amp * weight
+    
+    # Apply amplitude processing for better visualization
+    if spectrum.max() > 0:
+        # Apply log scaling
+        if log_scale:
+            # Add small epsilon to avoid log(0)
+            epsilon = np.percentile(spectrum[spectrum > 0], min_amplitude_percentile) if np.any(spectrum > 0) else 1e-10
+            spectrum = np.log1p(spectrum / epsilon)
+        
+        # Normalize amplitude if requested
+        if normalize_amplitude:
+            spectrum = spectrum / spectrum.max()
+    
+    return spectrum, time_axis, freq_axis
+
+
+def extract_semg_features(
+    signal: np.ndarray,
+    fs: float
+) -> Dict[str, float]:
+    """
+    Extract comprehensive sEMG signal features.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input sEMG signal
+    fs : float
+        Sampling frequency in Hz
+    
+    Returns:
+    --------
+    Dict[str, float]
+        Dictionary containing:
+        - WL: Waveform Length
+        - ZC: Zero Crossings
+        - SSC: Slope Sign Changes
+        - MDF: Median Frequency
+        - MNF: Mean Frequency
+        - IMNF: Instantaneous Mean Frequency (from HHT)
+        - WIRE51: Wavelet-based Index of Reliability Estimation
+        - RMS: Root Mean Square
+        - MAV: Mean Absolute Value
+        - VAR: Variance
+        - PKF: Peak Frequency
+        - TTP: Total Power
+    """
+    n_samples = len(signal)
+    
+    # Time domain features
+    # 1. Waveform Length (WL) - sum of absolute differences
+    wl = np.sum(np.abs(np.diff(signal)))
+    
+    # 2. Zero Crossings (ZC)
+    threshold = 0.01 * np.std(signal)  # Small threshold to avoid noise
+    zc = 0
+    for i in range(n_samples - 1):
+        if ((signal[i] > 0 and signal[i + 1] < 0) or 
+            (signal[i] < 0 and signal[i + 1] > 0)) and \
+            abs(signal[i] - signal[i + 1]) > threshold:
+            zc += 1
+    
+    # 3. Slope Sign Changes (SSC)
+    diff_signal = np.diff(signal)
+    ssc = 0
+    for i in range(len(diff_signal) - 1):
+        if ((diff_signal[i] > 0 and diff_signal[i + 1] < 0) or
+            (diff_signal[i] < 0 and diff_signal[i + 1] > 0)) and \
+            abs(diff_signal[i] - diff_signal[i + 1]) > threshold:
+            ssc += 1
+    
+    # 4. RMS, MAV, Variance
+    rms = np.sqrt(np.mean(signal ** 2))
+    mav = np.mean(np.abs(signal))
+    var = np.var(signal)
+    
+    # Frequency domain features
+    # Compute power spectrum
+    fft_signal = np.fft.rfft(signal)
+    power_spectrum = np.abs(fft_signal) ** 2
+    freqs = np.fft.rfftfreq(n_samples, 1/fs)
+    
+    # Total power
+    ttp = np.sum(power_spectrum)
+    
+    # 5. Median Frequency (MDF) - frequency that divides power spectrum in half
+    cumulative_power = np.cumsum(power_spectrum)
+    half_power = ttp / 2
+    mdf_idx = np.searchsorted(cumulative_power, half_power)
+    mdf = freqs[min(mdf_idx, len(freqs) - 1)]
+    
+    # 6. Mean Frequency (MNF) - weighted average of frequencies
+    if ttp > 0:
+        mnf = np.sum(freqs * power_spectrum) / ttp
+    else:
+        mnf = 0
+    
+    # 7. Peak Frequency (PKF)
+    pkf = freqs[np.argmax(power_spectrum)]
+    
+    # 8. IMNF - Instantaneous Mean Frequency (from Hilbert Transform)
+    try:
+        _, amplitude, phase = hilbert_transform(signal)
+        inst_freq = compute_instantaneous_frequency(phase, fs)
+        # Weighted average by amplitude
+        if np.sum(amplitude) > 0:
+            imnf = np.sum(inst_freq * amplitude) / np.sum(amplitude)
+        else:
+            imnf = 0
+        # Ensure reasonable frequency range
+        imnf = np.clip(imnf, 0, fs/2)
+    except Exception:
+        imnf = mnf  # Fallback to MNF
+    
+    # 9. WIRE51 - Wavelet Index of Reliability Estimation (simplified version)
+    # Uses a ratio of high to low frequency power
+    # True WIRE51 requires wavelet decomposition; this is a simplified spectral version
+    low_freq_mask = freqs < 50
+    mid_freq_mask = (freqs >= 50) & (freqs < 150)
+    high_freq_mask = freqs >= 150
+    
+    low_power = np.sum(power_spectrum[low_freq_mask])
+    mid_power = np.sum(power_spectrum[mid_freq_mask])
+    high_power = np.sum(power_spectrum[high_freq_mask])
+    
+    if low_power > 0:
+        wire51 = (mid_power + high_power) / (low_power + 1e-10)
+    else:
+        wire51 = 0
+    
+    return {
+        'WL': float(wl),
+        'ZC': int(zc),
+        'SSC': int(ssc),
+        'MDF': float(mdf),
+        'MNF': float(mnf),
+        'IMNF': float(imnf),
+        'WIRE51': float(wire51),
+        'RMS': float(rms),
+        'MAV': float(mav),
+        'VAR': float(var),
+        'PKF': float(pkf),
+        'TTP': float(ttp)
+    }
+
+
+def batch_hht_analysis(
+    segments: List[np.ndarray],
+    fs: float,
+    n_freq_bins: int = 256,
+    normalize_length: int = 256,
+    max_freq: Optional[float] = None,
+    use_ceemdan: bool = True,
+    extract_features: bool = True
+) -> Dict[str, Union[List[np.ndarray], np.ndarray, List[Dict]]]:
+    """
+    Perform batch HHT analysis on multiple segments.
+    
+    This function processes all segments at once, producing uniform-sized
+    Hilbert spectra suitable for CNN input.
+    
+    Parameters:
+    -----------
+    segments : List[np.ndarray]
+        List of sEMG segments to analyze
+    fs : float
+        Sampling frequency in Hz
+    n_freq_bins : int, optional
+        Number of frequency bins (default: 256)
+    normalize_length : int, optional
+        Target length for all spectra (default: 256)
+    max_freq : float, optional
+        Maximum frequency (default: fs/2)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
+    extract_features : bool, optional
+        Also extract sEMG features (default: True)
+    
+    Returns:
+    --------
+    Dict containing:
+        - 'spectra': List of Hilbert spectrum matrices
+        - 'spectra_array': 3D numpy array (n_segments, n_freq_bins, normalize_length)
+        - 'time': Normalized time axis [0, 1]
+        - 'frequency': Frequency axis
+        - 'features': List of feature dictionaries (if extract_features=True)
+    """
+    spectra = []
+    features_list = []
+    
+    if max_freq is None:
+        max_freq = fs / 2
+    
+    for segment in segments:
+        # Compute enhanced spectrum
+        spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
+            segment, fs,
+            n_freq_bins=n_freq_bins,
+            max_freq=max_freq,
+            normalize_length=normalize_length,
+            normalize_time=True,
+            use_ceemdan=use_ceemdan,
+            log_scale=True
+        )
+        spectra.append(spectrum)
+        
+        # Extract features
+        if extract_features:
+            features = extract_semg_features(segment, fs)
+            features_list.append(features)
+    
+    # Create 3D array for CNN input
+    spectra_array = np.array(spectra)
+    
+    result = {
+        'spectra': spectra,
+        'spectra_array': spectra_array,
+        'time': time_axis,  # Same for all (normalized)
+        'frequency': freq_axis,
+        'n_segments': len(segments)
+    }
+    
+    if extract_features:
+        result['features'] = features_list
+    
+    return result
+
+
+def hht_analysis_enhanced(
+    signal: np.ndarray,
+    fs: float,
+    n_freq_bins: int = 256,
+    max_freq: Optional[float] = None,
+    normalize_length: Optional[int] = None,
+    normalize_time: bool = True,
+    normalize_amplitude: bool = False,
+    use_ceemdan: bool = True,
+    return_imfs: bool = False,
+    extract_features: bool = True
+) -> Dict:
+    """
+    Enhanced Hilbert-Huang Transform analysis with CEEMDAN and feature extraction.
+    
+    This is an improved version of hht_analysis that uses CEEMDAN for more
+    robust decomposition and includes comprehensive feature extraction.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency in Hz
+    n_freq_bins : int, optional
+        Number of frequency bins (default: 256)
+    max_freq : float, optional
+        Maximum frequency (default: fs/2)
+    normalize_length : int, optional
+        Target length for normalization (for uniform CNN input)
+    normalize_time : bool, optional
+        Normalize time axis to [0, 1] (default: True)
+    normalize_amplitude : bool, optional
+        Normalize spectrum amplitude (default: False)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
+    return_imfs : bool, optional
+        Whether to return individual IMFs (default: False)
+    extract_features : bool, optional
+        Whether to extract sEMG features (default: True)
+    
+    Returns:
+    --------
+    Dict containing:
+        - 'spectrum': Hilbert spectrum matrix
+        - 'time': Time axis
+        - 'frequency': Frequency axis
+        - 'imfs': List of IMFs (if return_imfs=True)
+        - 'residue': Residue signal (if return_imfs=True)
+        - 'marginal_spectrum': Marginal Hilbert spectrum
+        - 'mean_frequency': Mean instantaneous frequency
+        - 'dominant_frequency': Dominant frequency at each time point
+        - 'features': sEMG features dictionary (if extract_features=True)
+    """
+    from scipy.signal import resample
+    
+    # Store original length
+    original_length = len(signal)
+    
+    # Normalize length if requested
+    if normalize_length is not None and len(signal) != normalize_length:
+        signal = resample(signal, normalize_length)
+    
+    # Compute enhanced spectrum
+    spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
+        signal, fs,
+        n_freq_bins=n_freq_bins,
+        max_freq=max_freq,
+        normalize_length=None,  # Already resampled above
+        normalize_time=normalize_time,
+        normalize_amplitude=normalize_amplitude,
+        use_ceemdan=use_ceemdan,
+        log_scale=True
+    )
+    
+    # Compute marginal spectrum (integrate over time)
+    marginal_spectrum = np.sum(spectrum, axis=1)
+    
+    # Compute dominant frequency at each time point
+    dominant_freq_idx = np.argmax(spectrum, axis=0)
+    dominant_frequency = freq_axis[dominant_freq_idx]
+    
+    # Compute mean frequency (weighted average)
+    freq_weights = spectrum.sum(axis=1)
+    if freq_weights.sum() > 0:
+        mean_frequency = np.average(freq_axis, weights=freq_weights)
+    else:
+        mean_frequency = 0
+    
+    result = {
+        'spectrum': spectrum,
+        'time': time_axis,
+        'frequency': freq_axis,
+        'marginal_spectrum': marginal_spectrum,
+        'mean_frequency': mean_frequency,
+        'dominant_frequency': dominant_frequency,
+        'original_length': original_length,
+        'normalized_length': len(signal),
+        'use_ceemdan': use_ceemdan,
+    }
+    
+    # Optionally return IMFs
+    if return_imfs:
+        if use_ceemdan:
+            imfs = ceemdan_decomposition(signal)
+        else:
+            imfs = emd_decomposition(signal)
+        result['imfs'] = imfs[:-1]  # All IMFs except residue
+        result['residue'] = imfs[-1]
+    
+    # Extract sEMG features
+    if extract_features:
+        result['features'] = extract_semg_features(signal, fs)
+    
+    return result

@@ -1,7 +1,7 @@
 """
 Data Augmentation module for sEMG signals.
 
-This module implements EMD-based data augmentation techniques:
+This module implements CEEMDAN-based data augmentation techniques:
 1. IMF decomposition and recombination for synthetic signal generation
 2. IMF mixing across different signals for data augmentation
 3. Various augmentation strategies for building sEMG datasets
@@ -9,19 +9,20 @@ This module implements EMD-based data augmentation techniques:
 
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Union
-from .hht import emd_decomposition
+from .hht import emd_decomposition, ceemdan_decomposition
 
 
 def augment_by_imf_mixing(
     signal: np.ndarray,
     n_augmented: int = 5,
     imf_perturbation: float = 0.1,
+    use_ceemdan: bool = True,
     seed: Optional[int] = None
 ) -> List[np.ndarray]:
     """
     Generate augmented signals by perturbing IMF components.
     
-    This method decomposes the signal using EMD, then creates variations
+    This method decomposes the signal using CEEMDAN/EMD, then creates variations
     by slightly modifying each IMF's amplitude and phase.
     
     Parameters:
@@ -32,6 +33,8 @@ def augment_by_imf_mixing(
         Number of augmented signals to generate (default: 5)
     imf_perturbation : float, optional
         Maximum perturbation ratio for IMFs (default: 0.1 = 10%)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
     seed : int, optional
         Random seed for reproducibility
     
@@ -48,8 +51,11 @@ def augment_by_imf_mixing(
     if seed is not None:
         np.random.seed(seed)
     
-    # Decompose original signal
-    imfs = emd_decomposition(signal)
+    # Decompose original signal using CEEMDAN or EMD
+    if use_ceemdan:
+        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+    else:
+        imfs = emd_decomposition(signal)
     
     augmented = [signal.copy()]  # Include original
     
@@ -76,6 +82,7 @@ def augment_by_imf_recombination(
     signals: List[np.ndarray],
     n_augmented: int = 5,
     n_imfs_to_swap: Optional[int] = None,
+    use_ceemdan: bool = True,
     seed: Optional[int] = None
 ) -> List[np.ndarray]:
     """
@@ -92,6 +99,8 @@ def augment_by_imf_recombination(
         Number of augmented signals to generate (default: 5)
     n_imfs_to_swap : int, optional
         Number of IMFs to swap (default: random)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
     seed : int, optional
         Random seed for reproducibility
     
@@ -121,8 +130,11 @@ def augment_by_imf_recombination(
             sig = resample(sig, target_length)
         normalized_signals.append(sig)
     
-    # Decompose all signals
-    all_imfs = [emd_decomposition(sig) for sig in normalized_signals]
+    # Decompose all signals using CEEMDAN or EMD
+    if use_ceemdan:
+        all_imfs = [ceemdan_decomposition(sig, n_ensembles=30) for sig in normalized_signals]
+    else:
+        all_imfs = [emd_decomposition(sig) for sig in normalized_signals]
     
     # Find minimum number of IMFs across all signals
     min_n_imfs = min(len(imfs) for imfs in all_imfs)
@@ -170,6 +182,7 @@ def augment_by_imf_scaling(
     n_augmented: int = 5,
     scale_range: Tuple[float, float] = (0.8, 1.2),
     selective_imfs: Optional[List[int]] = None,
+    use_ceemdan: bool = True,
     seed: Optional[int] = None
 ) -> List[np.ndarray]:
     """
@@ -185,6 +198,8 @@ def augment_by_imf_scaling(
         Range of scaling factors (default: 0.8 to 1.2)
     selective_imfs : List[int], optional
         Indices of IMFs to scale (default: all except residue)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
     seed : int, optional
         Random seed for reproducibility
     
@@ -196,7 +211,11 @@ def augment_by_imf_scaling(
     if seed is not None:
         np.random.seed(seed)
     
-    imfs = emd_decomposition(signal)
+    # Use CEEMDAN or EMD
+    if use_ceemdan:
+        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+    else:
+        imfs = emd_decomposition(signal)
     n_imfs = len(imfs) - 1  # Exclude residue
     
     if selective_imfs is None:
@@ -375,6 +394,7 @@ def comprehensive_augmentation(
     signal: np.ndarray,
     n_per_method: int = 2,
     methods: Optional[List[str]] = None,
+    use_ceemdan: bool = True,
     seed: Optional[int] = None
 ) -> Dict[str, List[np.ndarray]]:
     """
@@ -389,6 +409,8 @@ def comprehensive_augmentation(
     methods : List[str], optional
         List of methods to use (default: all)
         Options: 'imf_mixing', 'imf_scaling', 'noise', 'time_warp'
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
     seed : int, optional
         Random seed for reproducibility
     
@@ -406,16 +428,16 @@ def comprehensive_augmentation(
     if methods is None:
         methods = ['imf_mixing', 'imf_scaling', 'noise', 'time_warp']
     
-    results = {'original': [signal]}
+    results = {'original': [signal.copy()]}
     
     if 'imf_mixing' in methods:
         results['imf_mixing'] = augment_by_imf_mixing(
-            signal, n_augmented=n_per_method, seed=seed
+            signal, n_augmented=n_per_method, use_ceemdan=use_ceemdan, seed=seed
         )[1:]  # Exclude original
     
     if 'imf_scaling' in methods:
         results['imf_scaling'] = augment_by_imf_scaling(
-            signal, n_augmented=n_per_method, seed=seed
+            signal, n_augmented=n_per_method, use_ceemdan=use_ceemdan, seed=seed
         )[1:]  # Exclude original
     
     if 'noise' in methods:
@@ -436,6 +458,7 @@ def batch_augmentation(
     augmentation_method: str = 'imf_mixing',
     n_augmented: int = 5,
     target_length: Optional[int] = None,
+    use_ceemdan: bool = True,
     seed: Optional[int] = None,
     **kwargs
 ) -> List[np.ndarray]:
@@ -453,6 +476,8 @@ def batch_augmentation(
         Number of augmented signals per segment (default: 5)
     target_length : int, optional
         Resample all segments to this length (default: keep original)
+    use_ceemdan : bool, optional
+        Use CEEMDAN instead of EMD (default: True)
     seed : int, optional
         Random seed for reproducibility
     **kwargs : dict
@@ -474,9 +499,10 @@ def batch_augmentation(
     # Special case for imf_recombination which needs multiple signals
     if augmentation_method == 'imf_recombination' and len(segments) >= 2:
         augmented = augment_by_imf_recombination(
-            segments, n_augmented=n_augmented * len(segments), seed=seed
+            segments, n_augmented=n_augmented * len(segments), 
+            use_ceemdan=use_ceemdan, seed=seed
         )
-        return segments + augmented
+        return list(segments) + augmented
     
     # Process each segment
     for i, segment in enumerate(segments):
@@ -484,11 +510,13 @@ def batch_augmentation(
         
         if augmentation_method == 'imf_mixing':
             augmented = augment_by_imf_mixing(
-                segment, n_augmented=n_augmented, seed=seg_seed, **kwargs
+                segment, n_augmented=n_augmented, use_ceemdan=use_ceemdan, 
+                seed=seg_seed, **kwargs
             )
         elif augmentation_method == 'imf_scaling':
             augmented = augment_by_imf_scaling(
-                segment, n_augmented=n_augmented, seed=seg_seed, **kwargs
+                segment, n_augmented=n_augmented, use_ceemdan=use_ceemdan,
+                seed=seg_seed, **kwargs
             )
         elif augmentation_method == 'noise':
             augmented = augment_by_noise_injection(

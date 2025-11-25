@@ -37,8 +37,13 @@ from semg_preprocessing import (
     export_segments_to_csv,
     # HHT functions
     emd_decomposition,
+    ceemdan_decomposition,
     compute_hilbert_spectrum,
+    compute_hilbert_spectrum_enhanced,
     hht_analysis,
+    hht_analysis_enhanced,
+    batch_hht_analysis,
+    extract_semg_features,
     save_hilbert_spectrum,
     # Augmentation functions
     augment_by_imf_mixing,
@@ -295,15 +300,15 @@ class EMGProcessorGUI:
             return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
     
     def perform_hht_analysis(self, segment_index, n_freq_bins, max_freq, normalize_length, 
-                             do_normalize, progress=gr.Progress()):
-        """Perform HHT analysis on a segment."""
+                             do_normalize, use_ceemdan, normalize_amplitude, progress=gr.Progress()):
+        """Perform HHT analysis on a segment using CEEMDAN."""
         try:
             if self.segment_data is None or len(self.segment_data) == 0:
-                return "❌ Please detect segments first", None, None
+                return "❌ Please detect segments first", None
             
             seg_idx = int(segment_index) - 1
             if seg_idx < 0 or seg_idx >= len(self.segment_data):
-                return f"❌ Invalid segment index. Valid range: 1-{len(self.segment_data)}", None, None
+                return f"❌ Invalid segment index. Valid range: 1-{len(self.segment_data)}", None
             
             progress(0.1, desc="Preparing segment...")
             segment = self.segment_data[seg_idx]['data']
@@ -311,34 +316,39 @@ class EMGProcessorGUI:
             # Optionally normalize length
             norm_len = int(normalize_length) if do_normalize else None
             
-            progress(0.3, desc="Computing EMD decomposition...")
+            progress(0.3, desc="Computing CEEMDAN decomposition..." if use_ceemdan else "Computing EMD decomposition...")
             
-            # Perform HHT analysis
+            # Perform enhanced HHT analysis
             progress(0.5, desc="Computing Hilbert spectrum...")
-            self.hht_results = hht_analysis(
+            self.hht_results = hht_analysis_enhanced(
                 segment,
                 fs=self.fs,
                 n_freq_bins=int(n_freq_bins),
                 max_freq=float(max_freq) if max_freq > 0 else None,
                 normalize_length=norm_len,
-                return_imfs=True
+                normalize_time=do_normalize,
+                normalize_amplitude=normalize_amplitude,
+                use_ceemdan=use_ceemdan,
+                return_imfs=True,
+                extract_features=True
             )
             
             # Create spectrum plot
             progress(0.7, desc="Creating visualization...")
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             
-            # Hilbert spectrum
+            # Hilbert spectrum with improved colormap
             ax1 = axes[0, 0]
             spectrum = self.hht_results['spectrum']
             time = self.hht_results['time']
             freq = self.hht_results['frequency']
             
-            im = ax1.pcolormesh(time, freq, spectrum, shading='auto', cmap='hot')
-            ax1.set_xlabel('Time (s)')
+            # Use jet colormap for better sEMG visualization
+            im = ax1.pcolormesh(time, freq, spectrum, shading='auto', cmap='jet')
+            ax1.set_xlabel('Time (normalized)' if do_normalize else 'Time (s)')
             ax1.set_ylabel('Frequency (Hz)')
-            ax1.set_title('Hilbert Spectrum')
-            plt.colorbar(im, ax=ax1, label='Amplitude')
+            ax1.set_title(f'Hilbert Spectrum ({"CEEMDAN" if use_ceemdan else "EMD"})')
+            plt.colorbar(im, ax=ax1, label='Log Amplitude')
             
             # Marginal spectrum
             ax2 = axes[0, 1]
@@ -362,10 +372,11 @@ class EMGProcessorGUI:
             imfs = self.hht_results.get('imfs', [])
             for i, imf in enumerate(imfs[:5]):  # Show first 5 IMFs
                 imf_time = np.arange(len(imf)) / self.fs
-                ax4.plot(imf_time, imf + i * np.max(np.abs(imf)) * 2, label=f'IMF {i+1}', alpha=0.7)
+                offset = i * np.max(np.abs(imf)) * 2 if np.max(np.abs(imf)) > 0 else i
+                ax4.plot(imf_time, imf + offset, label=f'IMF {i+1}', alpha=0.7)
             ax4.set_xlabel('Time (s)')
             ax4.set_ylabel('Amplitude (offset)')
-            ax4.set_title('IMF Components')
+            ax4.set_title('IMF Components (CEEMDAN)' if use_ceemdan else 'IMF Components (EMD)')
             ax4.legend(loc='upper right')
             ax4.grid(True, alpha=0.3)
             
@@ -373,16 +384,27 @@ class EMGProcessorGUI:
             
             progress(1.0, desc="Complete!")
             
+            # Format features display
+            features = self.hht_results.get('features', {})
+            features_str = "\n**sEMG Features:**\n"
+            for key, value in features.items():
+                if isinstance(value, float):
+                    features_str += f"- {key}: {value:.4f}\n"
+                else:
+                    features_str += f"- {key}: {value}\n"
+            
             info = f"""
 ✅ HHT Analysis Complete!
 
 **Segment {seg_idx + 1}:**
 - Original length: {self.hht_results['original_length']} samples
-- Analyzed length: {len(segment)} samples
+- Analyzed length: {self.hht_results['normalized_length']} samples
 - Number of IMFs: {len(imfs)}
 - Mean frequency: {self.hht_results['mean_frequency']:.2f} Hz
-- Frequency bins: {n_freq_bins}
-- Max frequency: {max_freq if max_freq > 0 else self.fs/2} Hz
+- Decomposition: {"CEEMDAN" if use_ceemdan else "EMD"}
+- Time normalized: {"Yes" if do_normalize else "No"}
+- Amplitude normalized: {"Yes" if normalize_amplitude else "No"}
+{features_str}
 """
             
             return info.strip(), fig
@@ -391,8 +413,8 @@ class EMGProcessorGUI:
             return f"❌ Error in HHT analysis: {str(e)}\n{traceback.format_exc()}", None
     
     def perform_augmentation(self, augmentation_method, n_augmented, perturbation, 
-                            segment_index, progress=gr.Progress()):
-        """Perform data augmentation on a segment."""
+                            segment_index, use_ceemdan, progress=gr.Progress()):
+        """Perform data augmentation on a segment using CEEMDAN."""
         try:
             if self.segment_data is None or len(self.segment_data) == 0:
                 return "❌ Please detect segments first", None
@@ -404,17 +426,19 @@ class EMGProcessorGUI:
             progress(0.1, desc="Preparing segment...")
             segment = self.segment_data[seg_idx]['data']
             
-            progress(0.3, desc=f"Performing {augmentation_method} augmentation...")
+            progress(0.3, desc=f"Performing {augmentation_method} augmentation with {'CEEMDAN' if use_ceemdan else 'EMD'}...")
             
             if augmentation_method == 'imf_mixing':
                 self.augmented_signals = augment_by_imf_mixing(
                     segment, n_augmented=int(n_augmented), 
-                    imf_perturbation=float(perturbation)
+                    imf_perturbation=float(perturbation),
+                    use_ceemdan=use_ceemdan
                 )
             elif augmentation_method == 'imf_scaling':
                 self.augmented_signals = augment_by_imf_scaling(
                     segment, n_augmented=int(n_augmented),
-                    scale_range=(1-float(perturbation), 1+float(perturbation))
+                    scale_range=(1-float(perturbation), 1+float(perturbation)),
+                    use_ceemdan=use_ceemdan
                 )
             elif augmentation_method == 'noise_injection':
                 self.augmented_signals = augment_by_noise_injection(
@@ -428,11 +452,13 @@ class EMGProcessorGUI:
                 )
             elif augmentation_method == 'comprehensive':
                 results = comprehensive_augmentation(
-                    segment, n_per_method=max(1, int(n_augmented) // 4)
+                    segment, n_per_method=max(1, int(n_augmented) // 4),
+                    use_ceemdan=use_ceemdan
                 )
-                self.augmented_signals = [segment]
-                for method_signals in results.values():
-                    if method_signals != [segment]:
+                self.augmented_signals = [segment.copy()]
+                # Properly iterate through results without array comparison
+                for method_name, method_signals in results.items():
+                    if method_name != 'original':  # Skip original
                         self.augmented_signals.extend(method_signals)
             
             progress(0.7, desc="Creating visualization...")
@@ -460,6 +486,7 @@ class EMGProcessorGUI:
 ✅ Augmentation Complete!
 
 **Method**: {augmentation_method}
+**Decomposition**: {"CEEMDAN" if use_ceemdan else "EMD"}
 **Original segment**: {seg_idx + 1}
 **Generated signals**: {len(self.augmented_signals)} (including original)
 **Perturbation factor**: {perturbation}
@@ -469,6 +496,92 @@ class EMGProcessorGUI:
         except Exception as e:
             import traceback
             return f"❌ Error in augmentation: {str(e)}\n{traceback.format_exc()}", None
+    
+    def batch_hht_all_segments(self, n_freq_bins, normalize_length, max_freq, 
+                                use_ceemdan, progress=gr.Progress()):
+        """Perform HHT analysis on all detected segments."""
+        try:
+            if self.segment_data is None or len(self.segment_data) == 0:
+                return "❌ Please detect segments first", None
+            
+            progress(0.1, desc="Preparing segments...")
+            
+            # Collect all segment data
+            segments = [seg['data'] for seg in self.segment_data]
+            
+            progress(0.3, desc=f"Performing batch HHT on {len(segments)} segments...")
+            
+            # Perform batch analysis
+            self.batch_hht_results = batch_hht_analysis(
+                segments,
+                fs=self.fs,
+                n_freq_bins=int(n_freq_bins),
+                normalize_length=int(normalize_length),
+                max_freq=float(max_freq) if max_freq > 0 else None,
+                use_ceemdan=use_ceemdan,
+                extract_features=True
+            )
+            
+            progress(0.7, desc="Creating visualization...")
+            
+            # Create visualization showing first 4 spectra
+            n_show = min(len(segments), 4)
+            fig, axes = plt.subplots(2, n_show, figsize=(4*n_show, 8))
+            
+            if n_show == 1:
+                axes = axes.reshape(2, 1)
+            
+            for i in range(n_show):
+                # Spectrum
+                spectrum = self.batch_hht_results['spectra'][i]
+                time = self.batch_hht_results['time']
+                freq = self.batch_hht_results['frequency']
+                
+                im = axes[0, i].pcolormesh(time, freq, spectrum, shading='auto', cmap='jet')
+                axes[0, i].set_title(f'Segment {i+1}')
+                axes[0, i].set_xlabel('Time (norm)')
+                axes[0, i].set_ylabel('Frequency (Hz)')
+                plt.colorbar(im, ax=axes[0, i])
+                
+                # Original signal
+                seg = segments[i]
+                seg_time = np.arange(len(seg)) / self.fs
+                axes[1, i].plot(seg_time, seg, 'b-', linewidth=0.5)
+                axes[1, i].set_title(f'Signal {i+1}')
+                axes[1, i].set_xlabel('Time (s)')
+                axes[1, i].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            progress(1.0, desc="Complete!")
+            
+            # Format features summary
+            features_summary = "\n**Features Summary (first 4 segments):**\n"
+            features_list = self.batch_hht_results.get('features', [])
+            for i, features in enumerate(features_list[:4]):
+                features_summary += f"\n*Segment {i+1}:*\n"
+                features_summary += f"  WL={features['WL']:.2f}, ZC={features['ZC']}, SSC={features['SSC']}\n"
+                features_summary += f"  MDF={features['MDF']:.1f}Hz, MNF={features['MNF']:.1f}Hz, IMNF={features['IMNF']:.1f}Hz\n"
+                features_summary += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}\n"
+            
+            info = f"""
+✅ Batch HHT Analysis Complete!
+
+**Summary:**
+- Total segments: {len(segments)}
+- Spectra shape: {self.batch_hht_results['spectra_array'].shape}
+- Decomposition: {"CEEMDAN" if use_ceemdan else "EMD"}
+- Normalized length: {normalize_length} samples
+- Frequency bins: {n_freq_bins}
+
+All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN input.
+{features_summary}
+"""
+            
+            return info.strip(), fig
+        except Exception as e:
+            import traceback
+            return f"❌ Error in batch HHT: {str(e)}\n{traceback.format_exc()}", None
     
     def export_data(self, output_dir, export_full, export_segments, 
                    subject_id, fatigue_level, quality_rating, action_type, notes,
@@ -729,37 +842,68 @@ def create_gui():
                 gr.Markdown("""
                 ### Hilbert-Huang Transform (HHT) Analysis
                 
-                Perform time-frequency analysis on detected segments using EMD and Hilbert Transform.
+                Perform time-frequency analysis using **CEEMDAN** (Complete Ensemble EMD with Adaptive Noise) 
+                for improved decomposition quality. Extracts sEMG features: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51.
                 """)
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        hht_segment_input = gr.Number(value=1, label="Segment Index", precision=0,
-                                                     info="Which segment to analyze (1-indexed)")
-                        hht_freq_bins = gr.Number(value=256, label="Frequency Bins", precision=0)
-                        hht_max_freq = gr.Number(value=500, label="Max Frequency (Hz, 0=auto)", precision=0)
-                        hht_normalize = gr.Checkbox(value=False, label="Normalize segment length")
-                        hht_norm_length = gr.Number(value=1000, label="Target length (samples)", precision=0,
-                                                    visible=True)
+                with gr.Tabs():
+                    with gr.Tab("Single Segment"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                hht_segment_input = gr.Number(value=1, label="Segment Index", precision=0,
+                                                             info="Which segment to analyze (1-indexed)")
+                                hht_freq_bins = gr.Number(value=256, label="Frequency Bins", precision=0)
+                                hht_max_freq = gr.Number(value=500, label="Max Frequency (Hz, 0=auto)", precision=0)
+                                hht_use_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
+                                hht_normalize = gr.Checkbox(value=True, label="Normalize time axis (for CNN)")
+                                hht_norm_length = gr.Number(value=256, label="Target length (samples)", precision=0)
+                                hht_norm_amp = gr.Checkbox(value=False, label="Normalize amplitude")
+                                
+                                hht_btn = gr.Button("Perform HHT Analysis", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                hht_info = gr.Textbox(label="HHT Results & Features", lines=20)
+                                hht_plot = gr.Plot(label="Hilbert Spectrum & IMFs")
                         
-                        hht_btn = gr.Button("Perform HHT Analysis", variant="primary")
+                        hht_btn.click(
+                            fn=processor.perform_hht_analysis,
+                            inputs=[hht_segment_input, hht_freq_bins, hht_max_freq, hht_norm_length, 
+                                   hht_normalize, hht_use_ceemdan, hht_norm_amp],
+                            outputs=[hht_info, hht_plot]
+                        )
                     
-                    with gr.Column(scale=2):
-                        hht_info = gr.Textbox(label="HHT Results", lines=10)
-                        hht_plot = gr.Plot(label="Hilbert Spectrum")
-                
-                hht_btn.click(
-                    fn=processor.perform_hht_analysis,
-                    inputs=[hht_segment_input, hht_freq_bins, hht_max_freq, hht_norm_length, hht_normalize],
-                    outputs=[hht_info, hht_plot]
-                )
+                    with gr.Tab("Batch HHT (All Segments)"):
+                        gr.Markdown("""
+                        **One-Click Analysis**: Process all detected segments at once.
+                        All spectra will have uniform size for CNN input.
+                        """)
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_hht_freq_bins = gr.Number(value=256, label="Frequency Bins", precision=0)
+                                batch_hht_norm_length = gr.Number(value=256, label="Normalized Length", precision=0)
+                                batch_hht_max_freq = gr.Number(value=500, label="Max Frequency (Hz)", precision=0)
+                                batch_hht_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN")
+                                
+                                batch_hht_btn = gr.Button("🚀 Analyze All Segments", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                batch_hht_info = gr.Textbox(label="Batch Results & Features", lines=20)
+                                batch_hht_plot = gr.Plot(label="Spectra Overview")
+                        
+                        batch_hht_btn.click(
+                            fn=processor.batch_hht_all_segments,
+                            inputs=[batch_hht_freq_bins, batch_hht_norm_length, batch_hht_max_freq, batch_hht_ceemdan],
+                            outputs=[batch_hht_info, batch_hht_plot]
+                        )
             
             # Tab 5: Data Augmentation
             with gr.Tab("🔄 Augmentation / 数据增强"):
                 gr.Markdown("""
-                ### EMD-Based Data Augmentation
+                ### CEEMDAN-Based Data Augmentation
                 
-                Generate synthetic sEMG signals by decomposing and recombining IMF components.
+                Generate synthetic sEMG signals using **CEEMDAN** decomposition for more stable
+                and physically meaningful IMF components.
                 """)
                 
                 with gr.Row():
@@ -770,6 +914,7 @@ def create_gui():
                             value="imf_mixing",
                             label="Augmentation Method"
                         )
+                        aug_use_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
                         aug_n_input = gr.Slider(1, 20, value=5, step=1, label="Number of augmented signals")
                         aug_perturbation = gr.Slider(0.01, 0.5, value=0.1, step=0.01,
                                                     label="Perturbation factor")
@@ -777,12 +922,12 @@ def create_gui():
                         aug_btn = gr.Button("Generate Augmented Data", variant="primary")
                     
                     with gr.Column(scale=2):
-                        aug_info = gr.Textbox(label="Augmentation Results", lines=8)
+                        aug_info = gr.Textbox(label="Augmentation Results", lines=10)
                         aug_plot = gr.Plot(label="Augmented Signals")
                 
                 aug_btn.click(
                     fn=processor.perform_augmentation,
-                    inputs=[aug_method_input, aug_n_input, aug_perturbation, aug_segment_input],
+                    inputs=[aug_method_input, aug_n_input, aug_perturbation, aug_segment_input, aug_use_ceemdan],
                     outputs=[aug_info, aug_plot]
                 )
             
@@ -843,11 +988,14 @@ def create_gui():
                 - Adjust sensitivity for more/fewer detections
                 
                 ### 4. HHT Analysis (希尔伯特-黄变换)
-                - Performs EMD decomposition
+                - **CEEMDAN** decomposition for stable IMFs (recommended)
                 - Generates Hilbert spectrum (time-frequency representation)
-                - Option to normalize segment lengths for uniform spectra
+                - **Batch HHT**: One-click analysis of all segments
+                - **Time normalization**: Uniform spectra sizes for CNN input
+                - **Feature extraction**: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51
                 
                 ### 5. Data Augmentation (数据增强)
+                - **CEEMDAN-based** methods for better stability
                 - **imf_mixing**: Perturb IMF components
                 - **imf_scaling**: Scale IMF amplitudes
                 - **noise_injection**: Add controlled noise
@@ -859,16 +1007,28 @@ def create_gui():
                 - Export segments, HHT spectra, and augmented signals
                 - Custom filename prefixes for organization
                 
+                ## sEMG Features Guide / sEMG特征指南
+                
+                - **WL** (Waveform Length): 波形长度，反映信号复杂度
+                - **ZC** (Zero Crossings): 过零点数，反映频率
+                - **SSC** (Slope Sign Changes): 斜率变化数
+                - **MDF** (Median Frequency): 中值频率，疲劳指标
+                - **MNF** (Mean Frequency): 平均频率
+                - **IMNF** (Instantaneous Mean Freq): 瞬时平均频率
+                - **WIRE51**: 小波可靠性指数
+                - **RMS**: 均方根值，反映信号幅度
+                
                 ## Parameter Guide / 参数指南
                 
                 - **Sensitivity**: 0.5 (more segments) to 2.0 (fewer segments)
                 - **Perturbation**: 0.05 (subtle) to 0.3 (significant variation)
                 - **Quality Rating**: 1 (poor) to 5 (excellent)
+                - **CEEMDAN**: More stable than EMD, recommended for sEMG
                 """)
         
         gr.Markdown("""
         ---
-        **sEMG Preprocessing Toolkit v2.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
+        **sEMG Preprocessing Toolkit v0.3.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
         """)
     
     return app
