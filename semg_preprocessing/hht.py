@@ -13,6 +13,10 @@ from typing import List, Tuple, Optional, Dict, Union
 from scipy.signal import hilbert
 from scipy.interpolate import interp1d
 
+# Module-level constants for CEEMDAN configuration
+DEFAULT_CEEMDAN_ENSEMBLES = 30  # Default number of ensembles for CEEMDAN (30 for speed, 50 for accuracy)
+EPSILON = np.finfo(float).eps  # Machine epsilon for numerical stability
+
 
 def emd_decomposition(
     signal: np.ndarray,
@@ -115,8 +119,8 @@ def _sift_imf(
         # Subtract mean from signal
         h_new = h - mean_env
         
-        # Check for convergence
-        sd = np.sum((h - h_new) ** 2) / (np.sum(h ** 2) + 1e-10)
+        # Check for convergence (use EPSILON for numerical stability)
+        sd = np.sum((h - h_new) ** 2) / (np.sum(h ** 2) + EPSILON)
         h = h_new
         
         if sd < threshold:
@@ -738,7 +742,7 @@ def compute_hilbert_spectrum_enhanced(
     
     # Perform decomposition
     if use_ceemdan:
-        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+        imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
     else:
         imfs = emd_decomposition(signal)
     
@@ -772,9 +776,9 @@ def compute_hilbert_spectrum_enhanced(
     if spectrum.max() > 0:
         # Apply log scaling
         if log_scale:
-            # Add small epsilon to avoid log(0)
-            epsilon = np.percentile(spectrum[spectrum > 0], min_amplitude_percentile) if np.any(spectrum > 0) else 1e-10
-            spectrum = np.log1p(spectrum / epsilon)
+            # Add small epsilon to avoid log(0), use machine epsilon as fallback
+            epsilon_val = np.percentile(spectrum[spectrum > 0], min_amplitude_percentile) if np.any(spectrum > 0) else EPSILON
+            spectrum = np.log1p(spectrum / epsilon_val)
         
         # Normalize amplitude if requested
         if normalize_amplitude:
@@ -893,7 +897,7 @@ def extract_semg_features(
     high_power = np.sum(power_spectrum[high_freq_mask])
     
     if low_power > 0:
-        wire51 = (mid_power + high_power) / (low_power + 1e-10)
+        wire51 = (mid_power + high_power) / (low_power + EPSILON)
     else:
         wire51 = 0
     

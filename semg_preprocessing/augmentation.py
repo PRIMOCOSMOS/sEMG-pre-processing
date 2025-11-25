@@ -9,7 +9,7 @@ This module implements CEEMDAN-based data augmentation techniques:
 
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Union
-from .hht import emd_decomposition, ceemdan_decomposition
+from .hht import emd_decomposition, ceemdan_decomposition, DEFAULT_CEEMDAN_ENSEMBLES
 
 
 def augment_by_imf_mixing(
@@ -53,7 +53,7 @@ def augment_by_imf_mixing(
     
     # Decompose original signal using CEEMDAN or EMD
     if use_ceemdan:
-        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+        imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
     else:
         imfs = emd_decomposition(signal)
     
@@ -132,7 +132,7 @@ def augment_by_imf_recombination(
     
     # Decompose all signals using CEEMDAN or EMD
     if use_ceemdan:
-        all_imfs = [ceemdan_decomposition(sig, n_ensembles=30) for sig in normalized_signals]
+        all_imfs = [ceemdan_decomposition(sig, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES) for sig in normalized_signals]
     else:
         all_imfs = [emd_decomposition(sig) for sig in normalized_signals]
     
@@ -213,7 +213,7 @@ def augment_by_imf_scaling(
     
     # Use CEEMDAN or EMD
     if use_ceemdan:
-        imfs = ceemdan_decomposition(signal, n_ensembles=30)
+        imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
     else:
         imfs = emd_decomposition(signal)
     n_imfs = len(imfs) - 1  # Exclude residue
