@@ -62,14 +62,28 @@ def detect_muscle_activity(
     - Data should be preprocessed (filtered) before detection
     - Adjust amplitude_threshold based on signal characteristics
     """
+    # Define valid parameters for each method to prevent TypeError
+    ruptures_params = {'model', 'pen', 'min_size'}
+    multi_feature_params = {'use_clustering', 'adaptive_pen', 'n_clusters', 'sensitivity', 
+                            'model', 'pen', 'min_size'}
+    
     if method == "ruptures":
-        return _detect_ruptures(data, fs, **kwargs)
+        # Filter kwargs to only valid ruptures parameters
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
+        return _detect_ruptures(data, fs, **filtered_kwargs)
     elif method == "amplitude":
-        return _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration)
+        # Amplitude method uses sensitivity from kwargs if provided
+        sensitivity = kwargs.get('sensitivity', 2.0)
+        return _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
     elif method == "combined":
-        return _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, **kwargs)
+        # Filter kwargs to only valid ruptures parameters for combined
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
+        sensitivity = kwargs.get('sensitivity', 2.0)
+        return _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
     elif method == "multi_feature":
-        return _detect_multi_feature(data, fs, window_size, min_duration, **kwargs)
+        # Filter kwargs to only valid multi_feature parameters
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in multi_feature_params}
+        return _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
     else:
         raise ValueError(f"Unknown method: {method}. Use 'ruptures', 'amplitude', 'combined', or 'multi_feature'")
 
@@ -139,7 +153,8 @@ def _detect_amplitude(
     fs: float,
     threshold: Optional[float] = None,
     window_size: Optional[int] = None,
-    min_duration: float = 0.1
+    min_duration: float = 0.1,
+    sensitivity: float = 2.0
 ) -> List[Tuple[int, int]]:
     """
     Detect muscle activity based on amplitude threshold.
@@ -151,11 +166,14 @@ def _detect_amplitude(
     fs : float
         Sampling frequency
     threshold : float, optional
-        Amplitude threshold (default: 2 * RMS of signal)
+        Amplitude threshold (default: calculated from RMS and sensitivity)
     window_size : int, optional
         Window size for envelope calculation
     min_duration : float
         Minimum activity duration in seconds
+    sensitivity : float
+        Sensitivity multiplier for threshold (lower = more sensitive, default: 2.0)
+        Range: 0.5 (very sensitive) to 5.0 (very strict)
     
     Returns:
     --------
@@ -170,9 +188,9 @@ def _detect_amplitude(
     
     # Auto-calculate threshold if not provided
     if threshold is None:
-        # Use 2 times the RMS value of the signal as threshold
-        # This is more robust than using standard deviation
-        threshold = 2.0 * np.sqrt(np.mean(data ** 2))
+        # Use sensitivity * RMS value of the signal as threshold
+        # Lower sensitivity = lower threshold = more segments detected
+        threshold = sensitivity * np.sqrt(np.mean(data ** 2))
     
     # Find regions above threshold
     above_threshold = envelope > threshold
@@ -204,6 +222,7 @@ def _detect_combined(
     amplitude_threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
+    sensitivity: float = 2.0,
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
@@ -239,7 +258,7 @@ def _detect_combined(
     
     # Get segments from both methods
     ruptures_segments = _detect_ruptures(data, fs, **ruptures_kwargs)
-    amplitude_segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration)
+    amplitude_segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
     
     # Combine segments by finding overlaps
     combined_segments = []
@@ -399,6 +418,7 @@ def _detect_multi_feature(
     use_clustering: bool = True,
     adaptive_pen: bool = True,
     n_clusters: int = 2,
+    sensitivity: float = 1.0,
     **ruptures_kwargs
 ) -> List[Tuple[int, int]]:
     """
@@ -424,6 +444,10 @@ def _detect_multi_feature(
         Use adaptive penalty parameter selection
     n_clusters : int
         Number of clusters for K-means (default: 2 for activity/rest)
+    sensitivity : float
+        Detection sensitivity (default: 1.0)
+        Lower = more sensitive (more segments), Higher = stricter (fewer segments)
+        Range: 0.1 (very sensitive) to 3.0 (very strict)
     **ruptures_kwargs : dict
         Additional arguments for ruptures
     
@@ -442,11 +466,12 @@ def _detect_multi_feature(
     scaler = StandardScaler()
     features_normalized = scaler.fit_transform(features)
     
-    # Determine penalty parameter
+    # Determine penalty parameter (adjusted by sensitivity)
     if adaptive_pen:
-        pen = _calculate_adaptive_penalty(features_normalized, fs)
+        base_pen = _calculate_adaptive_penalty(features_normalized, fs)
+        pen = base_pen * sensitivity  # Apply sensitivity modifier
     else:
-        pen = ruptures_kwargs.get('pen', 3)
+        pen = ruptures_kwargs.get('pen', 3) * sensitivity
     
     # Use ruptures on multi-feature data
     model = ruptures_kwargs.get('model', 'l2')

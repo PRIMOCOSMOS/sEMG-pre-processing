@@ -136,7 +136,7 @@ class EMGProcessorGUI:
         except Exception as e:
             return f"❌ Error applying filters: {str(e)}", None
     
-    def detect_activity(self, method, min_duration, use_clustering, adaptive_pen, progress=gr.Progress()):
+    def detect_activity(self, method, min_duration, sensitivity, use_clustering, adaptive_pen, progress=gr.Progress()):
         """Detect muscle activity segments."""
         try:
             if self.filtered_signal is None:
@@ -145,7 +145,7 @@ class EMGProcessorGUI:
             # Debug info
             print(f"[DEBUG] Starting detection with method={method}, min_duration={min_duration}")
             print(f"[DEBUG] Signal length: {len(self.filtered_signal)}, fs={self.fs}")
-            print(f"[DEBUG] use_clustering={use_clustering}, adaptive_pen={adaptive_pen}")
+            print(f"[DEBUG] sensitivity={sensitivity}, use_clustering={use_clustering}, adaptive_pen={adaptive_pen}")
             
             # Update progress
             progress(0.1, desc="Initializing detection...")
@@ -157,6 +157,7 @@ class EMGProcessorGUI:
                 fs=self.fs,
                 method=method,
                 min_duration=float(min_duration),
+                sensitivity=float(sensitivity),
                 use_clustering=use_clustering,
                 adaptive_pen=adaptive_pen
             )
@@ -332,6 +333,8 @@ def create_gui():
                 - `amplitude`: <1 second (fast)
                 - `combined`: ~8-10 seconds (slower but accurate)
                 - `ruptures`: ~8-10 seconds (change-point only)
+                
+                **Sensitivity**: Lower values = more sensitive (detects more segments), Higher values = stricter (fewer segments)
                 """)
                 
                 with gr.Row():
@@ -344,6 +347,8 @@ def create_gui():
                         )
                         min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
                                                       label="Minimum segment duration (s)")
+                        sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
+                                                     label="Detection Sensitivity (lower=more sensitive)")
                         clustering_input = gr.Checkbox(value=True, label="Use clustering for classification")
                         adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty parameter")
                         
@@ -355,7 +360,7 @@ def create_gui():
                 
                 detect_btn.click(
                     fn=processor.detect_activity,
-                    inputs=[method_input, min_duration_input, clustering_input, adaptive_pen_input],
+                    inputs=[method_input, min_duration_input, sensitivity_input, clustering_input, adaptive_pen_input],
                     outputs=[detect_info, detect_plot]
                 )
             
