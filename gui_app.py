@@ -879,6 +879,176 @@ class EMGProcessorGUI:
             import traceback
             return f"❌ Error in augmentation: {str(e)}\n{traceback.format_exc()}", None
     
+    def perform_batch_augmentation(self, file_objs, n_augmented, fs, value_column, 
+                                    has_header, skip_rows, use_ceemdan, 
+                                    progress=gr.Progress()):
+        """
+        Perform batch data augmentation using CEEMDAN-based IMF recombination.
+        
+        This implements the algorithm:
+        1. Load multiple CSV files as input signals
+        2. Decompose each signal using CEEMDAN into IMFs (pad to 8)
+        3. For each generated signal, randomly select m=8 signals
+        4. From each selected signal, take one random IMF at a unique position
+        5. Sum all selected IMFs to create the artificial signal
+        """
+        try:
+            if file_objs is None or len(file_objs) == 0:
+                return "❌ Please upload CSV files for augmentation", None, None
+            
+            if len(file_objs) < 2:
+                return "❌ Need at least 2 signal files for IMF recombination", None, None
+            
+            progress(0.1, desc="Loading input signals...")
+            
+            # Load all CSV files
+            input_signals = []
+            filenames = []
+            
+            for file_obj in file_objs:
+                try:
+                    signal, df = load_csv_data(
+                        file_obj.name,
+                        value_column=int(value_column),
+                        has_header=has_header,
+                        skip_rows=int(skip_rows)
+                    )
+                    input_signals.append(signal)
+                    filenames.append(os.path.basename(file_obj.name))
+                except Exception as e:
+                    print(f"Warning: Failed to load {file_obj.name}: {e}")
+            
+            if len(input_signals) < 2:
+                return "❌ Failed to load enough valid signal files (need at least 2)", None, None
+            
+            progress(0.3, desc=f"Loaded {len(input_signals)} signals. Starting CEEMDAN decomposition...")
+            
+            # Store input signals for potential export
+            self.batch_augmentation_inputs = input_signals
+            self.batch_augmentation_fs = float(fs)
+            
+            # Perform CEEMDAN-based augmentation
+            progress(0.5, desc=f"Generating {n_augmented} artificial signals using IMF recombination...")
+            
+            self.augmented_signals = augment_ceemdan_random_imf(
+                input_signals,
+                n_augmented=int(n_augmented),
+                use_ceemdan=use_ceemdan
+            )
+            
+            progress(0.8, desc="Creating visualization...")
+            
+            # Create visualization showing original signals and generated signals
+            n_show_input = min(len(input_signals), 4)
+            n_show_output = min(len(self.augmented_signals), 4)
+            n_cols = max(n_show_input, n_show_output)
+            
+            fig, axes = plt.subplots(2, n_cols, figsize=(3.5 * n_cols, 6))
+            
+            # Ensure axes is 2D array even when n_cols == 1
+            if n_cols == 1:
+                axes = axes.reshape(2, 1)
+            
+            # Plot input signals (top row)
+            for i in range(n_cols):
+                if i < n_show_input:
+                    time = np.arange(len(input_signals[i])) / float(fs)
+                    axes[0, i].plot(time, input_signals[i], 'b-', linewidth=0.5, alpha=0.7)
+                    axes[0, i].set_title(f'Input {i+1}: {filenames[i][:15]}', fontsize=9)
+                    axes[0, i].set_xlabel('Time (s)', fontsize=8)
+                    axes[0, i].grid(True, alpha=0.3)
+                else:
+                    axes[0, i].axis('off')
+            
+            # Plot generated signals (bottom row)
+            for i in range(n_cols):
+                if i < n_show_output:
+                    aug_signal = self.augmented_signals[i]
+                    time = np.arange(len(aug_signal)) / float(fs)
+                    axes[1, i].plot(time, aug_signal, 'g-', linewidth=0.5, alpha=0.7)
+                    axes[1, i].set_title(f'Generated {i+1}', fontsize=9)
+                    axes[1, i].set_xlabel('Time (s)', fontsize=8)
+                    axes[1, i].grid(True, alpha=0.3)
+                else:
+                    axes[1, i].axis('off')
+            
+            axes[0, 0].set_ylabel('Input Signals', fontsize=10)
+            axes[1, 0].set_ylabel('Generated Signals', fontsize=10)
+            
+            plt.tight_layout()
+            
+            progress(1.0, desc="Complete!")
+            
+            # Calculate statistics for generated signals
+            gen_lengths = [len(s) for s in self.augmented_signals]
+            gen_rms = [np.sqrt(np.mean(s**2)) for s in self.augmented_signals]
+            
+            info = f"""
+✅ Batch Augmentation Complete!
+
+**Input:**
+- Files loaded: {len(input_signals)}
+- Input file names: {', '.join(filenames[:5])}{'...' if len(filenames) > 5 else ''}
+- Sampling frequency: {fs} Hz
+
+**Output:**
+- Generated signals: {len(self.augmented_signals)}
+- Signal length: {gen_lengths[0]} samples ({gen_lengths[0]/float(fs):.3f} s)
+- Average RMS: {np.mean(gen_rms):.4f} ± {np.std(gen_rms):.4f}
+
+**Method:** CEEMDAN-based IMF recombination
+- Decomposition: {'CEEMDAN' if use_ceemdan else 'EMD'}
+- IMFs per signal: 8 (padded with zeros if fewer)
+- Each generated signal combines 8 IMFs from 8 randomly selected input signals
+"""
+            
+            return info.strip(), fig, f"Generated {len(self.augmented_signals)} signals"
+        except Exception as e:
+            import traceback
+            return f"❌ Error in batch augmentation: {str(e)}\n{traceback.format_exc()}", None, None
+    
+    def export_augmented_signals(self, output_dir, prefix, progress=gr.Progress()):
+        """Export generated augmented signals to CSV files."""
+        try:
+            if self.augmented_signals is None or len(self.augmented_signals) == 0:
+                return "❌ No augmented signals to export. Please generate signals first."
+            
+            progress(0.1, desc="Creating output directory...")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            fs = getattr(self, 'batch_augmentation_fs', self.fs)
+            saved_files = []
+            
+            for i, signal in enumerate(self.augmented_signals):
+                progress((i + 1) / len(self.augmented_signals) * 0.9, 
+                        desc=f"Saving signal {i+1}/{len(self.augmented_signals)}...")
+                
+                filename = f"{prefix}_generated_{i+1:03d}.csv"
+                filepath = os.path.join(output_dir, filename)
+                
+                # Create dataframe with time and signal
+                time = np.arange(len(signal)) / fs
+                df = pd.DataFrame({
+                    'Time': time,
+                    'Signal': signal
+                })
+                df.to_csv(filepath, index=False)
+                saved_files.append(filepath)
+            
+            progress(1.0, desc="Complete!")
+            
+            return f"""
+✅ Export Complete!
+
+- Output directory: {output_dir}
+- Files exported: {len(saved_files)}
+- File prefix: {prefix}_generated_XXX.csv
+- Sampling frequency: {fs} Hz
+"""
+        except Exception as e:
+            import traceback
+            return f"❌ Error exporting signals: {str(e)}\n{traceback.format_exc()}"
+    
     def batch_hht_all_segments(self, n_freq_bins, normalize_length, max_freq, 
                                 use_ceemdan, progress=gr.Progress()):
         """Perform HHT analysis on all detected segments."""
@@ -1404,40 +1574,106 @@ def create_gui():
             # Tab 5: Data Augmentation
             with gr.Tab("🔄 Augmentation / 数据增强"):
                 gr.Markdown("""
-                ### CEEMDAN-Based Data Augmentation
+                ### CEEMDAN-Based Data Augmentation (基于CEEMDAN的数据增强)
                 
                 Generate synthetic sEMG signals using **CEEMDAN** decomposition for more stable
                 and physically meaningful IMF components.
-                
-                **Recommended**: `ceemdan_random_imf` for dataset building (uses all segments to generate new signals).
                 """)
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        aug_segment_input = gr.Number(value=1, label="Segment Index", precision=0)
-                        aug_method_input = gr.Radio(
-                            ["imf_mixing", "imf_scaling", "noise_injection", "time_warping", 
-                             "ceemdan_random_imf", "comprehensive"],
-                            value="ceemdan_random_imf",
-                            label="Augmentation Method",
-                            info="ceemdan_random_imf: Uses all segments to generate new signals (best for dataset building)"
-                        )
-                        aug_use_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
-                        aug_n_input = gr.Slider(1, 50, value=10, step=1, label="Number of augmented signals")
-                        aug_perturbation = gr.Slider(0.01, 0.5, value=0.1, step=0.01,
-                                                    label="Perturbation factor (for mixing/scaling/noise)")
+                with gr.Tabs():
+                    with gr.Tab("Single Segment Augmentation"):
+                        gr.Markdown("**Augment from detected segments** - Use segments from the loaded/processed signal")
                         
-                        aug_btn = gr.Button("Generate Augmented Data", variant="primary")
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                aug_segment_input = gr.Number(value=1, label="Segment Index", precision=0)
+                                aug_method_input = gr.Radio(
+                                    ["imf_mixing", "imf_scaling", "noise_injection", "time_warping", 
+                                     "ceemdan_random_imf", "comprehensive"],
+                                    value="ceemdan_random_imf",
+                                    label="Augmentation Method",
+                                    info="ceemdan_random_imf: Uses all segments to generate new signals"
+                                )
+                                aug_use_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
+                                aug_n_input = gr.Slider(1, 50, value=10, step=1, label="Number of augmented signals")
+                                aug_perturbation = gr.Slider(0.01, 0.5, value=0.1, step=0.01,
+                                                            label="Perturbation factor (for mixing/scaling/noise)")
+                                
+                                aug_btn = gr.Button("Generate Augmented Data", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                aug_info = gr.Textbox(label="Augmentation Results", lines=10)
+                                aug_plot = gr.Plot(label="Augmented Signals")
+                        
+                        aug_btn.click(
+                            fn=processor.perform_augmentation,
+                            inputs=[aug_method_input, aug_n_input, aug_perturbation, aug_segment_input, aug_use_ceemdan],
+                            outputs=[aug_info, aug_plot]
+                        )
                     
-                    with gr.Column(scale=2):
-                        aug_info = gr.Textbox(label="Augmentation Results", lines=10)
-                        aug_plot = gr.Plot(label="Augmented Signals")
-                
-                aug_btn.click(
-                    fn=processor.perform_augmentation,
-                    inputs=[aug_method_input, aug_n_input, aug_perturbation, aug_segment_input, aug_use_ceemdan],
-                    outputs=[aug_info, aug_plot]
-                )
+                    with gr.Tab("Batch File Augmentation / 批量文件增强"):
+                        gr.Markdown("""
+                        ### Batch IMF Recombination Data Augmentation (批量IMF重组数据增强)
+                        
+                        **Algorithm / 算法说明:**
+                        1. Load multiple CSV sEMG signal files as input (加载多个CSV信号文件作为输入)
+                        2. Decompose each signal using CEEMDAN into IMFs, pad to 8 IMFs (使用CEEMDAN分解为IMF，补齐到8个)
+                        3. For each generated signal, randomly select m=8 signals (对于每个生成信号，随机选择m=8个信号)
+                        4. From each selected signal, take one random IMF at a unique position (从每个选中信号取一个不同位置的IMF)
+                        5. Sum all selected IMFs to create the artificial signal (将所有选中的IMF相加生成人工信号)
+                        
+                        **Note:** This method requires at least 2 input signal files. More input files = more variety in generated signals.
+                        """)
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_aug_file_input = gr.File(
+                                    label="Select CSV Signal Files (选择CSV信号文件)", 
+                                    file_types=['.csv'],
+                                    file_count="multiple"
+                                )
+                                batch_aug_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
+                                batch_aug_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
+                                batch_aug_header_input = gr.Checkbox(value=True, label="Files have header row")
+                                batch_aug_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
+                                                                      info="For files with 2 header rows, set this to 1")
+                                batch_aug_n_input = gr.Slider(1, 100, value=20, step=1, 
+                                                              label="Number of signals to generate (目标生成数量)")
+                                batch_aug_ceemdan_input = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
+                                
+                                batch_aug_btn = gr.Button("🚀 Generate Artificial Signals", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                batch_aug_info = gr.Textbox(label="Batch Augmentation Results", lines=15)
+                                batch_aug_plot = gr.Plot(label="Input vs Generated Signals")
+                                batch_aug_status = gr.Textbox(label="Status", lines=1)
+                        
+                        batch_aug_btn.click(
+                            fn=processor.perform_batch_augmentation,
+                            inputs=[batch_aug_file_input, batch_aug_n_input, batch_aug_fs_input, 
+                                   batch_aug_column_input, batch_aug_header_input, batch_aug_skip_rows_input, 
+                                   batch_aug_ceemdan_input],
+                            outputs=[batch_aug_info, batch_aug_plot, batch_aug_status]
+                        )
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("### Export Generated Signals (导出生成的信号)")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_aug_output_dir = gr.Textbox(value="./output/augmented", 
+                                                                  label="Output Directory")
+                                batch_aug_prefix = gr.Textbox(value="artificial_semg", 
+                                                              label="File prefix")
+                                batch_aug_export_btn = gr.Button("💾 Export Generated Signals", variant="secondary")
+                            with gr.Column(scale=2):
+                                batch_aug_export_info = gr.Textbox(label="Export Status", lines=5)
+                        
+                        batch_aug_export_btn.click(
+                            fn=processor.export_augmented_signals,
+                            inputs=[batch_aug_output_dir, batch_aug_prefix],
+                            outputs=[batch_aug_export_info]
+                        )
             
             # Tab 6: Export Results
             with gr.Tab("💾 Export Results / 导出结果"):
@@ -1558,13 +1794,21 @@ def create_gui():
                 - **Feature extraction**: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51, DI
                 
                 ### 5. Data Augmentation (数据增强)
-                - **CEEMDAN-based** methods for better stability
-                - **ceemdan_random_imf**: (Recommended) Use all segments to generate new signals via random IMF combination
-                - **imf_mixing**: Perturb IMF components of a single segment
+                - **Single Segment**: Augment from detected segments in the loaded signal
+                - **Batch File Augmentation** (推荐): 
+                  - Upload multiple CSV signal files directly
+                  - Specify target number of generated signals
+                  - Uses CEEMDAN-based IMF recombination algorithm:
+                    1. Decompose each input signal into IMFs (pad to 8)
+                    2. For each generated signal, randomly select 8 source signals
+                    3. Each source contributes 1 IMF at a unique position
+                    4. Sum all 8 IMFs to create artificial signal
+                  - Export generated signals to CSV files
                 
                 ### 6. Export (导出)
                 - **Single File Export**: Export processed signal, segments, and features
                 - **Batch Export**: Export all batch-processed features to CSV
+                - **Augmented Signals Export**: Export generated artificial signals to CSV
                 - Add annotations: subject ID, fatigue level, quality rating
                 
                 ---
@@ -1576,6 +1820,13 @@ def create_gui():
                 3. **Detect**: Batch Detection tab → Detect in All Files
                 4. **Features**: Batch Detection tab → Extract Features from All Segments
                 5. **Export**: Batch Export tab → Export All Batch Features
+                
+                ## Data Augmentation Workflow / 数据增强工作流程
+                
+                1. **Upload**: Augmentation → Batch File Augmentation tab → Select CSV files
+                2. **Configure**: Set target number of signals to generate
+                3. **Generate**: Click "Generate Artificial Signals"
+                4. **Export**: Click "Export Generated Signals" to save to CSV
                 
                 ---
                 
