@@ -13,7 +13,8 @@ def load_csv_data(
     filepath: str,
     value_column: int = 1,
     has_header: bool = True,
-    delimiter: str = ','
+    delimiter: str = ',',
+    skip_rows: int = 0
 ) -> Tuple[np.ndarray, Optional[pd.DataFrame]]:
     """
     Load sEMG data from CSV file.
@@ -31,6 +32,11 @@ def load_csv_data(
         Whether the CSV file has a header row (default: True)
     delimiter : str, optional
         CSV delimiter (default: ',')
+    skip_rows : int, optional
+        Number of rows to skip at the beginning of the file before reading data
+        (default: 0). Use this for files with multiple header/metadata rows.
+        For example, if the file has 2 header rows and data starts from row 3,
+        set skip_rows=2 and has_header=False, or skip_rows=1 and has_header=True.
     
     Returns:
     --------
@@ -42,12 +48,16 @@ def load_csv_data(
     ---------
     >>> signal, df = load_csv_data('emg_data.csv')
     >>> signal, df = load_csv_data('emg_data.csv', value_column=2, has_header=False)
+    >>> # For files with 2 header rows (metadata + column names):
+    >>> signal, df = load_csv_data('emg_data.csv', skip_rows=1, has_header=True)
+    >>> # For files with 2 header rows but no column names:
+    >>> signal, df = load_csv_data('emg_data.csv', skip_rows=2, has_header=False)
     """
-    # Read CSV file
+    # Read CSV file with optional row skipping
     if has_header:
-        df = pd.read_csv(filepath, delimiter=delimiter)
+        df = pd.read_csv(filepath, delimiter=delimiter, skiprows=skip_rows)
     else:
-        df = pd.read_csv(filepath, delimiter=delimiter, header=None)
+        df = pd.read_csv(filepath, delimiter=delimiter, header=None, skiprows=skip_rows)
     
     # Extract signal data from specified column
     if value_column >= len(df.columns):
@@ -70,7 +80,8 @@ def batch_load_csv(
     pattern: str = "*.csv",
     value_column: int = 1,
     has_header: bool = True,
-    delimiter: str = ','
+    delimiter: str = ',',
+    skip_rows: int = 0
 ) -> List[Dict]:
     """
     Load multiple CSV files from a directory for batch processing.
@@ -87,6 +98,9 @@ def batch_load_csv(
         Whether CSV files have header rows (default: True)
     delimiter : str, optional
         CSV delimiter (default: ',')
+    skip_rows : int, optional
+        Number of rows to skip at the beginning of each file (default: 0).
+        Use this for files with multiple header/metadata rows.
     
     Returns:
     --------
@@ -102,6 +116,8 @@ def batch_load_csv(
     >>> data_list = batch_load_csv('./raw_data/')
     >>> for data in data_list:
     ...     print(f"Loaded {data['filename']}: {len(data['signal'])} samples")
+    >>> # For files with 2 header rows:
+    >>> data_list = batch_load_csv('./raw_data/', skip_rows=1, has_header=True)
     """
     # Find all matching files
     file_pattern = os.path.join(input_dir, pattern)
@@ -114,7 +130,7 @@ def batch_load_csv(
     
     for filepath in files:
         try:
-            signal, df = load_csv_data(filepath, value_column, has_header, delimiter)
+            signal, df = load_csv_data(filepath, value_column, has_header, delimiter, skip_rows)
             filename = os.path.splitext(os.path.basename(filepath))[0]
             
             loaded_data.append({

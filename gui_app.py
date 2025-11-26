@@ -75,12 +75,15 @@ class EMGProcessorGUI:
         # Batch processing state
         self.batch_data = []
         self.batch_results = []
+        self.batch_filtered = []  # Store filtered signals for batch
+        self.batch_segments = []  # Store segments for batch
+        self.batch_features = []  # Store features for batch
         # HHT results
         self.hht_results = None
         # Augmentation results
         self.augmented_signals = None
         
-    def load_file(self, file_obj, fs, value_column, has_header):
+    def load_file(self, file_obj, fs, value_column, has_header, skip_rows):
         """Load CSV file and extract signal."""
         try:
             if file_obj is None:
@@ -91,7 +94,8 @@ class EMGProcessorGUI:
             self.signal, self.df = load_csv_data(
                 file_obj.name,
                 value_column=int(value_column),
-                has_header=has_header
+                has_header=has_header,
+                skip_rows=int(skip_rows)
             )
             self.current_filename = os.path.basename(file_obj.name)
             
@@ -112,6 +116,7 @@ class EMGProcessorGUI:
 - Duration: {len(self.signal)/self.fs:.2f} seconds
 - Sampling frequency: {self.fs} Hz
 - Signal range: [{self.signal.min():.3f}, {self.signal.max():.3f}]
+- Skipped rows: {skip_rows}
             """
             
             return info.strip(), fig
@@ -119,7 +124,7 @@ class EMGProcessorGUI:
             import traceback
             return f"❌ Error loading file: {str(e)}\n{traceback.format_exc()}", None
     
-    def load_batch_files(self, file_objs, fs, value_column, has_header, progress=gr.Progress()):
+    def load_batch_files(self, file_objs, fs, value_column, has_header, skip_rows, progress=gr.Progress()):
         """Load multiple CSV files for batch processing."""
         try:
             if file_objs is None or len(file_objs) == 0:
@@ -127,6 +132,9 @@ class EMGProcessorGUI:
             
             self.fs = float(fs)
             self.batch_data = []
+            self.batch_filtered = []
+            self.batch_segments = []
+            self.batch_features = []
             
             progress(0.1, desc="Loading files...")
             
@@ -137,7 +145,8 @@ class EMGProcessorGUI:
                     signal, df = load_csv_data(
                         file_obj.name,
                         value_column=int(value_column),
-                        has_header=has_header
+                        has_header=has_header,
+                        skip_rows=int(skip_rows)
                     )
                     
                     self.batch_data.append({
@@ -151,17 +160,29 @@ class EMGProcessorGUI:
             
             progress(1.0, desc="Complete!")
             
-            # Create summary plot
-            fig, axes = plt.subplots(min(len(self.batch_data), 4), 1, figsize=(12, 3*min(len(self.batch_data), 4)))
-            if len(self.batch_data) == 1:
-                axes = [axes]
+            # Create summary plot showing all files
+            n_files = len(self.batch_data)
+            n_show = min(n_files, 8)  # Show up to 8 files
+            n_cols = 2 if n_show > 4 else 1
+            n_rows = (n_show + n_cols - 1) // n_cols
             
-            for i, data in enumerate(self.batch_data[:4]):
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(12 if n_cols == 2 else 12, 2.5*n_rows))
+            if n_show == 1:
+                axes = np.array([[axes]])
+            elif n_cols == 1:
+                axes = axes.reshape(-1, 1)
+            axes = axes.flatten()
+            
+            for i, data in enumerate(self.batch_data[:n_show]):
                 time = np.arange(len(data['signal'])) / self.fs
                 axes[i].plot(time, data['signal'], 'b-', linewidth=0.5, alpha=0.7)
-                axes[i].set_title(data['filename'])
-                axes[i].set_xlabel('Time (s)')
+                axes[i].set_title(data['filename'], fontsize=9)
+                axes[i].set_xlabel('Time (s)', fontsize=8)
                 axes[i].grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for j in range(n_show, len(axes)):
+                axes[j].axis('off')
             
             plt.tight_layout()
             
@@ -169,6 +190,7 @@ class EMGProcessorGUI:
 ✅ Batch loading complete!
 - Files loaded: {len(self.batch_data)} / {len(file_objs)}
 - Sampling frequency: {self.fs} Hz
+- Skipped rows: {skip_rows}
 
 **Loaded files:**
 """
@@ -234,6 +256,91 @@ class EMGProcessorGUI:
         except Exception as e:
             import traceback
             return f"❌ Error applying filters: {str(e)}\n{traceback.format_exc()}", None
+    
+    def apply_batch_filters(self, lowcut, highcut, filter_order, notch_freq, harmonics_str, progress=gr.Progress()):
+        """Apply bandpass and notch filters to all batch-loaded files."""
+        try:
+            if not self.batch_data:
+                return "❌ Please load batch files first", None
+            
+            self.batch_filtered = []
+            harmonics = [int(x.strip()) for x in harmonics_str.split(',') if x.strip()] if notch_freq > 0 else []
+            
+            progress(0.1, desc="Starting batch filtering...")
+            
+            for i, data in enumerate(self.batch_data):
+                progress((i + 1) / len(self.batch_data) * 0.8, desc=f"Filtering {data['filename']}...")
+                
+                # Apply bandpass filter
+                filtered = apply_bandpass_filter(
+                    data['signal'],
+                    fs=self.fs,
+                    lowcut=float(lowcut),
+                    highcut=float(highcut),
+                    order=int(filter_order)
+                )
+                
+                # Apply notch filter if enabled
+                if notch_freq > 0:
+                    filtered = apply_notch_filter(
+                        filtered,
+                        fs=self.fs,
+                        freq=float(notch_freq),
+                        harmonics=harmonics
+                    )
+                
+                self.batch_filtered.append({
+                    'filename': data['filename'],
+                    'original': data['signal'],
+                    'filtered': filtered
+                })
+            
+            progress(1.0, desc="Complete!")
+            
+            # Also set single signal for downstream processing if only one file
+            if len(self.batch_filtered) == 1:
+                self.signal = self.batch_data[0]['signal']
+                self.filtered_signal = self.batch_filtered[0]['filtered']
+            
+            # Create summary visualization showing all filtered signals
+            n_files = len(self.batch_filtered)
+            n_show = min(n_files, 6)
+            n_cols = 2
+            n_rows = (n_show + 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3*n_rows))
+            if n_show == 1:
+                axes = np.array([[axes]])
+            axes = axes.flatten()
+            
+            for i, data in enumerate(self.batch_filtered[:n_show]):
+                time = np.arange(len(data['filtered'])) / self.fs
+                axes[i].plot(time, data['filtered'], 'g-', linewidth=0.5, alpha=0.7)
+                axes[i].set_title(f"{data['filename']} (Filtered)", fontsize=9)
+                axes[i].set_xlabel('Time (s)', fontsize=8)
+                axes[i].grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for j in range(n_show, len(axes)):
+                axes[j].axis('off')
+            
+            plt.tight_layout()
+            
+            info = f"""
+✅ Batch filtering complete!
+- Files processed: {len(self.batch_filtered)}
+- Bandpass: {lowcut}-{highcut} Hz (order {filter_order})
+- Notch: {notch_freq} Hz (harmonics: {harmonics_str if notch_freq > 0 else 'N/A'})
+
+**Filtered files:**
+"""
+            for data in self.batch_filtered:
+                info += f"\n- {data['filename']}: {len(data['filtered'])} samples"
+            
+            return info.strip(), fig
+        except Exception as e:
+            import traceback
+            return f"❌ Error applying batch filters: {str(e)}\n{traceback.format_exc()}", None
     
     def detect_activity(self, method, min_duration, sensitivity, use_clustering, adaptive_pen, progress=gr.Progress()):
         """Detect muscle activity segments."""
@@ -301,6 +408,256 @@ class EMGProcessorGUI:
         except Exception as e:
             import traceback
             return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
+    
+    def detect_batch_activity(self, method, min_duration, sensitivity, use_clustering, adaptive_pen, progress=gr.Progress()):
+        """Detect muscle activity in all batch-filtered files."""
+        try:
+            if not self.batch_filtered:
+                return "❌ Please apply batch filters first", None
+            
+            self.batch_segments = []
+            total_segments = 0
+            
+            progress(0.1, desc="Starting batch detection...")
+            
+            for i, data in enumerate(self.batch_filtered):
+                progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']}...")
+                
+                # Detect muscle activity
+                segments = detect_muscle_activity(
+                    data['filtered'],
+                    fs=self.fs,
+                    method=method,
+                    min_duration=float(min_duration),
+                    sensitivity=float(sensitivity),
+                    use_clustering=use_clustering,
+                    adaptive_pen=adaptive_pen
+                )
+                
+                # Get detailed segment information
+                segment_data = segment_signal(
+                    data['filtered'],
+                    segments,
+                    fs=self.fs,
+                    include_metadata=True
+                )
+                
+                self.batch_segments.append({
+                    'filename': data['filename'],
+                    'filtered': data['filtered'],
+                    'segments': segments,
+                    'segment_data': segment_data
+                })
+                total_segments += len(segments)
+            
+            progress(0.8, desc="Creating visualization...")
+            
+            # Also set single file for downstream if only one file
+            if len(self.batch_segments) == 1:
+                self.filtered_signal = self.batch_filtered[0]['filtered']
+                self.segments = self.batch_segments[0]['segments']
+                self.segment_data = self.batch_segments[0]['segment_data']
+            
+            # Create summary visualization
+            n_files = len(self.batch_segments)
+            n_show = min(n_files, 6)
+            n_cols = 2
+            n_rows = (n_show + 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3*n_rows))
+            if n_show == 1:
+                axes = np.array([[axes]])
+            axes = axes.flatten()
+            
+            for i, data in enumerate(self.batch_segments[:n_show]):
+                time = np.arange(len(data['filtered'])) / self.fs
+                axes[i].plot(time, data['filtered'], 'k-', linewidth=0.5, alpha=0.5)
+                
+                # Highlight detected segments
+                colors = plt.cm.Set1(np.linspace(0, 1, max(len(data['segments']), 1)))
+                for j, (start, end) in enumerate(data['segments']):
+                    axes[i].axvspan(start/self.fs, end/self.fs, alpha=0.3, color=colors[j % len(colors)])
+                
+                axes[i].set_title(f"{data['filename']} ({len(data['segments'])} segs)", fontsize=9)
+                axes[i].set_xlabel('Time (s)', fontsize=8)
+                axes[i].grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for j in range(n_show, len(axes)):
+                axes[j].axis('off')
+            
+            plt.tight_layout()
+            
+            progress(1.0, desc="Complete!")
+            
+            info = f"""
+✅ Batch detection complete!
+- Files processed: {len(self.batch_segments)}
+- Total segments detected: {total_segments}
+- Method: {method}
+
+**Detection results:**
+"""
+            for data in self.batch_segments:
+                info += f"\n- {data['filename']}: {len(data['segments'])} segments"
+                if data['segment_data']:
+                    avg_duration = np.mean([s['duration'] for s in data['segment_data']])
+                    avg_rms = np.mean([s['rms'] for s in data['segment_data']])
+                    info += f" (avg duration: {avg_duration:.3f}s, avg RMS: {avg_rms:.4f})"
+            
+            return info.strip(), fig
+        except Exception as e:
+            import traceback
+            return f"❌ Error in batch detection: {str(e)}\n{traceback.format_exc()}", None
+    
+    def extract_batch_features(self, progress=gr.Progress()):
+        """Extract features from all segments in batch-processed files."""
+        try:
+            if not self.batch_segments:
+                return "❌ Please run batch detection first", None
+            
+            self.batch_features = []
+            total_segments = 0
+            
+            progress(0.1, desc="Starting feature extraction...")
+            
+            for i, data in enumerate(self.batch_segments):
+                progress((i + 1) / len(self.batch_segments) * 0.8, desc=f"Extracting from {data['filename']}...")
+                
+                file_features = []
+                for seg in data['segment_data']:
+                    features = extract_semg_features(seg['data'], self.fs)
+                    features['segment_start'] = seg['start_time']
+                    features['segment_end'] = seg['end_time']
+                    features['segment_duration'] = seg['duration']
+                    file_features.append(features)
+                    total_segments += 1
+                
+                self.batch_features.append({
+                    'filename': data['filename'],
+                    'features': file_features
+                })
+            
+            progress(1.0, desc="Complete!")
+            
+            # Create summary visualization of key features
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            
+            # Collect all features for plotting
+            all_rms = []
+            all_mdf = []
+            all_mnf = []
+            all_di = []
+            file_labels = []
+            
+            for data in self.batch_features:
+                for feat in data['features']:
+                    all_rms.append(feat['RMS'])
+                    all_mdf.append(feat['MDF'])
+                    all_mnf.append(feat['MNF'])
+                    all_di.append(feat['DI'])
+                    file_labels.append(data['filename'][:15])  # Truncate for display
+            
+            # Plot RMS distribution
+            axes[0, 0].bar(range(len(all_rms)), all_rms, color='steelblue', alpha=0.7)
+            axes[0, 0].set_title('RMS by Segment')
+            axes[0, 0].set_xlabel('Segment Index')
+            axes[0, 0].set_ylabel('RMS')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Plot MDF distribution
+            axes[0, 1].bar(range(len(all_mdf)), all_mdf, color='coral', alpha=0.7)
+            axes[0, 1].set_title('Median Frequency (MDF) by Segment')
+            axes[0, 1].set_xlabel('Segment Index')
+            axes[0, 1].set_ylabel('MDF (Hz)')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Plot MNF distribution
+            axes[1, 0].bar(range(len(all_mnf)), all_mnf, color='seagreen', alpha=0.7)
+            axes[1, 0].set_title('Mean Frequency (MNF) by Segment')
+            axes[1, 0].set_xlabel('Segment Index')
+            axes[1, 0].set_ylabel('MNF (Hz)')
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Plot Dimitrov Index distribution
+            axes[1, 1].bar(range(len(all_di)), all_di, color='purple', alpha=0.7)
+            axes[1, 1].set_title('Dimitrov Index (DI) by Segment')
+            axes[1, 1].set_xlabel('Segment Index')
+            axes[1, 1].set_ylabel('DI')
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            info = f"""
+✅ Batch feature extraction complete!
+- Files processed: {len(self.batch_features)}
+- Total segments: {total_segments}
+
+**Feature summary (averages across all segments):**
+- RMS: {np.mean(all_rms):.4f} ± {np.std(all_rms):.4f}
+- MDF: {np.mean(all_mdf):.2f} ± {np.std(all_mdf):.2f} Hz
+- MNF: {np.mean(all_mnf):.2f} ± {np.std(all_mnf):.2f} Hz
+- DI: {np.mean(all_di):.2f} ± {np.std(all_di):.2f}
+
+**Per-file breakdown:**
+"""
+            for data in self.batch_features:
+                if data['features']:
+                    avg_rms = np.mean([f['RMS'] for f in data['features']])
+                    avg_mdf = np.mean([f['MDF'] for f in data['features']])
+                    avg_di = np.mean([f['DI'] for f in data['features']])
+                    info += f"\n- {data['filename']}: {len(data['features'])} segs, RMS={avg_rms:.4f}, MDF={avg_mdf:.1f}Hz, DI={avg_di:.2f}"
+            
+            return info.strip(), fig
+        except Exception as e:
+            import traceback
+            return f"❌ Error extracting features: {str(e)}\n{traceback.format_exc()}", None
+    
+    def export_batch_features(self, output_path, subject_id, fatigue_level, progress=gr.Progress()):
+        """Export all batch features to a CSV file."""
+        try:
+            if not self.batch_features:
+                return "❌ Please extract batch features first"
+            
+            progress(0.2, desc="Preparing features for export...")
+            
+            all_features = []
+            segment_names = []
+            
+            for file_data in self.batch_features:
+                for i, feat in enumerate(file_data['features']):
+                    feat_copy = feat.copy()
+                    feat_copy['source_file'] = file_data['filename']
+                    all_features.append(feat_copy)
+                    segment_names.append(f"{file_data['filename']}_seg{i+1:03d}")
+            
+            progress(0.6, desc="Writing CSV...")
+            
+            # Build annotations
+            annotations = {}
+            if subject_id:
+                annotations['Subject'] = subject_id
+            if fatigue_level:
+                annotations['Fatigue_Level'] = fatigue_level
+            
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+            
+            # Export
+            export_features_to_csv(all_features, output_path, segment_names, annotations)
+            
+            progress(1.0, desc="Complete!")
+            
+            return f"""
+✅ Batch features exported to: {output_path}
+
+- Total segments: {len(all_features)}
+- Files included: {len(self.batch_features)}
+- Features per segment: {len(all_features[0]) if all_features else 0}
+"""
+        except Exception as e:
+            import traceback
+            return f"❌ Error exporting features: {str(e)}\n{traceback.format_exc()}"
     
     def perform_hht_analysis(self, segment_index, n_freq_bins, max_freq, normalize_length, 
                              do_normalize, use_ceemdan, normalize_amplitude, progress=gr.Progress()):
@@ -771,11 +1128,12 @@ def create_gui():
         HHT analysis, data augmentation, and batch processing.
         
         **New Features:**
-        - 📁 Batch file processing for dataset building
+        - 📁 Batch file processing for dataset building (全流程批处理)
         - 📊 Hilbert-Huang Transform (HHT) analysis
         - 🔄 EMD-based data augmentation
         - 🏷️ Data annotation support
         - 💾 Comprehensive export options
+        - 📈 Enhanced visualization for all results
         """)
         
         with gr.Tabs():
@@ -792,40 +1150,47 @@ def create_gui():
                                 column_input = gr.Number(value=1, label="Signal Column Index", precision=0,
                                                         info="Column containing signal values (0-indexed)")
                                 header_input = gr.Checkbox(value=True, label="File has header row")
+                                skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
+                                                           info="Number of rows to skip before reading data (for files with 2+ header rows)")
                                 load_btn = gr.Button("Load File", variant="primary")
                             
                             with gr.Column(scale=2):
-                                load_info = gr.Textbox(label="Load Status", lines=6)
+                                load_info = gr.Textbox(label="Load Status", lines=7)
                                 load_plot = gr.Plot(label="Signal Preview")
                         
                         load_btn.click(
                             fn=processor.load_file,
-                            inputs=[file_input, fs_input, column_input, header_input],
+                            inputs=[file_input, fs_input, column_input, header_input, skip_rows_input],
                             outputs=[load_info, load_plot]
                         )
                     
-                    with gr.Tab("Batch Processing"):
-                        gr.Markdown("### Upload multiple CSV files for batch processing")
+                    with gr.Tab("Batch Processing / 批处理"):
+                        gr.Markdown("""
+                        ### Upload multiple CSV files for batch processing
+                        **批量上传CSV文件进行处理** - 支持全流程批处理：滤波→检测→特征提取→导出
+                        """)
                         
                         with gr.Row():
                             with gr.Column(scale=1):
                                 batch_file_input = gr.File(
-                                    label="Select Multiple CSV Files", 
+                                    label="Select Multiple CSV Files (选择多个CSV文件)", 
                                     file_types=['.csv'],
                                     file_count="multiple"
                                 )
                                 batch_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
                                 batch_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
                                 batch_header_input = gr.Checkbox(value=True, label="Files have header row")
-                                batch_load_btn = gr.Button("Load All Files", variant="primary")
+                                batch_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
+                                                                  info="For files with 2 header rows, set this to 1")
+                                batch_load_btn = gr.Button("📂 Load All Files", variant="primary")
                             
                             with gr.Column(scale=2):
-                                batch_load_info = gr.Textbox(label="Batch Load Status", lines=10)
-                                batch_load_plot = gr.Plot(label="Signal Previews")
+                                batch_load_info = gr.Textbox(label="Batch Load Status", lines=12)
+                                batch_load_plot = gr.Plot(label="Signal Previews (显示所有信号)")
                         
                         batch_load_btn.click(
                             fn=processor.load_batch_files,
-                            inputs=[batch_file_input, batch_fs_input, batch_column_input, batch_header_input],
+                            inputs=[batch_file_input, batch_fs_input, batch_column_input, batch_header_input, batch_skip_rows_input],
                             outputs=[batch_load_info, batch_load_plot]
                         )
             
@@ -833,28 +1198,57 @@ def create_gui():
             with gr.Tab("🔧 Apply Filters / 应用滤波器"):
                 gr.Markdown("### Configure and apply preprocessing filters")
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("**Bandpass Filter Settings**")
-                        lowcut_input = gr.Slider(5, 50, value=20, step=1, label="High-pass cutoff (Hz)")
-                        highcut_input = gr.Slider(200, 500, value=450, step=10, label="Low-pass cutoff (Hz)")
-                        order_input = gr.Slider(2, 6, value=4, step=1, label="Filter order")
+                with gr.Tabs():
+                    with gr.Tab("Single File"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Bandpass Filter Settings**")
+                                lowcut_input = gr.Slider(5, 50, value=20, step=1, label="High-pass cutoff (Hz)")
+                                highcut_input = gr.Slider(200, 500, value=450, step=10, label="Low-pass cutoff (Hz)")
+                                order_input = gr.Slider(2, 6, value=4, step=1, label="Filter order")
+                                
+                                gr.Markdown("**Notch Filter Settings** (for power line interference)")
+                                notch_freq_input = gr.Radio([0, 50, 60], value=50, label="Notch frequency (Hz, 0=disabled)")
+                                harmonics_input = gr.Textbox(value="1,2,3", label="Harmonics (comma-separated)")
+                                
+                                filter_btn = gr.Button("Apply Filters", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                filter_info = gr.Textbox(label="Filter Status", lines=4)
+                                filter_plot = gr.Plot(label="Before/After Comparison")
                         
-                        gr.Markdown("**Notch Filter Settings** (for power line interference)")
-                        notch_freq_input = gr.Radio([0, 50, 60], value=50, label="Notch frequency (Hz, 0=disabled)")
-                        harmonics_input = gr.Textbox(value="1,2,3", label="Harmonics (comma-separated)")
-                        
-                        filter_btn = gr.Button("Apply Filters", variant="primary")
+                        filter_btn.click(
+                            fn=processor.apply_filters,
+                            inputs=[lowcut_input, highcut_input, order_input, notch_freq_input, harmonics_input],
+                            outputs=[filter_info, filter_plot]
+                        )
                     
-                    with gr.Column(scale=2):
-                        filter_info = gr.Textbox(label="Filter Status", lines=4)
-                        filter_plot = gr.Plot(label="Before/After Comparison")
-                
-                filter_btn.click(
-                    fn=processor.apply_filters,
-                    inputs=[lowcut_input, highcut_input, order_input, notch_freq_input, harmonics_input],
-                    outputs=[filter_info, filter_plot]
-                )
+                    with gr.Tab("Batch Filtering / 批量滤波"):
+                        gr.Markdown("### Apply filters to all batch-loaded files")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Bandpass Filter Settings**")
+                                batch_lowcut_input = gr.Slider(5, 50, value=20, step=1, label="High-pass cutoff (Hz)")
+                                batch_highcut_input = gr.Slider(200, 500, value=450, step=10, label="Low-pass cutoff (Hz)")
+                                batch_order_input = gr.Slider(2, 6, value=4, step=1, label="Filter order")
+                                
+                                gr.Markdown("**Notch Filter Settings**")
+                                batch_notch_freq_input = gr.Radio([0, 50, 60], value=50, label="Notch frequency (Hz)")
+                                batch_harmonics_input = gr.Textbox(value="1,2,3", label="Harmonics")
+                                
+                                batch_filter_btn = gr.Button("🔧 Apply Filters to All Files", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                batch_filter_info = gr.Textbox(label="Batch Filter Status", lines=12)
+                                batch_filter_plot = gr.Plot(label="Filtered Signals Preview")
+                        
+                        batch_filter_btn.click(
+                            fn=processor.apply_batch_filters,
+                            inputs=[batch_lowcut_input, batch_highcut_input, batch_order_input, 
+                                   batch_notch_freq_input, batch_harmonics_input],
+                            outputs=[batch_filter_info, batch_filter_plot]
+                        )
             
             # Tab 3: Detect Activity
             with gr.Tab("🎯 Detect Activity / 检测肌肉活动"):
@@ -864,31 +1258,79 @@ def create_gui():
                 **Sensitivity**: Lower values = more sensitive (detects more segments)
                 """)
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        method_input = gr.Radio(
-                            ["multi_feature", "combined", "amplitude", "ruptures"],
-                            value="multi_feature",
-                            label="Detection Method"
-                        )
-                        min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
-                                                      label="Minimum segment duration (s)")
-                        sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
-                                                     label="Detection Sensitivity")
-                        clustering_input = gr.Checkbox(value=True, label="Use clustering")
-                        adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
+                with gr.Tabs():
+                    with gr.Tab("Single File"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                method_input = gr.Radio(
+                                    ["multi_feature", "combined", "amplitude", "ruptures"],
+                                    value="multi_feature",
+                                    label="Detection Method"
+                                )
+                                min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
+                                                              label="Minimum segment duration (s)")
+                                sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
+                                                             label="Detection Sensitivity")
+                                clustering_input = gr.Checkbox(value=True, label="Use clustering")
+                                adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
+                                
+                                detect_btn = gr.Button("Detect Activity", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                detect_info = gr.Textbox(label="Detection Results", lines=12)
+                                detect_plot = gr.Plot(label="Detected Segments")
                         
-                        detect_btn = gr.Button("Detect Activity", variant="primary")
+                        detect_btn.click(
+                            fn=processor.detect_activity,
+                            inputs=[method_input, min_duration_input, sensitivity_input, clustering_input, adaptive_pen_input],
+                            outputs=[detect_info, detect_plot]
+                        )
                     
-                    with gr.Column(scale=2):
-                        detect_info = gr.Textbox(label="Detection Results", lines=12)
-                        detect_plot = gr.Plot(label="Detected Segments")
-                
-                detect_btn.click(
-                    fn=processor.detect_activity,
-                    inputs=[method_input, min_duration_input, sensitivity_input, clustering_input, adaptive_pen_input],
-                    outputs=[detect_info, detect_plot]
-                )
+                    with gr.Tab("Batch Detection / 批量检测"):
+                        gr.Markdown("### Detect activity in all batch-filtered files")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_method_input = gr.Radio(
+                                    ["multi_feature", "combined", "amplitude", "ruptures"],
+                                    value="multi_feature",
+                                    label="Detection Method"
+                                )
+                                batch_min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
+                                                                    label="Minimum segment duration (s)")
+                                batch_sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
+                                                                   label="Detection Sensitivity")
+                                batch_clustering_input = gr.Checkbox(value=True, label="Use clustering")
+                                batch_adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
+                                
+                                batch_detect_btn = gr.Button("🎯 Detect in All Files", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                batch_detect_info = gr.Textbox(label="Batch Detection Results", lines=15)
+                                batch_detect_plot = gr.Plot(label="Detection Results Overview")
+                        
+                        batch_detect_btn.click(
+                            fn=processor.detect_batch_activity,
+                            inputs=[batch_method_input, batch_min_duration_input, batch_sensitivity_input, 
+                                   batch_clustering_input, batch_adaptive_pen_input],
+                            outputs=[batch_detect_info, batch_detect_plot]
+                        )
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("### Extract Features from All Segments (批量特征提取)")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_extract_btn = gr.Button("📊 Extract Features from All Segments", variant="secondary")
+                            with gr.Column(scale=2):
+                                batch_extract_info = gr.Textbox(label="Feature Extraction Results", lines=15)
+                                batch_extract_plot = gr.Plot(label="Features Overview")
+                        
+                        batch_extract_btn.click(
+                            fn=processor.extract_batch_features,
+                            inputs=[],
+                            outputs=[batch_extract_info, batch_extract_plot]
+                        )
             
             # Tab 4: HHT Analysis
             with gr.Tab("📊 HHT Analysis / 希尔伯特-黄变换"):
@@ -992,58 +1434,90 @@ def create_gui():
             with gr.Tab("💾 Export Results / 导出结果"):
                 gr.Markdown("### Export processed data, segments, analysis results, and features")
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("**Output Settings**")
-                        output_dir_input = gr.Textbox(value="./output", label="Output Directory")
-                        custom_prefix_input = gr.Textbox(value="", label="Custom filename prefix (optional)")
+                with gr.Tabs():
+                    with gr.Tab("Single File Export"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Output Settings**")
+                                output_dir_input = gr.Textbox(value="./output", label="Output Directory")
+                                custom_prefix_input = gr.Textbox(value="", label="Custom filename prefix (optional)")
+                                
+                                gr.Markdown("**Export Options**")
+                                export_full_input = gr.Checkbox(value=True, label="Export full processed signal")
+                                export_segments_input = gr.Checkbox(value=True, label="Export individual segments")
+                                export_hht_input = gr.Checkbox(value=False, label="Export HHT results")
+                                export_augmented_input = gr.Checkbox(value=False, label="Export augmented signals")
+                                
+                                gr.Markdown("**Annotations / 数据标注**")
+                                subject_input = gr.Textbox(value="", label="Subject ID (受试者)")
+                                fatigue_input = gr.Dropdown(
+                                    choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
+                                    value="", label="Fatigue Level (疲劳程度)"
+                                )
+                                quality_input = gr.Slider(1, 5, value=3, step=1, label="Quality Rating (动作质量评级)")
+                                action_input = gr.Textbox(value="", label="Action Type (动作类型)")
+                                notes_input = gr.Textbox(value="", label="Notes (备注)", lines=2)
+                                
+                                export_btn = gr.Button("Export Data", variant="primary")
+                                
+                                gr.Markdown("---")
+                                gr.Markdown("**Feature Export / 特征导出**")
+                                features_output_path = gr.Textbox(value="./output/segment_features.csv", 
+                                                                 label="Features CSV Path")
+                                features_subject = gr.Textbox(value="", label="Subject ID for features")
+                                features_fatigue = gr.Dropdown(
+                                    choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
+                                    value="", label="Fatigue Level for features"
+                                )
+                                export_features_btn = gr.Button("📊 Export All Segment Features", variant="secondary")
+                                features_export_info = gr.Textbox(label="Features Export Status", lines=3)
+                            
+                            with gr.Column(scale=2):
+                                export_info = gr.Textbox(label="Export Status", lines=15)
                         
-                        gr.Markdown("**Export Options**")
-                        export_full_input = gr.Checkbox(value=True, label="Export full processed signal")
-                        export_segments_input = gr.Checkbox(value=True, label="Export individual segments")
-                        export_hht_input = gr.Checkbox(value=False, label="Export HHT results")
-                        export_augmented_input = gr.Checkbox(value=False, label="Export augmented signals")
-                        
-                        gr.Markdown("**Annotations / 数据标注**")
-                        subject_input = gr.Textbox(value="", label="Subject ID (受试者)")
-                        fatigue_input = gr.Dropdown(
-                            choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
-                            value="", label="Fatigue Level (疲劳程度)"
+                        export_btn.click(
+                            fn=processor.export_data,
+                            inputs=[output_dir_input, export_full_input, export_segments_input,
+                                   subject_input, fatigue_input, quality_input, action_input, notes_input,
+                                   export_hht_input, export_augmented_input, custom_prefix_input],
+                            outputs=[export_info]
                         )
-                        quality_input = gr.Slider(1, 5, value=3, step=1, label="Quality Rating (动作质量评级)")
-                        action_input = gr.Textbox(value="", label="Action Type (动作类型)")
-                        notes_input = gr.Textbox(value="", label="Notes (备注)", lines=2)
                         
-                        export_btn = gr.Button("Export Data", variant="primary")
-                        
-                        gr.Markdown("---")
-                        gr.Markdown("**Feature Export / 特征导出**")
-                        features_output_path = gr.Textbox(value="./output/segment_features.csv", 
-                                                         label="Features CSV Path")
-                        features_subject = gr.Textbox(value="", label="Subject ID for features")
-                        features_fatigue = gr.Dropdown(
-                            choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
-                            value="", label="Fatigue Level for features"
+                        export_features_btn.click(
+                            fn=processor.export_features_csv,
+                            inputs=[features_output_path, features_subject, features_fatigue],
+                            outputs=[features_export_info]
                         )
-                        export_features_btn = gr.Button("📊 Export All Segment Features", variant="secondary")
-                        features_export_info = gr.Textbox(label="Features Export Status", lines=3)
                     
-                    with gr.Column(scale=2):
-                        export_info = gr.Textbox(label="Export Status", lines=15)
-                
-                export_btn.click(
-                    fn=processor.export_data,
-                    inputs=[output_dir_input, export_full_input, export_segments_input,
-                           subject_input, fatigue_input, quality_input, action_input, notes_input,
-                           export_hht_input, export_augmented_input, custom_prefix_input],
-                    outputs=[export_info]
-                )
-                
-                export_features_btn.click(
-                    fn=processor.export_features_csv,
-                    inputs=[features_output_path, features_subject, features_fatigue],
-                    outputs=[features_export_info]
-                )
+                    with gr.Tab("Batch Export / 批量导出"):
+                        gr.Markdown("""
+                        ### Export all batch-processed features to CSV
+                        **导出所有批处理结果的特征到CSV文件**
+                        
+                        Prerequisites: Run batch filtering → batch detection → batch feature extraction first.
+                        """)
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                batch_features_output_path = gr.Textbox(
+                                    value="./output/batch_features.csv", 
+                                    label="Batch Features CSV Path"
+                                )
+                                batch_features_subject = gr.Textbox(value="", label="Subject ID (optional)")
+                                batch_features_fatigue = gr.Dropdown(
+                                    choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],
+                                    value="", label="Fatigue Level (optional)"
+                                )
+                                batch_export_features_btn = gr.Button("📊 Export All Batch Features", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                batch_features_export_info = gr.Textbox(label="Batch Export Status", lines=10)
+                        
+                        batch_export_features_btn.click(
+                            fn=processor.export_batch_features,
+                            inputs=[batch_features_output_path, batch_features_subject, batch_features_fatigue],
+                            outputs=[batch_features_export_info]
+                        )
             
             # Tab 7: Help
             with gr.Tab("ℹ️ Help / 帮助"):
@@ -1052,15 +1526,20 @@ def create_gui():
                 
                 ### 1. Load Data (加载数据)
                 - **Single file**: Upload a single CSV for analysis
-                - **Batch processing**: Upload multiple files for dataset building
+                - **Batch processing**: Upload multiple files for full pipeline processing
+                - **Skip rows**: For CSV files with 2+ header rows, set skip_rows appropriately
                 
                 ### 2. Apply Filters (应用滤波)
+                - **Single File**: Apply to single loaded file
+                - **Batch Filtering**: Apply to all batch-loaded files at once
                 - **Bandpass**: 20-450 Hz recommended for sEMG
                 - **Notch**: 50 Hz (Europe/Asia) or 60 Hz (Americas)
                 
                 ### 3. Detect Activity (检测活动)
+                - **Single File**: Detect in single file
+                - **Batch Detection**: Detect in all batch-filtered files at once
+                - **Extract Features**: Extract features from all detected segments
                 - **multi_feature** method recommended
-                - Adjust sensitivity for more/fewer detections
                 
                 ### 4. HHT Analysis (希尔伯特-黄变换)
                 - **CEEMDAN** decomposition for stable IMFs (recommended)
@@ -1073,16 +1552,23 @@ def create_gui():
                 - **CEEMDAN-based** methods for better stability
                 - **ceemdan_random_imf**: (Recommended) Use all segments to generate new signals via random IMF combination
                 - **imf_mixing**: Perturb IMF components of a single segment
-                - **imf_scaling**: Scale IMF amplitudes
-                - **noise_injection**: Add controlled noise
-                - **time_warping**: Apply time distortion
-                - **comprehensive**: Apply all methods
                 
                 ### 6. Export (导出)
+                - **Single File Export**: Export processed signal, segments, and features
+                - **Batch Export**: Export all batch-processed features to CSV
                 - Add annotations: subject ID, fatigue level, quality rating
-                - **Export Features**: Export all segment features (WL, ZC, SSC, MDF, MNF, IMNF, DI, WIRE51) to CSV
-                - Export segments, HHT spectra, and augmented signals
-                - Custom filename prefixes for organization
+                
+                ---
+                
+                ## Batch Processing Workflow / 批处理工作流程
+                
+                1. **Load**: Batch Processing tab → Load All Files
+                2. **Filter**: Batch Filtering tab → Apply Filters to All Files  
+                3. **Detect**: Batch Detection tab → Detect in All Files
+                4. **Features**: Batch Detection tab → Extract Features from All Segments
+                5. **Export**: Batch Export tab → Export All Batch Features
+                
+                ---
                 
                 ## sEMG Features Guide / sEMG特征指南
                 
@@ -1093,11 +1579,12 @@ def create_gui():
                 - **MNF** (Mean Frequency): 平均频率
                 - **IMNF** (Instantaneous Mean Freq): 瞬时平均频率
                 - **WIRE51**: 小波可靠性指数 (基于DWT离散小波变换)
-                - **DI** (Dimitrov Index): 迪米特罗夫指数，疲劳指标 (基于DWT)
+                - **DI** (Dimitrov Index): 迪米特罗夫指数，疲劳指标 (高值=更疲劳)
                 - **RMS**: 均方根值，反映信号幅度
                 
                 ## Parameter Guide / 参数指南
                 
+                - **Skip rows**: 跳过CSV开头的行数 (如有2个标题行则设为1)
                 - **Sensitivity**: 0.5 (more segments) to 2.0 (fewer segments)
                 - **Perturbation**: 0.05 (subtle) to 0.3 (significant variation)
                 - **Quality Rating**: 1 (poor) to 5 (excellent)
@@ -1106,7 +1593,7 @@ def create_gui():
         
         gr.Markdown("""
         ---
-        **sEMG Preprocessing Toolkit v0.4.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
+        **sEMG Preprocessing Toolkit v0.5.0** | [GitHub](https://github.com/PRIMOCOSMOS/sEMG-pre-processing) | MIT License
         """)
     
     return app

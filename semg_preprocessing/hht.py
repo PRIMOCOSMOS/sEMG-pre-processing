@@ -942,11 +942,15 @@ def extract_semg_features(
         wire51 = high_power / (low_power + EPSILON) if low_power > 0 else 0
     
     # 10. DI - Dimitrov Index (fatigue indicator)
-    # DI is the ratio of the -1 moment (M_{-1}) to the 5th moment (M_5) of the spectrum
-    # Formula: DI = M_{-1} / M_5 where M_k = sum(f^k * P(f)) / sum(P(f))
+    # Based on Dimitrov et al. (2006): FInsm5 = M_{-1} / M_5
+    # where M_k = sum(f^k * P(f)) / sum(P(f))
     # Higher DI values indicate more muscle fatigue (shift to lower frequencies)
+    # 
+    # Note: Using raw frequencies with f^5 creates extremely large numbers,
+    # resulting in near-zero ratios. The proper approach is to normalize
+    # frequencies to the Nyquist frequency (0-1 range) for numerical stability.
     try:
-        # Calculate spectral moments
+        # Calculate spectral moments with normalized frequencies
         # Use freqs > 0 to avoid division by zero for M_{-1}
         valid_mask = freqs > 0
         valid_freqs = freqs[valid_mask]
@@ -954,14 +958,22 @@ def extract_semg_features(
         
         total_power = np.sum(valid_power)
         
-        if total_power > EPSILON:
-            # M_{-1} = sum(f^{-1} * P(f)) / sum(P(f))
-            moment_minus1 = np.sum((valid_freqs ** -1) * valid_power) / total_power
+        if total_power > EPSILON and len(valid_freqs) > 0:
+            # Normalize frequencies to [0, 1] range (relative to Nyquist)
+            # This prevents numerical overflow from f^5
+            f_max = valid_freqs.max()
+            norm_freqs = valid_freqs / f_max
             
-            # M_5 = sum(f^5 * P(f)) / sum(P(f))
-            moment_5 = np.sum((valid_freqs ** 5) * valid_power) / total_power
+            # Normalize power spectrum
+            norm_power = valid_power / total_power
             
-            # DI = M_{-1} / M_5
+            # M_{-1} = sum(f_norm^{-1} * P_norm)
+            moment_minus1 = np.sum((norm_freqs ** -1) * norm_power)
+            
+            # M_5 = sum(f_norm^5 * P_norm)
+            moment_5 = np.sum((norm_freqs ** 5) * norm_power)
+            
+            # DI = M_{-1} / M_5 (now gives meaningful values)
             if moment_5 > EPSILON:
                 dimitrov_index = moment_minus1 / moment_5
             else:

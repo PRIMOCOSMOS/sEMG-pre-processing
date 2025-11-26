@@ -6,7 +6,7 @@ including filtering, noise removal, muscle activity detection, HHT analysis,
 CEEMDAN decomposition, feature extraction, and data augmentation.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .filters import (
     apply_highpass_filter,
