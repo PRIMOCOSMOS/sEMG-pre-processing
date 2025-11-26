@@ -958,7 +958,7 @@ def extract_semg_features(
         
         total_power = np.sum(valid_power)
         
-        if total_power > EPSILON and len(valid_freqs) > 0:
+        if total_power > EPSILON:
             # Normalize frequencies to [0, 1] range (relative to Nyquist)
             # This prevents numerical overflow from f^5
             f_max = valid_freqs.max()

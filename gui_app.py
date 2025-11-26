@@ -82,6 +82,41 @@ class EMGProcessorGUI:
         self.hht_results = None
         # Augmentation results
         self.augmented_signals = None
+    
+    def _create_batch_subplot_axes(self, n_items, max_show=8, figsize_per_row=2.5, n_cols=2):
+        """
+        Create subplot axes for batch visualization.
+        
+        Parameters:
+        -----------
+        n_items : int
+            Total number of items to potentially show
+        max_show : int
+            Maximum number of subplots to create (default: 8)
+        figsize_per_row : float
+            Height per row in inches (default: 2.5)
+        n_cols : int
+            Number of columns (default: 2)
+        
+        Returns:
+        --------
+        Tuple[Figure, np.ndarray, int]
+            - Matplotlib figure
+            - Flattened array of axes
+            - Number of items to show
+        """
+        n_show = min(n_items, max_show)
+        n_rows = (n_show + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(12 if n_cols == 2 else 12, figsize_per_row * n_rows))
+        
+        if n_show == 1:
+            axes = np.array([[axes]])
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        axes = axes.flatten()
+        return fig, axes, n_show
         
     def load_file(self, file_obj, fs, value_column, has_header, skip_rows):
         """Load CSV file and extract signal."""
@@ -160,18 +195,8 @@ class EMGProcessorGUI:
             
             progress(1.0, desc="Complete!")
             
-            # Create summary plot showing all files
-            n_files = len(self.batch_data)
-            n_show = min(n_files, 8)  # Show up to 8 files
-            n_cols = 2 if n_show > 4 else 1
-            n_rows = (n_show + n_cols - 1) // n_cols
-            
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(12 if n_cols == 2 else 12, 2.5*n_rows))
-            if n_show == 1:
-                axes = np.array([[axes]])
-            elif n_cols == 1:
-                axes = axes.reshape(-1, 1)
-            axes = axes.flatten()
+            # Create summary plot showing all files using helper method
+            fig, axes, n_show = self._create_batch_subplot_axes(len(self.batch_data))
             
             for i, data in enumerate(self.batch_data[:n_show]):
                 time = np.arange(len(data['signal'])) / self.fs
@@ -302,16 +327,8 @@ class EMGProcessorGUI:
                 self.signal = self.batch_data[0]['signal']
                 self.filtered_signal = self.batch_filtered[0]['filtered']
             
-            # Create summary visualization showing all filtered signals
-            n_files = len(self.batch_filtered)
-            n_show = min(n_files, 6)
-            n_cols = 2
-            n_rows = (n_show + 1) // n_cols
-            
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3*n_rows))
-            if n_show == 1:
-                axes = np.array([[axes]])
-            axes = axes.flatten()
+            # Create summary visualization using helper method
+            fig, axes, n_show = self._create_batch_subplot_axes(len(self.batch_filtered), max_show=6, figsize_per_row=3)
             
             for i, data in enumerate(self.batch_filtered[:n_show]):
                 time = np.arange(len(data['filtered'])) / self.fs
@@ -458,16 +475,8 @@ class EMGProcessorGUI:
                 self.segments = self.batch_segments[0]['segments']
                 self.segment_data = self.batch_segments[0]['segment_data']
             
-            # Create summary visualization
-            n_files = len(self.batch_segments)
-            n_show = min(n_files, 6)
-            n_cols = 2
-            n_rows = (n_show + 1) // n_cols
-            
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3*n_rows))
-            if n_show == 1:
-                axes = np.array([[axes]])
-            axes = axes.flatten()
+            # Create summary visualization using helper method
+            fig, axes, n_show = self._create_batch_subplot_axes(len(self.batch_segments), max_show=6, figsize_per_row=3)
             
             for i, data in enumerate(self.batch_segments[:n_show]):
                 time = np.arange(len(data['filtered'])) / self.fs
