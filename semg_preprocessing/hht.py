@@ -15,7 +15,7 @@ from scipy.interpolate import interp1d
 
 # Module-level constants for CEEMDAN configuration
 DEFAULT_CEEMDAN_ENSEMBLES = 30  # Default number of ensembles for CEEMDAN (30 for speed, 50 for accuracy)
-EPSILON = np.finfo(float).eps  # Machine epsilon for numerical stability
+EPSILON = 1e-10  # Small value for numerical stability (avoiding division by zero)
 
 
 def emd_decomposition(
@@ -874,9 +874,11 @@ def extract_semg_features(
     # 7. Peak Frequency (PKF)
     pkf = freqs[np.argmax(power_spectrum)]
     
-    # 8. IMNF - Instantaneous Mean Frequency (using Choi-Williams distribution)
-    # IMNF has the same mathematical form as MNF but uses Choi-Williams transform
-    # instead of FFT. The Choi-Williams distribution is a time-frequency representation.
+    # 8. IMNF - Instantaneous Mean Frequency
+    # Computed using Hilbert transform to obtain instantaneous frequency.
+    # IMNF is the power-weighted average of instantaneous frequencies.
+    # Formula: IMNF = sum(IF(t) * A^2(t)) / sum(A^2(t))
+    # where IF(t) is instantaneous frequency and A(t) is instantaneous amplitude
     try:
         from scipy.signal import hilbert as scipy_hilbert
         
@@ -885,16 +887,17 @@ def extract_semg_features(
         inst_amplitude = np.abs(analytic)
         inst_phase = np.unwrap(np.angle(analytic))
         
-        # Compute instantaneous frequency
+        # Compute instantaneous frequency from phase derivative
         inst_freq_signal = np.diff(inst_phase) / (2 * np.pi) * fs
         inst_freq_signal = np.concatenate([inst_freq_signal, [inst_freq_signal[-1]]])
         inst_freq_signal = np.abs(inst_freq_signal)
         inst_freq_signal = np.clip(inst_freq_signal, 0, fs/2)
         
-        # Choi-Williams-like weighted average using amplitude^2 as power
+        # Power-weighted average using amplitude^2 as power
         power = inst_amplitude ** 2
-        if np.sum(power) > 0:
-            imnf = np.sum(inst_freq_signal * power) / np.sum(power)
+        total_power_inst = np.sum(power)
+        if total_power_inst > EPSILON:
+            imnf = np.sum(inst_freq_signal * power) / total_power_inst
         else:
             imnf = mnf
         
@@ -907,50 +910,63 @@ def extract_semg_features(
     # Uses 5th-order Symlet wavelet (sym5) with Mallat algorithm
     # Formula: WIRE51 = sum(D5[n]^2) / sum(D1[n]^2)
     # where D5 and D1 are detail signals at scales 5 and 1 respectively
+    # Maximum decomposition level depends on signal length: floor(log2(N))
     try:
+        import pywt
         # Use sym5 wavelet as specified in literature
         wavelet = 'sym5'
-        max_level = min(5, pywt.dwt_max_level(n_samples, wavelet))
+        # Maximum level based on signal length for sym5 wavelet
+        max_level = pywt.dwt_max_level(n_samples, wavelet)
         
+        # We need at least 5 levels for proper WIRE51 calculation
         if max_level >= 5:
             coeffs = pywt.wavedec(signal, wavelet, level=5)
             # coeffs structure: [cA5, cD5, cD4, cD3, cD2, cD1]
             # D5 is coeffs[1] (detail at level 5)
             # D1 is coeffs[5] (detail at level 1)
-            d5 = coeffs[1]  # Detail signal at scale 5
-            d1 = coeffs[5]  # Detail signal at scale 1
+            d5 = coeffs[1]  # Detail signal at scale 5 (low frequency details)
+            d1 = coeffs[5]  # Detail signal at scale 1 (high frequency details)
             
             d5_power = np.sum(d5 ** 2)
             d1_power = np.sum(d1 ** 2)
             
+            # WIRE51 = D5_power / D1_power, higher values indicate more fatigue
             wire51 = d5_power / (d1_power + EPSILON)
         else:
-            # Fallback for short signals
-            coeffs = pywt.wavedec(signal, wavelet, level=max_level)
-            if len(coeffs) >= 2:
-                high_detail = coeffs[1]  # Highest scale detail available
-                low_detail = coeffs[-1]  # Lowest scale detail available
-                wire51 = np.sum(high_detail ** 2) / (np.sum(low_detail ** 2) + EPSILON)
+            # For short signals, use available levels
+            # Fallback: use highest and lowest detail levels available
+            level = min(max_level, 3)  # At least 3 levels if possible
+            coeffs = pywt.wavedec(signal, wavelet, level=level)
+            if len(coeffs) >= 3:
+                # Use highest detail (low freq) and lowest detail (high freq)
+                high_scale_detail = coeffs[1]  # Highest scale detail available
+                low_scale_detail = coeffs[-1]  # Lowest scale detail available
+                wire51 = np.sum(high_scale_detail ** 2) / (np.sum(low_scale_detail ** 2) + EPSILON)
             else:
                 wire51 = 0.0
     except Exception:
         # Fallback to spectral-based calculation
+        # WIRE51 approximation: high_freq_power / low_freq_power
         low_freq_mask = freqs < 50
         high_freq_mask = freqs >= 50
         low_power = np.sum(power_spectrum[low_freq_mask])
         high_power = np.sum(power_spectrum[high_freq_mask])
-        wire51 = high_power / (low_power + EPSILON) if low_power > 0 else 0
+        wire51 = high_power / (low_power + EPSILON) if low_power > EPSILON else 0
     
-    # 10. DI - Dimitrov Index (fatigue indicator)
-    # Based on Dimitrov et al. (2006): FInsm5 = M_{-1} / M_5
+    # 10. DI - Dimitrov Index (Dimitrov Fatigue Index, FInsm5)
+    # Based on Dimitrov et al. (2006): Med Sci Sports Exerc 38(11):1971-1979
+    # Formula: DI = M_{-1} / M_5
     # where M_k = sum(f^k * P(f)) / sum(P(f))
-    # Higher DI values indicate more muscle fatigue (shift to lower frequencies)
     # 
-    # Note: Using raw frequencies with f^5 creates extremely large numbers,
-    # resulting in near-zero ratios. The proper approach is to normalize
-    # frequencies to the Nyquist frequency (0-1 range) for numerical stability.
+    # Physical interpretation:
+    # - M_{-1} gives more weight to low frequencies (1/f weighting)
+    # - M_5 gives more weight to high frequencies (f^5 weighting)
+    # - DI = M_{-1} / M_5 increases with fatigue as spectrum shifts to lower frequencies
+    # 
+    # Typical values: 1e-11 to 1e-9 (very small due to f^5 term)
+    # The ratio between fatigued/non-fatigued conditions is what matters (typically 2-10x increase)
     try:
-        # Calculate spectral moments with normalized frequencies
+        # Calculate spectral moments with original formula
         # Use freqs > 0 to avoid division by zero for M_{-1}
         valid_mask = freqs > 0
         valid_freqs = freqs[valid_mask]
@@ -959,21 +975,18 @@ def extract_semg_features(
         total_power = np.sum(valid_power)
         
         if total_power > EPSILON:
-            # Normalize frequencies to [0, 1] range (relative to Nyquist)
-            # This prevents numerical overflow from f^5
-            f_max = valid_freqs.max()
-            norm_freqs = valid_freqs / f_max
-            
-            # Normalize power spectrum
+            # Normalize power spectrum to probability distribution
             norm_power = valid_power / total_power
             
-            # M_{-1} = sum(f_norm^{-1} * P_norm)
-            moment_minus1 = np.sum((norm_freqs ** -1) * norm_power)
+            # M_{-1} = sum(f^{-1} * P(f)) - emphasizes low frequencies
+            moment_minus1 = np.sum((valid_freqs ** -1) * norm_power)
             
-            # M_5 = sum(f_norm^5 * P_norm)
-            moment_5 = np.sum((norm_freqs ** 5) * norm_power)
+            # M_5 = sum(f^5 * P(f)) - emphasizes high frequencies
+            moment_5 = np.sum((valid_freqs ** 5) * norm_power)
             
-            # DI = M_{-1} / M_5 (now gives meaningful values)
+            # DI = M_{-1} / M_5
+            # This will be a very small number (1e-11 to 1e-9 range)
+            # but increases with fatigue as power shifts to lower frequencies
             if moment_5 > EPSILON:
                 dimitrov_index = moment_minus1 / moment_5
             else:
@@ -983,11 +996,12 @@ def extract_semg_features(
             
     except Exception:
         # Fallback: estimate using spectral ratio (higher = more fatigue)
+        # This approximates the DI concept: low freq / high freq power
         low_freq_mask = freqs < 80  # Low frequency band
         high_freq_mask = freqs >= 80  # High frequency band
         low_power = np.sum(power_spectrum[low_freq_mask])
         high_power = np.sum(power_spectrum[high_freq_mask])
-        dimitrov_index = low_power / (high_power + EPSILON) if high_power > 0 else 0
+        dimitrov_index = low_power / (high_power + EPSILON) if high_power > EPSILON else 0
     
     return {
         'WL': float(wl),
