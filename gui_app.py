@@ -1172,6 +1172,259 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
             import traceback
             return f"❌ Error exporting features: {str(e)}\n{traceback.format_exc()}"
     
+    def analyze_segment_features(self, file_objs, fs, value_column, has_header, skip_rows, progress=gr.Progress()):
+        """
+        Analyze features from single or multiple sEMG segment CSV files.
+        Each file should contain a single segment of sEMG data.
+        """
+        try:
+            if file_objs is None or len(file_objs) == 0:
+                return "❌ Please upload segment CSV files", None, None
+            
+            progress(0.1, desc="Loading segment files...")
+            
+            # Load all segment files
+            segments = []
+            filenames = []
+            
+            for file_obj in file_objs:
+                try:
+                    signal, df = load_csv_data(
+                        file_obj.name,
+                        value_column=int(value_column),
+                        has_header=has_header,
+                        skip_rows=int(skip_rows)
+                    )
+                    segments.append(signal)
+                    filenames.append(os.path.basename(file_obj.name))
+                except Exception as e:
+                    print(f"Warning: Failed to load {file_obj.name}: {e}")
+            
+            if len(segments) == 0:
+                return "❌ No valid segment files loaded", None, None
+            
+            progress(0.3, desc=f"Extracting features from {len(segments)} segment(s)...")
+            
+            # Extract features from all segments
+            features_list = []
+            for i, segment in enumerate(segments):
+                progress(0.3 + (i / len(segments)) * 0.5, desc=f"Extracting features from segment {i+1}/{len(segments)}...")
+                features = extract_semg_features(segment, float(fs))
+                features['filename'] = filenames[i]
+                features['segment_index'] = i + 1
+                features_list.append(features)
+            
+            # Store for export
+            self.segment_features_analysis = {
+                'features': features_list,
+                'filenames': filenames,
+                'fs': float(fs)
+            }
+            
+            progress(0.8, desc="Creating visualization...")
+            
+            # Create trend visualization
+            fig = self._create_feature_trend_plots(features_list, filenames)
+            
+            progress(1.0, desc="Complete!")
+            
+            # Create summary info
+            info = self._create_feature_summary(features_list, filenames)
+            
+            # Create DataFrame for display
+            df_display = self._create_feature_dataframe(features_list, filenames)
+            
+            return info, fig, df_display
+            
+        except Exception as e:
+            import traceback
+            return f"❌ Error analyzing segments: {str(e)}\n{traceback.format_exc()}", None, None
+    
+    def _create_feature_trend_plots(self, features_list, filenames):
+        """Create trend plots for sEMG features across segments."""
+        # Define feature groups for visualization
+        time_domain_features = ['WL', 'ZC', 'SSC', 'RMS', 'MAV', 'VAR']
+        frequency_features = ['MDF', 'MNF', 'IMNF', 'PKF', 'TTP']
+        fatigue_indicators = ['DI', 'WIRE51']
+        
+        # Create subplots
+        fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+        
+        segment_indices = list(range(1, len(features_list) + 1))
+        
+        # Plot 1: Time domain features
+        ax = axes[0]
+        for feature in time_domain_features:
+            values = [f[feature] for f in features_list]
+            ax.plot(segment_indices, values, 'o-', label=feature, linewidth=2, markersize=6)
+        ax.set_xlabel('Segment Index', fontsize=11)
+        ax.set_ylabel('Feature Value', fontsize=11)
+        ax.set_title('Time Domain Features Trend', fontsize=12, fontweight='bold')
+        ax.legend(loc='best', ncol=3, fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Frequency domain features
+        ax = axes[1]
+        for feature in frequency_features:
+            values = [f[feature] for f in features_list]
+            ax.plot(segment_indices, values, 'o-', label=feature, linewidth=2, markersize=6)
+        ax.set_xlabel('Segment Index', fontsize=11)
+        ax.set_ylabel('Frequency (Hz)', fontsize=11)
+        ax.set_title('Frequency Domain Features Trend', fontsize=12, fontweight='bold')
+        ax.legend(loc='best', ncol=2, fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 3: Fatigue indicators
+        ax = axes[2]
+        # Use dual y-axes for different scales
+        ax2 = ax.twinx()
+        
+        # Plot DI on left axis (very small values)
+        di_values = [f['DI'] for f in features_list]
+        line1 = ax.plot(segment_indices, di_values, 'ro-', label='DI (Dimitrov Index)', linewidth=2, markersize=6)
+        ax.set_ylabel('DI Value (×1e-14)', fontsize=11, color='r')
+        ax.tick_params(axis='y', labelcolor='r')
+        
+        # Plot WIRE51 on right axis
+        wire51_values = [f['WIRE51'] for f in features_list]
+        line2 = ax2.plot(segment_indices, wire51_values, 'bs-', label='WIRE51', linewidth=2, markersize=6)
+        ax2.set_ylabel('WIRE51 Value', fontsize=11, color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+        
+        ax.set_xlabel('Segment Index', fontsize=11)
+        ax.set_title('Fatigue Indicators Trend', fontsize=12, fontweight='bold')
+        
+        # Combine legends
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, loc='upper left', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
+    
+    def _create_feature_summary(self, features_list, filenames):
+        """Create summary text for features."""
+        n_segments = len(features_list)
+        
+        info = f"""
+✅ Feature Analysis Complete!
+
+**Summary:**
+- Total segments analyzed: {n_segments}
+- Sampling frequency: {self.segment_features_analysis['fs']} Hz
+
+**Feature Statistics (Mean ± Std):**
+
+*Time Domain:*
+"""
+        
+        # Calculate statistics for key features
+        time_features = ['WL', 'ZC', 'SSC', 'RMS', 'MAV', 'VAR']
+        for feat in time_features:
+            values = [f[feat] for f in features_list]
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            info += f"  {feat}: {mean_val:.4f} ± {std_val:.4f}\n"
+        
+        info += "\n*Frequency Domain:*\n"
+        freq_features = ['MDF', 'MNF', 'IMNF', 'PKF']
+        for feat in freq_features:
+            values = [f[feat] for f in features_list]
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            info += f"  {feat}: {mean_val:.2f} ± {std_val:.2f} Hz\n"
+        
+        info += "\n*Fatigue Indicators:*\n"
+        di_values = [f['DI'] for f in features_list]
+        wire51_values = [f['WIRE51'] for f in features_list]
+        info += f"  DI: {np.mean(di_values):.6e} ± {np.std(di_values):.6e}\n"
+        info += f"  WIRE51: {np.mean(wire51_values):.4f} ± {np.std(wire51_values):.4f}\n"
+        
+        if n_segments > 1:
+            info += f"\n**Trend Analysis:**\n"
+            # Check if features show increasing/decreasing trends
+            mdf_trend = "decreasing" if features_list[-1]['MDF'] < features_list[0]['MDF'] else "increasing"
+            di_trend = "increasing" if features_list[-1]['DI'] > features_list[0]['DI'] else "decreasing"
+            info += f"  MDF: {mdf_trend} (first: {features_list[0]['MDF']:.1f} Hz → last: {features_list[-1]['MDF']:.1f} Hz)\n"
+            info += f"  DI: {di_trend} (first: {features_list[0]['DI']:.6e} → last: {features_list[-1]['DI']:.6e})\n"
+            
+            if mdf_trend == "decreasing" and di_trend == "increasing":
+                info += "  ⚠️ Possible fatigue pattern detected (MDF↓ + DI↑)\n"
+        
+        return info.strip()
+    
+    def _create_feature_dataframe(self, features_list, filenames):
+        """Create a pandas DataFrame for feature display."""
+        df_data = []
+        for i, features in enumerate(features_list):
+            row = {
+                'Segment': i + 1,
+                'Filename': filenames[i],
+                'WL': features['WL'],
+                'ZC': features['ZC'],
+                'SSC': features['SSC'],
+                'RMS': features['RMS'],
+                'MAV': features['MAV'],
+                'MDF': features['MDF'],
+                'MNF': features['MNF'],
+                'IMNF': features['IMNF'],
+                'DI': features['DI'],
+                'WIRE51': features['WIRE51'],
+            }
+            df_data.append(row)
+        
+        return pd.DataFrame(df_data)
+    
+    def export_segment_features_csv(self, output_path, progress=gr.Progress()):
+        """Export analyzed segment features to CSV."""
+        try:
+            if not hasattr(self, 'segment_features_analysis') or not self.segment_features_analysis:
+                return "❌ Please analyze segments first"
+            
+            progress(0.3, desc="Preparing data for export...")
+            
+            features_list = self.segment_features_analysis['features']
+            filenames = self.segment_features_analysis['filenames']
+            
+            # Create detailed CSV with all features
+            df_data = []
+            for i, features in enumerate(features_list):
+                row = {
+                    'Segment_Index': i + 1,
+                    'Filename': filenames[i],
+                }
+                # Add all features
+                for key, value in features.items():
+                    if key not in ['filename', 'segment_index']:
+                        row[key] = value
+                df_data.append(row)
+            
+            df = pd.DataFrame(df_data)
+            
+            progress(0.7, desc="Writing CSV file...")
+            
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+            
+            # Export to CSV
+            df.to_csv(output_path, index=False)
+            
+            progress(1.0, desc="Complete!")
+            
+            return f"""
+✅ Features exported successfully!
+
+**Output file:** {output_path}
+**Segments:** {len(features_list)}
+**Features per segment:** {len(df.columns) - 2}
+
+The CSV contains all extracted features for each segment.
+"""
+        except Exception as e:
+            import traceback
+            return f"❌ Error exporting features: {str(e)}\n{traceback.format_exc()}"
+    
     def export_data(self, output_dir, export_full, export_segments, 
                    subject_id, fatigue_level, quality_rating, action_type, notes,
                    export_hht, export_augmented, custom_prefix, progress=gr.Progress()):
@@ -1571,7 +1824,83 @@ def create_gui():
                             outputs=[batch_hht_info, batch_hht_plot]
                         )
             
-            # Tab 5: Data Augmentation
+            # Tab 4.5: Segment Feature Analysis
+            with gr.Tab("📈 Feature Analysis / 特征分析"):
+                gr.Markdown("""
+                ### sEMG Segment Feature Analysis (sEMG分段特征分析)
+                
+                Analyze sEMG features from single or multiple segment CSV files.
+                Each uploaded file should contain one sEMG segment.
+                
+                **Features extracted:**
+                - Time domain: WL, ZC, SSC, RMS, MAV, VAR
+                - Frequency domain: MDF, MNF, IMNF, PKF, TTP
+                - Fatigue indicators: DI (Dimitrov Index), WIRE51
+                
+                **Visualizations:**
+                - Feature trends across segments
+                - Statistical summaries
+                - Export to CSV for further analysis
+                """)
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Upload Segment Files**")
+                        segment_files_input = gr.File(
+                            label="Select Segment CSV Files (选择分段CSV文件)", 
+                            file_types=['.csv'],
+                            file_count="multiple"
+                        )
+                        segment_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
+                        segment_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
+                        segment_header_input = gr.Checkbox(value=True, label="Files have header row")
+                        segment_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
+                                                           info="For files with 2 header rows, set this to 1")
+                        
+                        analyze_features_btn = gr.Button("📊 Analyze Features", variant="primary")
+                    
+                    with gr.Column(scale=2):
+                        feature_analysis_info = gr.Textbox(label="Feature Analysis Results", lines=20)
+                        feature_trend_plot = gr.Plot(label="Feature Trends Across Segments")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Feature Data Table & Export")
+                
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        feature_table_display = gr.Dataframe(
+                            label="Extracted Features (可查看所有特征值)",
+                            interactive=False
+                        )
+                
+                # Single click handler that updates all outputs
+                analyze_features_btn.click(
+                    fn=processor.analyze_segment_features,
+                    inputs=[segment_files_input, segment_fs_input, segment_column_input, 
+                           segment_header_input, segment_skip_rows_input],
+                    outputs=[feature_analysis_info, feature_trend_plot, feature_table_display]
+                )
+                
+                gr.Markdown("### Export Features to CSV")
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        feature_csv_output_path = gr.Textbox(
+                            value="./output/segment_features_analysis.csv", 
+                            label="Output CSV Path"
+                        )
+                        export_segment_features_btn = gr.Button("💾 Export Features to CSV", variant="secondary")
+                    with gr.Column(scale=2):
+                        feature_export_status = gr.Textbox(label="Export Status", lines=5)
+                
+                export_segment_features_btn.click(
+                    fn=processor.export_segment_features_csv,
+                    inputs=[feature_csv_output_path],
+                    outputs=[feature_export_status]
+                )
+            
+            # Tab 5: Segment Feature Analysis (already added above)
+            
+            # Tab 6: Data Augmentation
             with gr.Tab("🔄 Augmentation / 数据增强"):
                 gr.Markdown("""
                 ### CEEMDAN-Based Data Augmentation (基于CEEMDAN的数据增强)
@@ -1675,7 +2004,7 @@ def create_gui():
                             outputs=[batch_aug_export_info]
                         )
             
-            # Tab 6: Export Results
+            # Tab 7: Export Results
             with gr.Tab("💾 Export Results / 导出结果"):
                 gr.Markdown("### Export processed data, segments, analysis results, and features")
                 
@@ -1764,7 +2093,7 @@ def create_gui():
                             outputs=[batch_features_export_info]
                         )
             
-            # Tab 7: Help
+            # Tab 8: Help
             with gr.Tab("ℹ️ Help / 帮助"):
                 gr.Markdown("""
                 ## Quick Start Guide / 快速入门
@@ -1793,7 +2122,14 @@ def create_gui():
                 - **Time normalization**: Uniform spectra sizes for CNN input
                 - **Feature extraction**: WL, ZC, SSC, MDF, MNF, IMNF, WIRE51, DI
                 
-                ### 5. Data Augmentation (数据增强)
+                ### 5. Feature Analysis (特征分析) **NEW!**
+                - **Upload segment CSV files**: Single or multiple sEMG segments
+                - **Automatic feature extraction**: All time/frequency domain features
+                - **Trend visualization**: See how features change across segments
+                - **CSV export**: Save all extracted features for further analysis
+                - **Fatigue detection**: Identify fatigue patterns (MDF↓, DI↑)
+                
+                ### 6. Data Augmentation (数据增强)
                 - **Single Segment**: Augment from detected segments in the loaded signal
                 - **Batch File Augmentation** (推荐): 
                   - Upload multiple CSV signal files directly
@@ -1805,7 +2141,7 @@ def create_gui():
                     4. Sum all 8 IMFs to create artificial signal
                   - Export generated signals to CSV files
                 
-                ### 6. Export (导出)
+                ### 7. Export (导出)
                 - **Single File Export**: Export processed signal, segments, and features
                 - **Batch Export**: Export all batch-processed features to CSV
                 - **Augmented Signals Export**: Export generated artificial signals to CSV
@@ -1820,6 +2156,14 @@ def create_gui():
                 3. **Detect**: Batch Detection tab → Detect in All Files
                 4. **Features**: Batch Detection tab → Extract Features from All Segments
                 5. **Export**: Batch Export tab → Export All Batch Features
+                
+                ## Feature Analysis Workflow / 特征分析工作流程
+                
+                1. **Upload**: Feature Analysis tab → Select segment CSV files
+                2. **Configure**: Set sampling frequency and CSV format options
+                3. **Analyze**: Click "Analyze Features" to extract all features
+                4. **Visualize**: View feature trends and statistics
+                5. **Export**: Click "Export Features to CSV" to save results
                 
                 ## Data Augmentation Workflow / 数据增强工作流程
                 
