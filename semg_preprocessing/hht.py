@@ -17,6 +17,10 @@ from scipy.interpolate import interp1d
 DEFAULT_CEEMDAN_ENSEMBLES = 30  # Default number of ensembles for CEEMDAN (30 for speed, 50 for accuracy)
 EPSILON = 1e-10  # Small value for numerical stability (avoiding division by zero)
 
+# sEMG frequency filtering constants
+SEMG_LOW_FREQ_CUTOFF = 20.0  # Hz - Exclude DC and low-freq artifacts (motion, baseline drift)
+                              # sEMG content is typically in 20-450 Hz range
+
 
 def emd_decomposition(
     signal: np.ndarray,
@@ -856,23 +860,40 @@ def extract_semg_features(
     power_spectrum = np.abs(fft_signal) ** 2
     freqs = np.fft.rfftfreq(n_samples, 1/fs)
     
-    # Total power
-    ttp = np.sum(power_spectrum)
+    # For sEMG signals, exclude DC and very low frequencies (< SEMG_LOW_FREQ_CUTOFF)
+    # These are typically artifacts, baseline drift, or motion noise
+    # sEMG frequency content is typically in 20-450 Hz range
+    freq_mask = freqs >= SEMG_LOW_FREQ_CUTOFF  # Exclude frequencies below cutoff
+    valid_freqs = freqs[freq_mask]
+    valid_power = power_spectrum[freq_mask]
+    
+    # Total power (using valid frequency range)
+    ttp_valid = np.sum(valid_power)
+    ttp = np.sum(power_spectrum)  # Total including DC for compatibility
     
     # 5. Median Frequency (MDF) - frequency that divides power spectrum in half
-    cumulative_power = np.cumsum(power_spectrum)
-    half_power = ttp / 2
-    mdf_idx = np.searchsorted(cumulative_power, half_power)
-    mdf = freqs[min(mdf_idx, len(freqs) - 1)]
+    # Use valid frequency range to avoid DC bias
+    if ttp_valid > 0:
+        cumulative_power = np.cumsum(valid_power)
+        half_power = ttp_valid / 2
+        mdf_idx = np.searchsorted(cumulative_power, half_power)
+        mdf = valid_freqs[min(mdf_idx, len(valid_freqs) - 1)]
+    else:
+        mdf = 0
     
     # 6. Mean Frequency (MNF) - weighted average of frequencies
-    if ttp > 0:
-        mnf = np.sum(freqs * power_spectrum) / ttp
+    # Use valid frequency range to avoid DC bias
+    if ttp_valid > 0:
+        mnf = np.sum(valid_freqs * valid_power) / ttp_valid
     else:
         mnf = 0
     
     # 7. Peak Frequency (PKF)
-    pkf = freqs[np.argmax(power_spectrum)]
+    # Use valid frequency range to find dominant sEMG frequency
+    if len(valid_power) > 0:
+        pkf = valid_freqs[np.argmax(valid_power)]
+    else:
+        pkf = 0
     
     # 8. IMNF - Instantaneous Mean Frequency
     # Computed using Hilbert transform to obtain instantaneous frequency.
@@ -880,10 +901,26 @@ def extract_semg_features(
     # Formula: IMNF = sum(IF(t) * A^2(t)) / sum(A^2(t))
     # where IF(t) is instantaneous frequency and A(t) is instantaneous amplitude
     try:
-        from scipy.signal import hilbert as scipy_hilbert
+        from scipy.signal import hilbert as scipy_hilbert, butter, filtfilt
         
-        # Compute analytic signal
-        analytic = scipy_hilbert(signal)
+        # Apply high-pass filter to remove DC and low-frequency drift
+        # This prevents low-frequency artifacts from affecting instantaneous frequency
+        # Use 4th order Butterworth high-pass filter at SEMG_LOW_FREQ_CUTOFF
+        min_fs_for_filter = 2 * SEMG_LOW_FREQ_CUTOFF  # Minimum sampling rate for filtering
+        if fs > min_fs_for_filter:  # Only filter if sampling rate is high enough
+            nyquist = fs / 2
+            cutoff = SEMG_LOW_FREQ_CUTOFF / nyquist
+            max_normalized_cutoff = 1.0  # Maximum valid normalized cutoff frequency
+            if cutoff < max_normalized_cutoff:  # Valid cutoff frequency
+                b, a = butter(4, cutoff, btype='high')
+                signal_filtered = filtfilt(b, a, signal)
+            else:
+                signal_filtered = signal
+        else:
+            signal_filtered = signal
+        
+        # Compute analytic signal from filtered signal
+        analytic = scipy_hilbert(signal_filtered)
         inst_amplitude = np.abs(analytic)
         inst_phase = np.unwrap(np.angle(analytic))
         
@@ -891,7 +928,9 @@ def extract_semg_features(
         inst_freq_signal = np.diff(inst_phase) / (2 * np.pi) * fs
         inst_freq_signal = np.concatenate([inst_freq_signal, [inst_freq_signal[-1]]])
         inst_freq_signal = np.abs(inst_freq_signal)
-        inst_freq_signal = np.clip(inst_freq_signal, 0, fs/2)
+        
+        # Clip to valid sEMG frequency range (SEMG_LOW_FREQ_CUTOFF to Nyquist)
+        inst_freq_signal = np.clip(inst_freq_signal, SEMG_LOW_FREQ_CUTOFF, fs/2)
         
         # Power-weighted average using amplitude^2 as power
         power = inst_amplitude ** 2
@@ -902,7 +941,7 @@ def extract_semg_features(
             imnf = mnf
         
         # Ensure reasonable frequency range
-        imnf = np.clip(imnf, 0, fs/2)
+        imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, fs/2)
     except Exception:
         imnf = mnf  # Fallback to MNF
     
@@ -967,22 +1006,22 @@ def extract_semg_features(
     # The ratio between fatigued/non-fatigued conditions is what matters (typically 2-10x increase)
     try:
         # Calculate spectral moments with original formula
-        # Use freqs > 0 to avoid division by zero for M_{-1}
-        valid_mask = freqs > 0
-        valid_freqs = freqs[valid_mask]
-        valid_power = power_spectrum[valid_mask]
+        # Use valid frequency range (>= SEMG_LOW_FREQ_CUTOFF) to exclude DC and low-frequency artifacts
+        di_mask = freqs >= SEMG_LOW_FREQ_CUTOFF
+        di_freqs = freqs[di_mask]
+        di_power = power_spectrum[di_mask]
         
-        total_power = np.sum(valid_power)
+        total_power_di = np.sum(di_power)
         
-        if total_power > EPSILON:
+        if total_power_di > EPSILON and len(di_freqs) > 0:
             # Normalize power spectrum to probability distribution
-            norm_power = valid_power / total_power
+            norm_power = di_power / total_power_di
             
             # M_{-1} = sum(f^{-1} * P(f)) - emphasizes low frequencies
-            moment_minus1 = np.sum((valid_freqs ** -1) * norm_power)
+            moment_minus1 = np.sum((di_freqs ** -1) * norm_power)
             
             # M_5 = sum(f^5 * P(f)) - emphasizes high frequencies
-            moment_5 = np.sum((valid_freqs ** 5) * norm_power)
+            moment_5 = np.sum((di_freqs ** 5) * norm_power)
             
             # DI = M_{-1} / M_5
             # This will be a very small number (1e-11 to 1e-9 range)
