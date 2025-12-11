@@ -846,6 +846,7 @@ def compute_hilbert_spectrum_production(
     
     # Step 5: Amplitude Thresholding for Noise Reduction
     # Remove amplitudes below threshold percentile
+    threshold_value = 0.0  # Initialize to prevent NameError
     if amplitude_threshold_percentile > 0 and np.max(spectrum) > 0:
         threshold_value = np.percentile(spectrum[spectrum > 0], amplitude_threshold_percentile)
         spectrum[spectrum < threshold_value] = 0
@@ -864,7 +865,7 @@ def compute_hilbert_spectrum_production(
         'reconstructed_energy': float(reconstructed_energy),
         'energy_conservation_ok': energy_error < 0.05,  # < 5% error is acceptable
         'max_amplitude': float(max_amplitude),
-        'threshold_value': float(threshold_value) if amplitude_threshold_percentile > 0 else 0.0
+        'threshold_value': float(threshold_value)
     }
     
     return spectrum, time_axis, freq_axis, validation_info
