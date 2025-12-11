@@ -1,32 +1,161 @@
 # sEMG Signal Preprocessing Toolkit
 
-一个用于表面肌电图（sEMG）信号预处理的Python工具包，包括滤波、去噪和肌肉活动检测功能。
+一个用于表面肌电图（sEMG）信号预处理的Python工具包，包括滤波、去噪、肌肉活动检测、特征提取和数据增强功能。
 
-A comprehensive Python toolkit for surface electromyography (sEMG) signal preprocessing, including filtering, noise removal, and muscle activity detection.
+A comprehensive Python toolkit for surface electromyography (sEMG) signal preprocessing, including filtering, noise removal, muscle activity detection, feature extraction, and data augmentation.
 
-## Features / 功能特性
+## 📚 Documentation / 文档
 
-### 1. EMG数据预处理 / EMG Data Preprocessing
+- **[Feature Algorithms](FEATURE_ALGORITHMS.md)** - Detailed mathematical formulas and physical meanings for all feature extraction algorithms
+- **[GUI Guide](GUI_GUIDE.md)** - Graphical user interface usage guide
+- **[Implementation Summary](IMPLEMENTATION_SUMMARY.md)** - Technical implementation details
+- **[Project Structure](PROJECT_STRUCTURE.md)** - Code organization and architecture
 
-- **高通/低通滤波 / High-pass/Low-pass Filtering**
-  - 高通滤波器（10-20Hz）：消除运动伪影、基线漂移和心电干扰
-  - 低通滤波器（450-500Hz）：去除高频噪声
-  - 支持巴特沃斯(Butterworth)和切比雪夫(Chebyshev)滤波器
-  - 滤波器阶数可调（推荐2-4阶）
+## 🎯 Key Features / 核心功能
 
-- **工频干扰去除 / Power Line Interference Removal**
-  - 方案一：陷波器(Notch Filter)，可级联处理50Hz及其谐波
-  - 方案二：DFT方法，去除目标频域成分后重建信号
+### 1. EMG Data Preprocessing / EMG数据预处理
 
-- **其他生物信号干扰处理 / Other Biological Signal Interference**
-  - 增强的高通滤波器设计，有效抑制ECG干扰（≤30Hz）
+- **High-pass/Low-pass Filtering / 高通/低通滤波**
+  - High-pass filter (10-20Hz): Remove motion artifacts, baseline drift, ECG interference
+  - Low-pass filter (450-500Hz): Remove high-frequency noise
+  - Supports Butterworth and Chebyshev filters
+  - Adjustable filter order (recommended: 2-4)
 
-### 2. 肌肉活动检测与分段 / Muscle Activity Detection and Segmentation
+- **Power Line Interference Removal / 工频干扰去除**
+  - Method 1: Notch filter with harmonic cascading (50/60Hz and harmonics)
+  - Method 2: DFT-based frequency domain removal with signal reconstruction
 
-- 基于ruptures库的变化点检测
-- 基于幅值的活动检测
-- 结合ruptures和幅值的混合方法（推荐）
-- 自动信号分段和元数据提取
+- **Batch Processing / 批量处理**
+  - Process multiple files simultaneously
+  - Unified parameters across all signals
+  - Batch export capabilities
+
+### 2. Muscle Activity Detection & Segmentation / 肌肉活动检测与分段
+
+- Ruptures-based change point detection
+- Amplitude-based activity detection
+- Combined hybrid method (recommended)
+- Automatic signal segmentation with metadata extraction
+
+### 3. Feature Extraction / 特征提取
+
+**Time Domain Features:**
+- WL (Waveform Length), ZC (Zero Crossings), SSC (Slope Sign Changes)
+- RMS (Root Mean Square), MAV (Mean Absolute Value), VAR (Variance)
+
+**Frequency Domain Features (Welch PSD-based):**
+- MDF (Median Frequency), MNF (Mean Frequency)
+- PKF (Peak Frequency), TTP (Total Power)
+- IMNF (Instantaneous Mean Frequency using Choi-Williams Distribution)
+
+**Fatigue Indicators:**
+- WIRE51 (Wavelet Index - sym5 DWT-based)
+- DI (Dimitrov Index - spectral moment ratio)
+
+**See [FEATURE_ALGORITHMS.md](FEATURE_ALGORITHMS.md) for detailed formulas and interpretations.**
+
+### 4. Hilbert-Huang Transform (HHT) / 希尔伯特-黄变换
+
+- CEEMDAN decomposition for robust IMF extraction
+- Production-ready HHT with:
+  - Fixed IMF count (8) with zero-padding
+  - Unified time-frequency axes
+  - Energy conservation validation (<5% error)
+  - Signal normalization and amplitude thresholding
+  - Noise reduction and muscle activity representation
+
+### 5. Data Augmentation / 数据增强
+
+- CEEMDAN-based IMF recombination
+- Batch file augmentation
+- Generate artificial sEMG signals from multiple source signals
+- Maintains physiological characteristics
+
+### 6. File Format Support / 文件格式支持
+
+- **CSV**: Standard comma-separated values (with header row options)
+- **MAT**: MATLAB .mat files (n×1 or 1×n double arrays)
+
+## System Architecture / 系统架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GUI Application (Tkinter)                │
+│  - File Loading  - Filtering  - Detection  - Export         │
+│  - Feature Analysis  - HHT Analysis  - Augmentation        │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────────┐
+│                Core Processing Modules                      │
+├─────────────────────────────────────────────────────────────┤
+│  1. utils.py                                                │
+│     - File I/O (CSV, MAT)                                   │
+│     - Batch loading with skip_rows support                  │
+│                                                              │
+│  2. filters.py                                              │
+│     - Bandpass/Highpass/Lowpass filters                     │
+│     - Notch filters (power line interference)               │
+│     - DFT-based frequency removal                           │
+│                                                              │
+│  3. detection.py                                            │
+│     - Ruptures-based change point detection                 │
+│     - Amplitude threshold detection                         │
+│     - Hybrid detection methods                              │
+│     - Automatic segmentation                                │
+│                                                              │
+│  4. hht.py (Feature Extraction & HHT)                       │
+│     ┌─────────────────────────────────────────────┐        │
+│     │ Feature Extraction                          │        │
+│     │ - Time domain: WL, ZC, SSC, RMS, MAV, VAR  │        │
+│     │ - Frequency: MDF, MNF, PKF, TTP (Welch PSD)│        │
+│     │ - Advanced: IMNF (CWD-based)               │        │
+│     │ - Fatigue: WIRE51 (sym5 DWT), DI           │        │
+│     └─────────────────────────────────────────────┘        │
+│     ┌─────────────────────────────────────────────┐        │
+│     │ HHT Analysis                                │        │
+│     │ - EMD/CEEMDAN decomposition                │        │
+│     │ - Hilbert transform & instantaneous freq    │        │
+│     │ - Production HHT with validation           │        │
+│     │ - Energy conservation checking              │        │
+│     └─────────────────────────────────────────────┘        │
+│                                                              │
+│  5. augmentation.py                                         │
+│     - CEEMDAN-based signal generation                       │
+│     - IMF recombination (m=8)                               │
+│     - Batch augmentation                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Processing Pipeline / 处理流程
+
+```
+Input Signal (CSV/MAT)
+    ↓
+[1] Preprocessing
+    ├─ Bandpass Filter (20-450 Hz)
+    ├─ Notch Filter (50/60 Hz + harmonics)
+    └─ Normalization (optional)
+    ↓
+[2] Activity Detection
+    ├─ Ruptures change point detection
+    ├─ Amplitude threshold detection
+    └─ Combined hybrid method
+    ↓
+[3] Segmentation
+    └─ Extract activity segments with metadata
+    ↓
+[4] Feature Extraction (Per Segment)
+    ├─ Time Domain Features
+    ├─ Frequency Features (Welch PSD)
+    ├─ IMNF (Choi-Williams)
+    └─ Fatigue Indicators (WIRE51, DI)
+    ↓
+[5] Advanced Analysis (Optional)
+    ├─ HHT Analysis (Time-Frequency)
+    └─ Data Augmentation (CEEMDAN IMF)
+    ↓
+Output (CSV/NPZ/Visualization)
+```
 
 ## Installation / 安装
 
