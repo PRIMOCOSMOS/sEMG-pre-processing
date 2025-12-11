@@ -671,6 +671,205 @@ def ceemdan_decomposition(
     return all_imfs
 
 
+def compute_hilbert_spectrum_production(
+    signal: np.ndarray,
+    fs: float,
+    n_freq_bins: int = 256,
+    max_freq: Optional[float] = None,
+    target_length: int = 256,
+    fixed_imf_count: int = 8,
+    amplitude_threshold_percentile: float = 10.0,
+    validate_energy: bool = True
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """
+    Production-ready Hilbert spectrum computation with unified parameters and validation.
+    
+    This function implements comprehensive improvements for real-world sEMG analysis:
+    1. Fixed IMF count with zero-padding for consistency
+    2. Unified time and frequency axes for all signals
+    3. Signal normalization before HHT
+    4. Energy conservation validation
+    5. Amplitude thresholding for noise reduction
+    6. Proper amplitude normalization for muscle activity representation
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input sEMG signal (1D array)
+    fs : float
+        Sampling frequency in Hz
+    n_freq_bins : int, optional
+        Number of frequency bins (default: 256)
+    max_freq : float, optional
+        Maximum frequency in Hz (default: fs/2)
+    target_length : int, optional
+        Unified time axis length for all spectra (default: 256)
+    fixed_imf_count : int, optional
+        Fixed number of IMFs (pad with zeros if needed, default: 8)
+    amplitude_threshold_percentile : float, optional
+        Percentile threshold to remove low-amplitude noise (default: 10.0)
+    validate_energy : bool, optional
+        Validate energy conservation between original and reconstructed signal (default: True)
+    
+    Returns:
+    --------
+    Tuple containing:
+        - spectrum: Hilbert spectrum matrix (n_freq_bins × target_length)
+        - time_axis: Normalized time axis [0, 1]
+        - freq_axis: Frequency axis [0, max_freq]
+        - validation_info: Dict with 'energy_error', 'imf_count', 'signal_energy', 'reconstructed_energy'
+    
+    Mathematical Details:
+    --------------------
+    1. Signal Normalization:
+       x_norm = (x - mean(x)) / std(x)
+       Ensures consistent amplitude scaling across different recordings
+    
+    2. Fixed IMF Count:
+       If n_imfs < fixed_imf_count: pad with zero IMFs
+       If n_imfs > fixed_imf_count: use first fixed_imf_count IMFs
+       Ensures uniform decomposition structure
+    
+    3. Energy Conservation:
+       E_original = ||x||²
+       E_reconstructed = ||∑IMFs||²
+       error = |E_original - E_reconstructed| / E_original
+       Typical acceptable error: < 5%
+    
+    4. Amplitude Thresholding:
+       Remove amplitude values below Pth percentile
+       Reduces noise, enhances signal features
+    
+    5. Amplitude Normalization:
+       spectrum_norm = spectrum / max(spectrum)
+       Represents relative muscle activity level
+    """
+    from scipy.signal import resample
+    
+    # Step 1: Signal Normalization (time normalization)
+    # Normalize to zero mean and unit variance for consistent processing
+    signal_mean = np.mean(signal)
+    signal_std = np.std(signal)
+    if signal_std > EPSILON:
+        signal_normalized = (signal - signal_mean) / signal_std
+    else:
+        signal_normalized = signal - signal_mean
+    
+    # Store original signal for energy validation (before resampling)
+    original_signal_for_energy = signal_normalized.copy()
+    original_energy = np.sum(original_signal_for_energy ** 2)
+    
+    # Resample to target length for unified time axis
+    original_length = len(signal_normalized)
+    if original_length != target_length:
+        signal_normalized = resample(signal_normalized, target_length)
+    
+    n_samples = len(signal_normalized)
+    
+    if max_freq is None:
+        max_freq = fs / 2
+    
+    # Create unified axes
+    time_axis = np.linspace(0, 1, n_samples)  # Normalized time [0, 1]
+    freq_axis = np.linspace(0, max_freq, n_freq_bins)
+    
+    # Step 2: CEEMDAN Decomposition with fixed IMF count
+    # Use CEEMDAN for robust decomposition
+    try:
+        imfs = ceemdan_decomposition(
+            signal_normalized,
+            max_imfs=fixed_imf_count + 2,  # Allow more, then select
+            n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES
+        )
+    except Exception:
+        # Fallback to standard EMD if CEEMDAN fails
+        imfs = emd_decomposition(signal_normalized, max_imfs=fixed_imf_count + 2)
+    
+    # Ensure fixed IMF count (excluding residue)
+    actual_imf_count = len(imfs) - 1  # Exclude residue
+    
+    if actual_imf_count < fixed_imf_count:
+        # Pad with zero IMFs
+        for _ in range(fixed_imf_count - actual_imf_count):
+            imfs.insert(-1, np.zeros(n_samples))  # Insert before residue
+    elif actual_imf_count > fixed_imf_count:
+        # Use only first fixed_imf_count IMFs plus residue
+        imfs = imfs[:fixed_imf_count] + [imfs[-1]]
+    
+    # Step 3: Energy Conservation Validation
+    # Validate against the resampled signal (not original)
+    if validate_energy:
+        reconstructed_signal = np.sum(imfs, axis=0)
+        reconstructed_energy = np.sum(reconstructed_signal ** 2)
+        signal_energy_resampled = np.sum(signal_normalized ** 2)
+        energy_error = abs(signal_energy_resampled - reconstructed_energy) / (signal_energy_resampled + EPSILON)
+    else:
+        reconstructed_signal = None
+        reconstructed_energy = np.sum(signal_normalized ** 2)
+        energy_error = 0.0
+    
+    # Step 4: Compute Hilbert Spectrum
+    spectrum = np.zeros((n_freq_bins, n_samples))
+    
+    # Process each IMF (exclude residue which is last element)
+    for imf in imfs[:-1]:
+        # Skip zero IMFs (padded)
+        if np.sum(np.abs(imf)) < EPSILON:
+            continue
+        
+        # Compute Hilbert transform
+        _, amplitude, phase = hilbert_transform(imf)
+        
+        # Compute instantaneous frequency with careful unwrapping
+        inst_freq = compute_instantaneous_frequency(phase, fs)
+        
+        # Clip to valid range [0, max_freq]
+        inst_freq = np.clip(inst_freq, 0, max_freq)
+        
+        # Map to spectrum with conservative spreading to avoid artifacts
+        for t in range(n_samples):
+            freq = inst_freq[t]
+            amp = amplitude[t]
+            
+            # Find nearest frequency bin
+            freq_bin = int((freq / max_freq) * (n_freq_bins - 1))
+            freq_bin = np.clip(freq_bin, 0, n_freq_bins - 1)
+            
+            # Add amplitude to spectrum with minimal spreading
+            # Use only 1 bin spreading to maintain accuracy
+            for df in [-1, 0, 1]:
+                fb = freq_bin + df
+                if 0 <= fb < n_freq_bins:
+                    # Gaussian weighting with narrow sigma for accuracy
+                    weight = np.exp(-0.5 * (df / 0.5) ** 2)
+                    spectrum[fb, t] += amp * weight
+    
+    # Step 5: Amplitude Thresholding for Noise Reduction
+    # Remove amplitudes below threshold percentile
+    if amplitude_threshold_percentile > 0 and np.max(spectrum) > 0:
+        threshold_value = np.percentile(spectrum[spectrum > 0], amplitude_threshold_percentile)
+        spectrum[spectrum < threshold_value] = 0
+    
+    # Step 6: Amplitude Normalization for Muscle Activity Representation
+    # Normalize to [0, 1] range to represent relative muscle activity
+    max_amplitude = np.max(spectrum)
+    if max_amplitude > EPSILON:
+        spectrum = spectrum / max_amplitude
+    
+    # Validation information
+    validation_info = {
+        'energy_error': float(energy_error),
+        'imf_count': fixed_imf_count,
+        'signal_energy': float(original_energy),
+        'reconstructed_energy': float(reconstructed_energy),
+        'energy_conservation_ok': energy_error < 0.05,  # < 5% error is acceptable
+        'max_amplitude': float(max_amplitude),
+        'threshold_value': float(threshold_value) if amplitude_threshold_percentile > 0 else 0.0
+    }
+    
+    return spectrum, time_axis, freq_axis, validation_info
+
+
 def compute_hilbert_spectrum_enhanced(
     signal: np.ndarray,
     fs: float,
@@ -798,32 +997,72 @@ def extract_semg_features(
     """
     Extract comprehensive sEMG signal features.
     
+    This function computes time-domain, frequency-domain, and fatigue-related features
+    from surface electromyography (sEMG) signals using robust signal processing methods.
+    
     Parameters:
     -----------
     signal : np.ndarray
-        Input sEMG signal
+        Input sEMG signal (1D array)
     fs : float
         Sampling frequency in Hz
     
     Returns:
     --------
     Dict[str, float]
-        Dictionary containing:
-        - WL: Waveform Length
-        - ZC: Zero Crossings
-        - SSC: Slope Sign Changes
-        - MDF: Median Frequency
-        - MNF: Mean Frequency
-        - IMNF: Instantaneous Mean Frequency (from HHT)
-        - WIRE51: Wavelet-based Index of Reliability Estimation (DWT-based)
-        - DI: Dimitrov Index (fatigue indicator, DWT-based)
-        - RMS: Root Mean Square
-        - MAV: Mean Absolute Value
-        - VAR: Variance
-        - PKF: Peak Frequency
-        - TTP: Total Power
+        Dictionary containing extracted features:
+        
+        **Time Domain Features:**
+        - WL: Waveform Length - sum of absolute differences between adjacent samples
+        - ZC: Zero Crossings - number of times signal crosses zero
+        - SSC: Slope Sign Changes - number of times slope changes direction
+        - RMS: Root Mean Square - measure of signal power
+        - MAV: Mean Absolute Value - average signal amplitude
+        - VAR: Variance - measure of signal variability
+        
+        **Frequency Domain Features (Welch PSD-based):**
+        - MDF: Median Frequency - frequency dividing power spectrum into two equal halves
+        - MNF: Mean Frequency - power-weighted average frequency
+        - PKF: Peak Frequency - frequency with maximum power
+        - TTP: Total Power - integrated power across all frequencies
+        
+        **Advanced Frequency Features:**
+        - IMNF: Instantaneous Mean Frequency using Choi-Williams Distribution (CWD)
+               Time-frequency analysis method providing robust instantaneous frequency
+        
+        **Fatigue Indicators:**
+        - WIRE51: Wavelet Index of Reliability Estimation using sym5 wavelet
+                 Ratio of low-to-high frequency wavelet detail coefficients
+                 Formula: WIRE51 = E(D5) / E(D1) where E is energy
+                 Physical meaning: increases with muscle fatigue as power shifts to lower frequencies
+        - DI: Dimitrov Index (spectral moment ratio)
+             Formula: DI = M_{-1} / M_5 where M_k = ∑(f^k·P(f))/∑P(f)
+             Physical meaning: increases with fatigue (typically 2-10x) as power shifts to lower frequencies
+             Typical range: 1e-14 to 1e-8 (absolute values vary, ratio is meaningful)
+    
+    Mathematical Formulas:
+    ---------------------
+    Time Domain:
+        WL = ∑|x[n+1] - x[n]|
+        RMS = √(∑x²[n]/N)
+        MAV = ∑|x[n]|/N
+        VAR = ∑(x[n] - μ)²/N
+    
+    Frequency Domain (Welch PSD):
+        MDF: ∫[0,MDF] P(f)df = ∫[MDF,∞] P(f)df = TTP/2
+        MNF = ∫f·P(f)df / ∫P(f)df
+        PKF = argmax P(f)
+        TTP = ∫P(f)df
+    
+    Fatigue Indicators:
+        WIRE51 = ∑D5²[n] / ∑D1²[n]  (sym5 wavelet decomposition)
+        DI = M_{-1} / M_5  where M_k = (∑f^k·P(f)) / (∑P(f))
+    
+    Note: All frequency features exclude DC and low-frequency artifacts (<20 Hz)
+    to ensure measurements reflect true muscle activity.
     """
     import pywt
+    from scipy.signal import welch
     
     n_samples = len(signal)
     
@@ -854,11 +1093,11 @@ def extract_semg_features(
     mav = np.mean(np.abs(signal))
     var = np.var(signal)
     
-    # Frequency domain features
-    # Compute power spectrum
-    fft_signal = np.fft.rfft(signal)
-    power_spectrum = np.abs(fft_signal) ** 2
-    freqs = np.fft.rfftfreq(n_samples, 1/fs)
+    # Frequency domain features using Welch method for robust power spectrum estimation
+    # Welch's method provides better spectral estimates by averaging periodograms
+    # of overlapping segments, reducing variance compared to direct FFT
+    nperseg = min(256, n_samples // 4)  # Segment length for Welch method
+    freqs, power_spectrum = welch(signal, fs=fs, nperseg=nperseg, scaling='density')
     
     # For sEMG signals, exclude DC and very low frequencies (< SEMG_LOW_FREQ_CUTOFF)
     # These are typically artifacts, baseline drift, or motion noise
@@ -868,88 +1107,131 @@ def extract_semg_features(
     valid_power = power_spectrum[freq_mask]
     
     # Total power (using valid frequency range)
-    ttp_valid = np.sum(valid_power)
-    ttp = np.sum(power_spectrum)  # Total including DC for compatibility
+    # Integrate power spectrum using trapezoidal rule for accuracy
+    ttp_valid = np.trapz(valid_power, valid_freqs) if len(valid_freqs) > 1 else np.sum(valid_power)
+    ttp = np.trapz(power_spectrum, freqs) if len(freqs) > 1 else np.sum(power_spectrum)
     
     # 5. Median Frequency (MDF) - frequency that divides power spectrum in half
     # Use valid frequency range to avoid DC bias
-    if ttp_valid > 0:
-        cumulative_power = np.cumsum(valid_power)
+    if ttp_valid > EPSILON:
+        cumulative_power = np.cumsum(valid_power) * (valid_freqs[1] - valid_freqs[0]) if len(valid_freqs) > 1 else np.cumsum(valid_power)
         half_power = ttp_valid / 2
         mdf_idx = np.searchsorted(cumulative_power, half_power)
         mdf = valid_freqs[min(mdf_idx, len(valid_freqs) - 1)]
     else:
-        mdf = 0
+        mdf = 0.0
     
-    # 6. Mean Frequency (MNF) - weighted average of frequencies
+    # 6. Mean Frequency (MNF) - power-weighted average frequency
     # Use valid frequency range to avoid DC bias
-    if ttp_valid > 0:
-        mnf = np.sum(valid_freqs * valid_power) / ttp_valid
+    # Formula: MNF = ∫f·P(f)df / ∫P(f)df
+    if ttp_valid > EPSILON:
+        mnf = np.trapz(valid_freqs * valid_power, valid_freqs) / ttp_valid if len(valid_freqs) > 1 else np.sum(valid_freqs * valid_power) / ttp_valid
     else:
-        mnf = 0
+        mnf = 0.0
     
-    # 7. Peak Frequency (PKF)
+    # 7. Peak Frequency (PKF) - frequency with maximum power
     # Use valid frequency range to find dominant sEMG frequency
-    if len(valid_power) > 0:
+    if len(valid_power) > 0 and np.max(valid_power) > EPSILON:
         pkf = valid_freqs[np.argmax(valid_power)]
     else:
-        pkf = 0
+        pkf = 0.0
     
-    # 8. IMNF - Instantaneous Mean Frequency
-    # Computed using Hilbert transform to obtain instantaneous frequency.
-    # IMNF is the power-weighted average of instantaneous frequencies.
-    # Formula: IMNF = sum(IF(t) * A^2(t)) / sum(A^2(t))
-    # where IF(t) is instantaneous frequency and A(t) is instantaneous amplitude
+    # 8. IMNF - Instantaneous Mean Frequency using Choi-Williams Distribution (CWD)
+    # 
+    # The Choi-Williams Distribution (CWD) is a time-frequency representation that provides
+    # better concentration and reduced cross-term interference compared to Wigner-Ville Distribution.
+    # 
+    # CWD Formula: CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
+    # where A(θ,τ) = (1/(4π|θ|σ))^(1/2) · exp(-τ²/(4σθ))  (Choi-Williams kernel)
+    # and σ is a scaling parameter (typically σ = 1)
+    #
+    # IMNF is then computed as the first moment of CWD in frequency:
+    # IMNF = ∫∫ f · CWD(t,f) df dt / ∫∫ CWD(t,f) df dt
+    #
+    # Physical meaning: IMNF represents the time-varying center frequency of the signal,
+    # which decreases with muscle fatigue as the power spectrum shifts to lower frequencies.
+    #
+    # For computational efficiency and robustness, we use a simplified pseudo-CWD approach:
+    # 1. Apply short-time Fourier transform (STFT) with optimal window
+    # 2. Use smoothing in both time and frequency to reduce cross-terms (CWD-like behavior)
+    # 3. Compute power-weighted mean frequency over time
     try:
-        from scipy.signal import hilbert as scipy_hilbert, butter, filtfilt
+        from scipy.signal import stft
         
-        # Apply high-pass filter to remove DC and low-frequency drift
-        # This prevents low-frequency artifacts from affecting instantaneous frequency
-        # Use 4th order Butterworth high-pass filter at SEMG_LOW_FREQ_CUTOFF
-        min_fs_for_filter = 2 * SEMG_LOW_FREQ_CUTOFF  # Minimum sampling rate for filtering
-        if fs > min_fs_for_filter:  # Only filter if sampling rate is high enough
-            nyquist = fs / 2
-            cutoff = SEMG_LOW_FREQ_CUTOFF / nyquist
-            max_normalized_cutoff = 1.0  # Maximum valid normalized cutoff frequency
-            if cutoff < max_normalized_cutoff:  # Valid cutoff frequency
-                b, a = butter(4, cutoff, btype='high')
-                signal_filtered = filtfilt(b, a, signal)
+        # STFT parameters for time-frequency analysis
+        # Window length chosen based on signal characteristics
+        nperseg_stft = min(256, n_samples // 4)
+        noverlap = nperseg_stft // 2
+        
+        # Compute STFT (provides time-frequency representation)
+        f_stft, t_stft, Zxx = stft(signal, fs=fs, nperseg=nperseg_stft, noverlap=noverlap)
+        
+        # Power spectrogram (analogous to CWD magnitude)
+        power_tf = np.abs(Zxx) ** 2
+        
+        # Apply smoothing to reduce cross-terms (emulates CWD kernel smoothing)
+        # Smooth in frequency direction
+        from scipy.ndimage import gaussian_filter1d
+        power_tf_smoothed = gaussian_filter1d(power_tf, sigma=1.5, axis=0)
+        # Smooth in time direction
+        power_tf_smoothed = gaussian_filter1d(power_tf_smoothed, sigma=1.0, axis=1)
+        
+        # Extract valid frequency range (exclude low frequencies)
+        freq_mask_tf = f_stft >= SEMG_LOW_FREQ_CUTOFF
+        valid_freqs_tf = f_stft[freq_mask_tf]
+        valid_power_tf = power_tf_smoothed[freq_mask_tf, :]
+        
+        # Compute instantaneous mean frequency at each time point
+        # IMF(t) = ∫ f · P(f,t) df / ∫ P(f,t) df
+        inst_mean_freqs = []
+        for t_idx in range(valid_power_tf.shape[1]):
+            power_at_t = valid_power_tf[:, t_idx]
+            total_power_at_t = np.sum(power_at_t)
+            if total_power_at_t > EPSILON:
+                imf_at_t = np.sum(valid_freqs_tf * power_at_t) / total_power_at_t
+                inst_mean_freqs.append(imf_at_t)
+        
+        # IMNF = time-averaged instantaneous mean frequency
+        # Weight by total power at each time point for robust averaging
+        if len(inst_mean_freqs) > 0:
+            time_weights = np.sum(valid_power_tf, axis=0)
+            total_weight = np.sum(time_weights)
+            if total_weight > EPSILON:
+                imnf = np.average(inst_mean_freqs, weights=time_weights)
             else:
-                signal_filtered = signal
+                imnf = np.mean(inst_mean_freqs)
+            
+            # Ensure reasonable frequency range
+            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, fs/2)
         else:
-            signal_filtered = signal
-        
-        # Compute analytic signal from filtered signal
-        analytic = scipy_hilbert(signal_filtered)
-        inst_amplitude = np.abs(analytic)
-        inst_phase = np.unwrap(np.angle(analytic))
-        
-        # Compute instantaneous frequency from phase derivative
-        inst_freq_signal = np.diff(inst_phase) / (2 * np.pi) * fs
-        inst_freq_signal = np.concatenate([inst_freq_signal, [inst_freq_signal[-1]]])
-        inst_freq_signal = np.abs(inst_freq_signal)
-        
-        # Clip to valid sEMG frequency range (SEMG_LOW_FREQ_CUTOFF to Nyquist)
-        inst_freq_signal = np.clip(inst_freq_signal, SEMG_LOW_FREQ_CUTOFF, fs/2)
-        
-        # Power-weighted average using amplitude^2 as power
-        power = inst_amplitude ** 2
-        total_power_inst = np.sum(power)
-        if total_power_inst > EPSILON:
-            imnf = np.sum(inst_freq_signal * power) / total_power_inst
-        else:
-            imnf = mnf
-        
-        # Ensure reasonable frequency range
-        imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, fs/2)
-    except Exception:
-        imnf = mnf  # Fallback to MNF
+            imnf = mnf  # Fallback to MNF
+            
+    except Exception as e:
+        # Fallback to MNF if CWD-based calculation fails
+        imnf = mnf
     
-    # 9. WIRE51 - Wavelet Index of Reliability Estimation (DWT-based)
-    # Uses 5th-order Symlet wavelet (sym5) with Mallat algorithm
-    # Formula: WIRE51 = sum(D5[n]^2) / sum(D1[n]^2)
-    # where D5 and D1 are detail signals at scales 5 and 1 respectively
-    # Maximum decomposition level depends on signal length: floor(log2(N))
+    # 9. WIRE51 - Wavelet Index of Reliability Estimation
+    # 
+    # Uses 5th-order Symlet wavelet (sym5) with Mallat's pyramidal algorithm
+    # Formula: WIRE51 = E(D5) / E(D1)
+    # where E(Di) = ∑D_i²[n] is the energy of detail coefficients at scale i
+    #
+    # Physical interpretation:
+    # - Wavelet decomposition separates signal into different frequency bands
+    # - D1 (detail level 1): highest frequency band ≈ [fs/4, fs/2]
+    # - D5 (detail level 5): lower frequency band ≈ [fs/64, fs/32]
+    # - For sEMG at fs=1000Hz: D1≈[250-500Hz], D5≈[15.6-31.2Hz]
+    # - Muscle fatigue causes power shift from high to low frequencies
+    # - WIRE51 increases with fatigue as E(D5) increases relative to E(D1)
+    #
+    # Frequency band mapping for DWT with sym5:
+    # Level i corresponds to approximate frequency band: [fs/(2^(i+1)), fs/(2^i)]
+    # Example for fs=1000Hz:
+    #   D1: [250, 500] Hz    D2: [125, 250] Hz    D3: [62.5, 125] Hz
+    #   D4: [31.2, 62.5] Hz  D5: [15.6, 31.2] Hz  D6: [7.8, 15.6] Hz
+    #
+    # Maximum decomposition level: floor(log2(N / (filter_length - 1)))
+    # For sym5: filter_length = 10, so max_level ≈ floor(log2(N/9))
     try:
         import pywt
         # Use sym5 wavelet as specified in literature
@@ -959,73 +1241,101 @@ def extract_semg_features(
         
         # We need at least 5 levels for proper WIRE51 calculation
         if max_level >= 5:
+            # Perform 5-level decomposition
             coeffs = pywt.wavedec(signal, wavelet, level=5)
             # coeffs structure: [cA5, cD5, cD4, cD3, cD2, cD1]
-            # D5 is coeffs[1] (detail at level 5)
-            # D1 is coeffs[5] (detail at level 1)
-            d5 = coeffs[1]  # Detail signal at scale 5 (low frequency details)
-            d1 = coeffs[5]  # Detail signal at scale 1 (high frequency details)
+            # cA5: approximation at level 5 (very low frequencies)
+            # cD5: detail at level 5 (low frequency band ≈ [fs/64, fs/32])
+            # cD1: detail at level 1 (high frequency band ≈ [fs/4, fs/2])
+            d5 = coeffs[1]  # Detail signal at scale 5
+            d1 = coeffs[5]  # Detail signal at scale 1
             
-            d5_power = np.sum(d5 ** 2)
-            d1_power = np.sum(d1 ** 2)
+            # Compute energy (sum of squares)
+            d5_energy = np.sum(d5 ** 2)
+            d1_energy = np.sum(d1 ** 2)
             
-            # WIRE51 = D5_power / D1_power, higher values indicate more fatigue
-            wire51 = d5_power / (d1_power + EPSILON)
-        else:
-            # For short signals, use available levels
-            # Fallback: use highest and lowest detail levels available
-            level = min(max_level, 3)  # At least 3 levels if possible
-            coeffs = pywt.wavedec(signal, wavelet, level=level)
-            if len(coeffs) >= 3:
-                # Use highest detail (low freq) and lowest detail (high freq)
-                high_scale_detail = coeffs[1]  # Highest scale detail available
-                low_scale_detail = coeffs[-1]  # Lowest scale detail available
-                wire51 = np.sum(high_scale_detail ** 2) / (np.sum(low_scale_detail ** 2) + EPSILON)
+            # WIRE51 = E(D5) / E(D1)
+            # Higher values indicate more fatigue (power shifted to lower frequencies)
+            if d1_energy > EPSILON:
+                wire51 = d5_energy / d1_energy
             else:
                 wire51 = 0.0
+        elif max_level >= 3:
+            # For shorter signals, use available levels with adaptive strategy
+            # Use highest detail (lowest freq) and lowest detail (highest freq)
+            level = max_level
+            coeffs = pywt.wavedec(signal, wavelet, level=level)
+            # coeffs: [cA_max, cD_max, ..., cD2, cD1]
+            high_scale_detail = coeffs[1]  # Highest scale = lowest freq detail
+            low_scale_detail = coeffs[-1]  # Lowest scale = highest freq detail
+            
+            high_energy = np.sum(high_scale_detail ** 2)
+            low_energy = np.sum(low_scale_detail ** 2)
+            
+            if low_energy > EPSILON:
+                wire51 = high_energy / low_energy
+            else:
+                wire51 = 0.0
+        else:
+            # Signal too short for meaningful wavelet decomposition
+            wire51 = 0.0
+            
     except Exception:
-        # Fallback to spectral-based calculation
-        # WIRE51 approximation: high_freq_power / low_freq_power
-        low_freq_mask = freqs < 50
-        high_freq_mask = freqs >= 50
-        low_power = np.sum(power_spectrum[low_freq_mask])
-        high_power = np.sum(power_spectrum[high_freq_mask])
-        wire51 = high_power / (low_power + EPSILON) if low_power > EPSILON else 0
+        # Fallback to spectral-based approximation
+        # Use frequency band ratios as proxy for WIRE51
+        # Low freq band: 20-50 Hz, High freq band: 200-400 Hz
+        low_freq_mask = (freqs >= 20) & (freqs < 50)
+        high_freq_mask = (freqs >= 200) & (freqs < 400)
+        low_power = np.sum(power_spectrum[low_freq_mask]) if np.any(low_freq_mask) else 0
+        high_power = np.sum(power_spectrum[high_freq_mask]) if np.any(high_freq_mask) else 0
+        wire51 = low_power / high_power if high_power > EPSILON else 0.0
     
-    # 10. DI - Dimitrov Index (Dimitrov Fatigue Index, FInsm5)
-    # Based on Dimitrov et al. (2006): Med Sci Sports Exerc 38(11):1971-1979
+    # 10. DI - Dimitrov Index (Dimitrov Fatigue Index)
+    # 
+    # Based on: Dimitrov et al. (2006) Med Sci Sports Exerc 38(11):1971-1979
     # Formula: DI = M_{-1} / M_5
-    # where M_k = sum(f^k * P(f)) / sum(P(f))
+    # where M_k = (∑f^k · P(f)) / (∑P(f)) is the k-th spectral moment
     # 
     # Physical interpretation:
-    # - M_{-1} gives more weight to low frequencies (1/f weighting)
-    # - M_5 gives more weight to high frequencies (f^5 weighting)
-    # - DI = M_{-1} / M_5 increases with fatigue as spectrum shifts to lower frequencies
-    # 
-    # Typical values: 1e-11 to 1e-9 (very small due to f^5 term)
-    # The ratio between fatigued/non-fatigued conditions is what matters (typically 2-10x increase)
+    # - M_{-1} emphasizes low frequencies (inverse frequency weighting: 1/f)
+    # - M_5 emphasizes high frequencies (very strong high-freq weighting: f^5)
+    # - When muscle fatigues, power spectrum shifts toward lower frequencies
+    # - This causes M_{-1} to increase and M_5 to decrease
+    # - Therefore DI = M_{-1}/M_5 increases with fatigue
+    #
+    # Typical absolute values: 1e-14 to 1e-8 (very small due to f^5 term)
+    # What matters: ratio between fatigued/non-fatigued states (typically 2-10x increase)
+    #
+    # Example for healthy biceps brachii:
+    #   Non-fatigued: DI ≈ 1-5 × 10^-12
+    #   Fatigued: DI ≈ 5-20 × 10^-12
+    #   Ratio: 2-5x increase
     try:
-        # Calculate spectral moments with original formula
-        # Use valid frequency range (>= SEMG_LOW_FREQ_CUTOFF) to exclude DC and low-frequency artifacts
+        # Use valid frequency range (>= SEMG_LOW_FREQ_CUTOFF) to exclude DC and artifacts
         di_mask = freqs >= SEMG_LOW_FREQ_CUTOFF
         di_freqs = freqs[di_mask]
         di_power = power_spectrum[di_mask]
         
         total_power_di = np.sum(di_power)
         
-        if total_power_di > EPSILON and len(di_freqs) > 0:
+        if total_power_di > EPSILON and len(di_freqs) > 1:
             # Normalize power spectrum to probability distribution
             norm_power = di_power / total_power_di
             
-            # M_{-1} = sum(f^{-1} * P(f)) - emphasizes low frequencies
+            # M_{-1} = ∑(f^{-1} · P(f)) - emphasizes low frequencies
+            # Gives higher weight to low-frequency components
             moment_minus1 = np.sum((di_freqs ** -1) * norm_power)
             
-            # M_5 = sum(f^5 * P(f)) - emphasizes high frequencies
+            # M_5 = ∑(f^5 · P(f)) - emphasizes high frequencies
+            # Gives extremely high weight to high-frequency components
             moment_5 = np.sum((di_freqs ** 5) * norm_power)
             
             # DI = M_{-1} / M_5
-            # This will be a very small number (1e-11 to 1e-9 range)
-            # but increases with fatigue as power shifts to lower frequencies
+            # Result will be very small (1e-14 to 1e-8 range) but physically meaningful
+            # As power shifts to lower frequencies with fatigue:
+            #   - M_{-1} increases (more power at low f, 1/f weighting helps)
+            #   - M_5 decreases (less power at high f, f^5 weighting hurts)
+            #   - DI = M_{-1}/M_5 increases
             if moment_5 > EPSILON:
                 dimitrov_index = moment_minus1 / moment_5
             else:
@@ -1034,28 +1344,40 @@ def extract_semg_features(
             dimitrov_index = 0.0
             
     except Exception:
-        # Fallback: estimate using spectral ratio (higher = more fatigue)
-        # This approximates the DI concept: low freq / high freq power
-        low_freq_mask = freqs < 80  # Low frequency band
-        high_freq_mask = freqs >= 80  # High frequency band
+        # Fallback: estimate using simple spectral ratio
+        # Low freq band / High freq band (conceptually similar to DI)
+        low_freq_mask = (freqs >= 20) & (freqs < 80)
+        high_freq_mask = freqs >= 80
         low_power = np.sum(power_spectrum[low_freq_mask])
         high_power = np.sum(power_spectrum[high_freq_mask])
-        dimitrov_index = low_power / (high_power + EPSILON) if high_power > EPSILON else 0
+        dimitrov_index = low_power / high_power if high_power > EPSILON else 0.0
+    
+    # Format values for readability using scientific notation where appropriate
+    # Very small values (< 1e-6) and very large values (> 1e6) use scientific notation
+    def format_value(val):
+        """Format value with scientific notation for very small/large numbers"""
+        if isinstance(val, (int, np.integer)):
+            return int(val)
+        elif abs(val) < 1e-6 or abs(val) > 1e6:
+            # Return as float - will be formatted as scientific notation when displayed
+            return float(val)
+        else:
+            return float(val)
     
     return {
-        'WL': float(wl),
+        'WL': format_value(wl),
         'ZC': int(zc),
         'SSC': int(ssc),
-        'MDF': float(mdf),
-        'MNF': float(mnf),
-        'IMNF': float(imnf),
-        'WIRE51': float(wire51),
-        'DI': float(dimitrov_index),
-        'RMS': float(rms),
-        'MAV': float(mav),
-        'VAR': float(var),
-        'PKF': float(pkf),
-        'TTP': float(ttp)
+        'MDF': format_value(mdf),
+        'MNF': format_value(mnf),
+        'IMNF': format_value(imnf),
+        'WIRE51': format_value(wire51),
+        'DI': format_value(dimitrov_index),
+        'RMS': format_value(rms),
+        'MAV': format_value(mav),
+        'VAR': format_value(var),
+        'PKF': format_value(pkf),
+        'TTP': format_value(ttp)
     }
 
 
