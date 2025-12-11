@@ -7,6 +7,7 @@ import pandas as pd
 from typing import Tuple, Optional, Union, List, Dict
 import os
 import glob
+from scipy.io import loadmat
 
 
 def load_csv_data(
@@ -146,6 +147,149 @@ def batch_load_csv(
     
     print(f"\nSuccessfully loaded {len(loaded_data)} files")
     return loaded_data
+
+
+def load_mat_data(
+    filepath: str,
+    variable_name: Optional[str] = None
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Load sEMG data from MATLAB .mat file.
+    
+    Supports .mat files containing n×1 or 1×n double arrays where n is the number
+    of samples. Automatically detects and reshapes the data to 1D array.
+    
+    Parameters:
+    -----------
+    filepath : str
+        Path to the .mat file
+    variable_name : str, optional
+        Name of the variable in the .mat file to load. If None, will automatically
+        detect and load the first numeric array found (excluding MATLAB metadata).
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, Dict]
+        - Signal data as numpy array (1D)
+        - Dictionary containing all variables from the .mat file
+        
+    Examples:
+    ---------
+    >>> signal, mat_data = load_mat_data('emg_data.mat')
+    >>> signal, mat_data = load_mat_data('emg_data.mat', variable_name='emg_signal')
+    
+    Raises:
+    -------
+    ValueError
+        If no suitable numeric array is found in the .mat file
+    FileNotFoundError
+        If the file does not exist
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+    
+    # Load .mat file
+    try:
+        mat_contents = loadmat(filepath)
+    except Exception as e:
+        raise ValueError(f"Error loading .mat file: {e}")
+    
+    # Filter out MATLAB metadata variables (start with __)
+    data_vars = {k: v for k, v in mat_contents.items() if not k.startswith('__')}
+    
+    if len(data_vars) == 0:
+        raise ValueError("No data variables found in .mat file (only MATLAB metadata)")
+    
+    # Find the signal data
+    signal_data = None
+    
+    if variable_name is not None:
+        # Use specified variable name
+        if variable_name not in data_vars:
+            available = ', '.join(data_vars.keys())
+            raise ValueError(f"Variable '{variable_name}' not found. Available: {available}")
+        signal_data = data_vars[variable_name]
+    else:
+        # Auto-detect: find first numeric array
+        for var_name, var_data in data_vars.items():
+            if isinstance(var_data, np.ndarray) and var_data.dtype.kind in 'biufc':  # numeric types
+                signal_data = var_data
+                print(f"Auto-detected signal variable: '{var_name}'")
+                break
+    
+    if signal_data is None:
+        raise ValueError("No suitable numeric array found in .mat file")
+    
+    # Reshape to 1D array
+    # Handle n×1, 1×n, or 1D arrays
+    if signal_data.ndim == 2:
+        if signal_data.shape[0] == 1:
+            # 1×n array
+            signal_data = signal_data.flatten()
+        elif signal_data.shape[1] == 1:
+            # n×1 array
+            signal_data = signal_data.flatten()
+        else:
+            raise ValueError(f"Expected n×1 or 1×n array, got shape {signal_data.shape}")
+    elif signal_data.ndim == 1:
+        # Already 1D
+        pass
+    else:
+        raise ValueError(f"Expected 1D or 2D array, got {signal_data.ndim}D array")
+    
+    # Ensure float type
+    signal_data = signal_data.astype(float)
+    
+    return signal_data, mat_contents
+
+
+def load_signal_file(
+    filepath: str,
+    value_column: int = 1,
+    has_header: bool = True,
+    delimiter: str = ',',
+    skip_rows: int = 0,
+    mat_variable: Optional[str] = None
+) -> Tuple[np.ndarray, Union[pd.DataFrame, Dict, None]]:
+    """
+    Load sEMG signal from either CSV or MAT file (auto-detects based on extension).
+    
+    Parameters:
+    -----------
+    filepath : str
+        Path to the file (.csv or .mat)
+    value_column : int, optional
+        For CSV: Column index containing signal values (default: 1)
+    has_header : bool, optional
+        For CSV: Whether file has header row (default: True)
+    delimiter : str, optional
+        For CSV: Delimiter (default: ',')
+    skip_rows : int, optional
+        For CSV: Number of rows to skip (default: 0)
+    mat_variable : str, optional
+        For MAT: Variable name to load (default: auto-detect)
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, Union[pd.DataFrame, Dict, None]]
+        - Signal data as numpy array (1D)
+        - DataFrame (for CSV) or Dict (for MAT) or None
+        
+    Examples:
+    ---------
+    >>> signal, data = load_signal_file('emg_data.csv')
+    >>> signal, data = load_signal_file('emg_data.mat')
+    >>> signal, data = load_signal_file('emg_data.mat', mat_variable='my_signal')
+    """
+    _, ext = os.path.splitext(filepath)
+    ext = ext.lower()
+    
+    if ext == '.mat':
+        return load_mat_data(filepath, mat_variable)
+    elif ext == '.csv':
+        return load_csv_data(filepath, value_column, has_header, delimiter, skip_rows)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}. Supported: .csv, .mat")
 
 
 def save_processed_data(

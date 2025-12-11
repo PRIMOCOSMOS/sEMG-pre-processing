@@ -119,20 +119,21 @@ class EMGProcessorGUI:
         return fig, axes, n_show
         
     def load_file(self, file_obj, fs, value_column, has_header, skip_rows):
-        """Load CSV file and extract signal."""
+        """Load signal file (CSV or MAT) and extract signal."""
         try:
             if file_obj is None:
                 return "Please upload a file", None
             
-            # Load the data
+            # Load the data using unified loader
             self.fs = float(fs)
-            self.signal, self.df = load_csv_data(
+            self.signal, self.df = load_signal_file(
                 file_obj.name,
                 value_column=int(value_column),
                 has_header=has_header,
                 skip_rows=int(skip_rows)
             )
             self.current_filename = os.path.basename(file_obj.name)
+            file_ext = os.path.splitext(self.current_filename)[1].lower()
             
             # Create preview plot
             fig, ax = plt.subplots(figsize=(12, 4))
@@ -144,14 +145,15 @@ class EMGProcessorGUI:
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
             
+            file_type_str = "MAT file" if file_ext == '.mat' else "CSV file"
             info = f"""
-✅ File loaded successfully!
+✅ {file_type_str} loaded successfully!
 - Filename: {self.current_filename}
 - Samples: {len(self.signal)}
 - Duration: {len(self.signal)/self.fs:.2f} seconds
 - Sampling frequency: {self.fs} Hz
 - Signal range: [{self.signal.min():.3f}, {self.signal.max():.3f}]
-- Skipped rows: {skip_rows}
+{f'- Skipped rows: {skip_rows}' if file_ext == '.csv' else ''}
             """
             
             return info.strip(), fig
@@ -160,7 +162,7 @@ class EMGProcessorGUI:
             return f"❌ Error loading file: {str(e)}\n{traceback.format_exc()}", None
     
     def load_batch_files(self, file_objs, fs, value_column, has_header, skip_rows, progress=gr.Progress()):
-        """Load multiple CSV files for batch processing."""
+        """Load multiple signal files (CSV or MAT) for batch processing."""
         try:
             if file_objs is None or len(file_objs) == 0:
                 return "Please upload files", None
@@ -177,7 +179,7 @@ class EMGProcessorGUI:
                 progress((i + 1) / len(file_objs) * 0.8, desc=f"Loading {os.path.basename(file_obj.name)}...")
                 
                 try:
-                    signal, df = load_csv_data(
+                    signal, df = load_signal_file(
                         file_obj.name,
                         value_column=int(value_column),
                         has_header=has_header,
@@ -886,7 +888,7 @@ class EMGProcessorGUI:
         Perform batch data augmentation using CEEMDAN-based IMF recombination.
         
         This implements the algorithm:
-        1. Load multiple CSV files as input signals
+        1. Load multiple signal files (CSV or MAT) as input signals
         2. Decompose each signal using CEEMDAN into IMFs (pad to 8)
         3. For each generated signal, randomly select m=8 signals
         4. From each selected signal, take one random IMF at a unique position
@@ -894,20 +896,20 @@ class EMGProcessorGUI:
         """
         try:
             if file_objs is None or len(file_objs) == 0:
-                return "❌ Please upload CSV files for augmentation", None, None
+                return "❌ Please upload signal files for augmentation", None, None
             
             if len(file_objs) < 2:
                 return "❌ Need at least 2 signal files for IMF recombination", None, None
             
             progress(0.1, desc="Loading input signals...")
             
-            # Load all CSV files
+            # Load all signal files
             input_signals = []
             filenames = []
             
             for file_obj in file_objs:
                 try:
-                    signal, df = load_csv_data(
+                    signal, df = load_signal_file(
                         file_obj.name,
                         value_column=int(value_column),
                         has_header=has_header,
@@ -1174,12 +1176,12 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
     
     def analyze_segment_features(self, file_objs, fs, value_column, has_header, skip_rows, progress=gr.Progress()):
         """
-        Analyze features from single or multiple sEMG segment CSV files.
+        Analyze features from single or multiple sEMG segment files (CSV or MAT).
         Each file should contain a single segment of sEMG data.
         """
         try:
             if file_objs is None or len(file_objs) == 0:
-                return "❌ Please upload segment CSV files", None, None
+                return "❌ Please upload segment files", None, None
             
             progress(0.1, desc="Loading segment files...")
             
@@ -1189,7 +1191,7 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
             
             for file_obj in file_objs:
                 try:
-                    signal, df = load_csv_data(
+                    signal, df = load_signal_file(
                         file_obj.name,
                         value_column=int(value_column),
                         has_header=has_header,
@@ -1577,7 +1579,7 @@ def create_gui():
                         
                         with gr.Row():
                             with gr.Column(scale=1):
-                                file_input = gr.File(label="Select CSV File", file_types=['.csv'])
+                                file_input = gr.File(label="Select Signal File (CSV or MAT)", file_types=['.csv', '.mat'])
                                 fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
                                 column_input = gr.Number(value=1, label="Signal Column Index", precision=0,
                                                         info="Column containing signal values (0-indexed)")
@@ -1605,8 +1607,8 @@ def create_gui():
                         with gr.Row():
                             with gr.Column(scale=1):
                                 batch_file_input = gr.File(
-                                    label="Select Multiple CSV Files (选择多个CSV文件)", 
-                                    file_types=['.csv'],
+                                    label="Select Multiple Signal Files (选择多个信号文件 CSV/MAT)", 
+                                    file_types=['.csv', '.mat'],
                                     file_count="multiple"
                                 )
                                 batch_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
@@ -1847,8 +1849,8 @@ def create_gui():
                     with gr.Column(scale=1):
                         gr.Markdown("**Upload Segment Files**")
                         segment_files_input = gr.File(
-                            label="Select Segment CSV Files (选择分段CSV文件)", 
-                            file_types=['.csv'],
+                            label="Select Segment Files (选择分段文件 CSV/MAT)", 
+                            file_types=['.csv', '.mat'],
                             file_count="multiple"
                         )
                         segment_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
@@ -1957,8 +1959,8 @@ def create_gui():
                         with gr.Row():
                             with gr.Column(scale=1):
                                 batch_aug_file_input = gr.File(
-                                    label="Select CSV Signal Files (选择CSV信号文件)", 
-                                    file_types=['.csv'],
+                                    label="Select Signal Files for Augmentation (选择信号文件 CSV/MAT)", 
+                                    file_types=['.csv', '.mat'],
                                     file_count="multiple"
                                 )
                                 batch_aug_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
