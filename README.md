@@ -32,10 +32,110 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
 
 ### 2. Muscle Activity Detection & Segmentation / 肌肉活动检测与分段
 
-- Ruptures-based change point detection
-- Amplitude-based activity detection
-- Combined hybrid method (recommended)
-- Automatic signal segmentation with metadata extraction
+**Intelligent Event-Based Detection Algorithm**
+
+The toolkit implements an advanced muscle activity detection system designed to identify meaningful physiological events (e.g., individual muscle contractions like bicep curls) rather than mechanically satisfying parameter constraints.
+
+#### Detection Methods
+
+1. **Ruptures**: Change point detection for structural signal changes
+2. **Amplitude**: Threshold-based detection for sustained activity
+3. **Rhythmic Patterns**: Local RMS variance for periodic movements
+4. **Amplitude Trends**: Gradual activation pattern detection
+5. **Combined** (⭐ Recommended): Intelligent holistic optimization
+
+#### Combined Method: Intelligent Event Detection
+
+The combined method uses a three-stage approach to find optimal segmentation:
+
+**Stage 1: Multi-Strategy Candidate Generation**
+- Generates 6 different segmentation schemes:
+  - Ruptures-based (structural changes)
+  - Amplitude-based (sustained activity)
+  - Rhythmic patterns (periodic movements)
+  - Amplitude trends (gradual activation)
+  - Hybrid 1: Ruptures refined by amplitude
+  - Hybrid 2: Amplitude refined by ruptures
+
+**Stage 2: Event Quality Scoring**
+
+Each segmentation scheme is scored based on event quality metrics:
+
+1. **RMS Consistency** (30% weight):
+   - Measures coefficient of variation within each event
+   - Lower CV = more coherent single event
+   - Score: 0-10 points per event
+
+2. **Duration Reasonableness** (25% weight):
+   - Ideal range: 0.5 - 5.0 seconds for typical muscle contractions
+   - Penalizes extremes (too short or too long)
+   - Score: 0-10 points per event
+
+3. **Boundary Quality** (25% weight):
+   - Evaluates amplitude drops before/after events
+   - Clear boundaries = better event separation
+   - Score: 0-10 points per event
+
+4. **Transition Sharpness** (20% weight):
+   - Measures amplitude gradient at event boundaries
+   - Sharp transitions = distinct events
+   - Score: 0-10 points per event
+
+**Scoring Formula:**
+```
+event_score = 0.30 × consistency + 0.25 × duration + 0.25 × boundary + 0.20 × transition
+scheme_score = mean(event_scores) - |num_events - expected_events| × 0.5
+```
+
+**Stage 3: Intelligent Refinement**
+
+The best-scoring scheme is post-processed:
+- **Boundary Refinement**: Align event boundaries to local RMS minima
+- **Similar Event Merging**: Merge adjacent events that are likely part of the same activity
+  - Criteria: Small gap (<200ms), similar amplitudes, significant gap RMS
+
+#### Duration Constraints
+
+- **min_duration**: Optimization constraint (not a hard cutoff)
+  - Events shorter than this are penalized heavily in scoring
+  - Typical range: 0.1 - 0.5 seconds
+  
+- **max_duration**: Optimization guide (optional)
+  - Long events exceeding this trigger intelligent splitting
+  - Uses multiple criteria: ruptures, RMS minima, amplitude drops
+  - Typical range: 3.0 - 10.0 seconds
+
+#### Parameter Tuning
+
+**sensitivity** parameter (default: 2.0):
+- Lower values (0.5 - 1.5): More sensitive, detects subtle activities
+- Medium values (1.5 - 2.5): Balanced, recommended for most cases
+- Higher values (2.5 - 4.0): Stricter, only strong activations
+
+**Example Usage:**
+```python
+from semg_preprocessing import detect_muscle_activity
+
+# Intelligent combined detection (recommended)
+segments = detect_muscle_activity(
+    filtered_signal, 
+    fs=1000,
+    method='combined',
+    min_duration=0.2,      # Minimum 200ms events
+    max_duration=5.0,      # Split events longer than 5s
+    sensitivity=2.0        # Balanced sensitivity
+)
+
+# Each segment is a tuple: (start_index, end_index)
+print(f"Detected {len(segments)} muscle activity events")
+```
+
+**Key Advantages:**
+- ✅ Finds meaningful physiological events, not arbitrary segments
+- ✅ Holistic optimization considers overall segmentation quality
+- ✅ Respects duration constraints as optimization guides
+- ✅ Intelligent boundary refinement and event merging
+- ✅ Works well across different signal characteristics and noise levels
 
 ### 3. Feature Extraction / 特征提取
 
