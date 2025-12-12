@@ -12,6 +12,7 @@ import numpy as np
 import ruptures as rpt
 from typing import List, Tuple, Optional, Dict, Union
 from scipy import signal as scipy_signal
+from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
@@ -23,6 +24,7 @@ def detect_muscle_activity(
     amplitude_threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
+    max_duration: Optional[float] = None,
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
@@ -45,6 +47,9 @@ def detect_muscle_activity(
         Window size for feature calculation (default: fs/10)
     min_duration : float, optional
         Minimum duration of muscle activity in seconds (default: 0.1)
+    max_duration : float, optional
+        Maximum duration of muscle activity in seconds (default: None = no limit)
+        Long segments exceeding this duration will be split using internal change detection
     **kwargs : dict
         Additional arguments:
         - For ruptures: model, pen, min_size
@@ -61,6 +66,7 @@ def detect_muscle_activity(
     - 'combined' method provides good balance of speed and accuracy
     - Data should be preprocessed (filtered) before detection
     - Adjust amplitude_threshold based on signal characteristics
+    - max_duration helps split overly long segments into more meaningful motion periods
     """
     # Define valid parameters for each method to prevent TypeError
     ruptures_params = {'model', 'pen', 'min_size'}
@@ -70,22 +76,28 @@ def detect_muscle_activity(
     if method == "ruptures":
         # Filter kwargs to only valid ruptures parameters
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
-        return _detect_ruptures(data, fs, **filtered_kwargs)
+        segments = _detect_ruptures(data, fs, **filtered_kwargs)
     elif method == "amplitude":
         # Amplitude method uses sensitivity from kwargs if provided
         sensitivity = kwargs.get('sensitivity', 2.0)
-        return _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
+        segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
     elif method == "combined":
         # Filter kwargs to only valid ruptures parameters for combined
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
         sensitivity = kwargs.get('sensitivity', 2.0)
-        return _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
+        segments = _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
     elif method == "multi_feature":
         # Filter kwargs to only valid multi_feature parameters
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in multi_feature_params}
-        return _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
+        segments = _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
     else:
         raise ValueError(f"Unknown method: {method}. Use 'ruptures', 'amplitude', 'combined', or 'multi_feature'")
+    
+    # Apply max_duration splitting if specified
+    if max_duration is not None and max_duration > min_duration:
+        segments = _split_long_segments(data, segments, fs, min_duration, max_duration)
+    
+    return segments
 
 
 def _detect_ruptures(
@@ -226,10 +238,13 @@ def _detect_combined(
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity using combined ruptures and amplitude approach.
+    Detect muscle activity using enhanced combined ruptures and amplitude approach.
     
-    This method first uses ruptures to detect potential change points,
-    then uses amplitude analysis to refine the detection.
+    This improved method combines multiple detection strategies:
+    1. Ruptures for structural change points
+    2. Amplitude-based detection for sustained activity
+    3. Local RMS variance for rhythmic patterns (NEW)
+    4. Amplitude trend analysis for low-amplitude outbursts (NEW)
     
     Parameters:
     -----------
@@ -243,45 +258,48 @@ def _detect_combined(
         Window size for envelope calculation
     min_duration : float
         Minimum activity duration in seconds
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive, default: 2.0)
     **kwargs : dict
         Additional arguments for ruptures (model, pen, min_size)
-        Note: use_clustering and adaptive_pen are ignored for this method
     
     Returns:
     --------
     List[Tuple[int, int]]
         Detected activity periods
     """
+    if window_size is None:
+        window_size = int(fs / 10)
+    
     # Filter kwargs to only pass valid ruptures parameters
     valid_ruptures_params = {'model', 'pen', 'min_size'}
     ruptures_kwargs = {k: v for k, v in kwargs.items() if k in valid_ruptures_params}
     
-    # Get segments from both methods
+    # Adjust rupture penalty based on sensitivity for better low-amplitude detection
+    if 'pen' not in ruptures_kwargs:
+        # Lower penalty for higher sensitivity (more change points)
+        ruptures_kwargs['pen'] = 3.0 * sensitivity / 2.0
+    
+    # 1. Get segments from ruptures (structural changes)
     ruptures_segments = _detect_ruptures(data, fs, **ruptures_kwargs)
+    
+    # 2. Get segments from amplitude detection
     amplitude_segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
     
-    # Combine segments by finding overlaps
-    combined_segments = []
+    # 3. NEW: Detect rhythmic patterns using local RMS variance
+    rhythmic_segments = _detect_rhythmic_patterns(data, fs, window_size, min_duration, sensitivity)
     
-    for r_start, r_end in ruptures_segments:
-        for a_start, a_end in amplitude_segments:
-            # Check for overlap
-            overlap_start = max(r_start, a_start)
-            overlap_end = min(r_end, a_end)
-            
-            if overlap_start < overlap_end:
-                # There is overlap, merge the segments
-                merged_start = min(r_start, a_start)
-                merged_end = max(r_end, a_end)
-                combined_segments.append((merged_start, merged_end))
+    # 4. NEW: Detect low-amplitude outbursts using trend analysis
+    trend_segments = _detect_amplitude_trends(data, fs, window_size, min_duration, sensitivity)
     
-    # Merge overlapping segments in combined list
-    if combined_segments:
-        combined_segments = _merge_overlapping_segments(combined_segments)
+    # Combine all segments using union approach
+    all_segments = ruptures_segments + amplitude_segments + rhythmic_segments + trend_segments
     
-    # If no combined segments found, use amplitude detection as fallback
-    if not combined_segments:
-        combined_segments = amplitude_segments
+    # Merge overlapping segments
+    if all_segments:
+        combined_segments = _merge_overlapping_segments(all_segments)
+    else:
+        combined_segments = []
     
     return combined_segments
 
@@ -691,3 +709,276 @@ def _filter_segments_by_clustering(
                         if label == activity_cluster]
     
     return activity_segments
+
+
+def _detect_rhythmic_patterns(
+    data: np.ndarray,
+    fs: float,
+    window_size: int,
+    min_duration: float,
+    sensitivity: float = 2.0
+) -> List[Tuple[int, int]]:
+    """
+    Detect rhythmic muscle activity patterns using local RMS variance analysis.
+    
+    This method is particularly sensitive to rhythmic outbursts with varying amplitude,
+    which are common in sEMG during repetitive movements.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for local analysis
+    min_duration : float
+        Minimum duration in seconds
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive)
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected rhythmic segments
+    """
+    # Calculate RMS envelope
+    rms_envelope = _calculate_rms_envelope(data, window_size)
+    
+    # Calculate local variance of RMS (captures rhythmicity)
+    rms_variance = _calculate_sliding_variance(rms_envelope, window_size)
+    
+    # Normalize variance
+    rms_variance_normalized = rms_variance / (np.mean(rms_variance) + 1e-10)
+    
+    # Adaptive threshold based on sensitivity
+    # Lower sensitivity -> lower threshold -> more segments
+    threshold = sensitivity * 0.5
+    
+    # Find regions with high RMS variance (rhythmic activity)
+    rhythmic_regions = rms_variance_normalized > threshold
+    
+    # Find transitions
+    diff = np.diff(rhythmic_regions.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases
+    if rhythmic_regions[0]:
+        starts = np.concatenate([[0], starts])
+    if rhythmic_regions[-1]:
+        ends = np.concatenate([ends, [len(rhythmic_regions)]])
+    
+    # Filter by minimum duration
+    min_samples = int(min_duration * fs)
+    segments = []
+    for start, end in zip(starts, ends):
+        if end - start >= min_samples:
+            segments.append((int(start), int(end)))
+    
+    return segments
+
+
+def _detect_amplitude_trends(
+    data: np.ndarray,
+    fs: float,
+    window_size: int,
+    min_duration: float,
+    sensitivity: float = 2.0
+) -> List[Tuple[int, int]]:
+    """
+    Detect low-amplitude outbursts using amplitude trend analysis.
+    
+    This method is designed to catch gradual amplitude increases that might
+    be missed by simple threshold-based detection, especially in rhythmic movements
+    where amplitude varies over time.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for trend calculation
+    min_duration : float
+        Minimum duration in seconds
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive)
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected trend-based segments
+    """
+    # Calculate absolute amplitude envelope
+    abs_envelope = np.abs(data)
+    kernel = np.ones(window_size) / window_size
+    smoothed_envelope = np.convolve(abs_envelope, kernel, mode='same')
+    
+    # Calculate the gradient (rate of change) of the envelope
+    gradient = np.gradient(smoothed_envelope)
+    gradient_smoothed = np.convolve(gradient, kernel, mode='same')
+    
+    # Calculate local mean and std of the envelope for adaptive threshold
+    local_mean = np.convolve(smoothed_envelope, kernel, mode='same')
+    local_std = np.sqrt(np.convolve((smoothed_envelope - local_mean)**2, kernel, mode='same'))
+    
+    # Adaptive threshold: regions where envelope exceeds local baseline
+    # Lower sensitivity = more sensitive to small changes
+    threshold_multiplier = 0.5 + (sensitivity - 1.0) * 0.3  # Range: 0.5 to 1.1
+    adaptive_threshold = local_mean + threshold_multiplier * local_std
+    
+    # Detect regions above adaptive threshold
+    above_threshold = smoothed_envelope > adaptive_threshold
+    
+    # Also consider regions with significant positive gradient (rising activity)
+    gradient_threshold = np.percentile(np.abs(gradient_smoothed), 60) / sensitivity
+    rising_activity = gradient_smoothed > gradient_threshold
+    
+    # Combine both criteria
+    activity_regions = above_threshold | rising_activity
+    
+    # Find transitions
+    diff = np.diff(activity_regions.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases
+    if activity_regions[0]:
+        starts = np.concatenate([[0], starts])
+    if activity_regions[-1]:
+        ends = np.concatenate([ends, [len(activity_regions)]])
+    
+    # Filter by minimum duration
+    min_samples = int(min_duration * fs)
+    segments = []
+    for start, end in zip(starts, ends):
+        if end - start >= min_samples:
+            segments.append((int(start), int(end)))
+    
+    return segments
+
+
+def _split_long_segments(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    fs: float,
+    min_duration: float,
+    max_duration: float
+) -> List[Tuple[int, int]]:
+    """
+    Split segments that exceed maximum duration using internal change detection.
+    
+    This function uses multiple criteria to split long segments:
+    1. Rupture-based change points within the segment
+    2. Local minima in RMS envelope (natural breaks)
+    3. Amplitude drops below local threshold
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segments : List[Tuple[int, int]]
+        Input segments
+    fs : float
+        Sampling frequency
+    min_duration : float
+        Minimum duration in seconds
+    max_duration : float
+        Maximum duration in seconds
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Split segments (all within max_duration)
+    """
+    max_samples = int(max_duration * fs)
+    min_samples = int(min_duration * fs)
+    split_segments = []
+    
+    for start, end in segments:
+        segment_length = end - start
+        
+        # If segment is within limit, keep as is
+        if segment_length <= max_samples:
+            split_segments.append((start, end))
+            continue
+        
+        # Segment is too long, need to split it
+        segment_data = data[start:end]
+        
+        # Method 1: Use ruptures to find internal change points
+        try:
+            data_2d = segment_data.reshape(-1, 1)
+            # Use lower penalty to detect more change points
+            algo = rpt.Pelt(model='l2', min_size=min_samples).fit(data_2d)
+            internal_cps = algo.predict(pen=1.5)
+            
+            # Remove last point if it's the end
+            if internal_cps and internal_cps[-1] == len(segment_data):
+                internal_cps = internal_cps[:-1]
+        except:
+            internal_cps = []
+        
+        # Method 2: Find local minima in RMS envelope as natural break points
+        window_size = int(fs / 10)
+        rms_envelope = _calculate_rms_envelope(segment_data, window_size)
+        
+        # Find local minima (potential breaks)
+        # Invert to find minima
+        peaks, _ = find_peaks(-rms_envelope, distance=min_samples, prominence=np.std(rms_envelope) * 0.3)
+        local_minima = peaks.tolist()
+        
+        # Method 3: Find amplitude drops
+        mean_rms = np.mean(rms_envelope)
+        std_rms = np.std(rms_envelope)
+        low_amplitude_threshold = mean_rms - 0.5 * std_rms
+        below_threshold = rms_envelope < low_amplitude_threshold
+        
+        # Find midpoints of low-amplitude regions as potential splits
+        diff = np.diff(below_threshold.astype(int))
+        low_amp_starts = np.where(diff == 1)[0] + 1
+        low_amp_ends = np.where(diff == -1)[0] + 1
+        
+        # Get midpoints of low-amplitude regions
+        amplitude_drops = []
+        for la_start, la_end in zip(low_amp_starts, low_amp_ends):
+            if la_end - la_start > min_samples // 2:  # Only consider significant drops
+                midpoint = (la_start + la_end) // 2
+                amplitude_drops.append(midpoint)
+        
+        # Combine all potential split points
+        all_split_points = sorted(set(internal_cps + local_minima + amplitude_drops))
+        
+        # Filter split points: must be at least min_samples apart
+        filtered_splits = []
+        last_split = 0
+        for sp in all_split_points:
+            if sp - last_split >= min_samples:
+                filtered_splits.append(sp)
+                last_split = sp
+        
+        # Create sub-segments
+        if filtered_splits:
+            sub_start = 0
+            for split_point in filtered_splits:
+                if split_point - sub_start >= min_samples:
+                    split_segments.append((start + sub_start, start + split_point))
+                    sub_start = split_point
+            
+            # Add final sub-segment
+            if len(segment_data) - sub_start >= min_samples:
+                split_segments.append((start + sub_start, end))
+        else:
+            # No good split points found, force split at max_duration intervals
+            num_splits = int(np.ceil(segment_length / max_samples))
+            split_size = segment_length // num_splits
+            
+            for i in range(num_splits):
+                sub_start = start + i * split_size
+                sub_end = start + (i + 1) * split_size if i < num_splits - 1 else end
+                if sub_end - sub_start >= min_samples:
+                    split_segments.append((sub_start, sub_end))
+    
+    return split_segments
