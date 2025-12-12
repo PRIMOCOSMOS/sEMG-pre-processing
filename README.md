@@ -34,7 +34,7 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
 
 **Intelligent Event-Based Detection Algorithm**
 
-The toolkit implements an advanced muscle activity detection system designed to identify meaningful physiological events (e.g., individual muscle contractions like bicep curls) rather than mechanically satisfying parameter constraints.
+The toolkit implements an advanced muscle activity detection system designed to identify meaningful physiological events (e.g., individual muscle contractions like bicep curls) with strict enforcement of duration constraints.
 
 #### Detection Methods
 
@@ -42,11 +42,11 @@ The toolkit implements an advanced muscle activity detection system designed to 
 2. **Amplitude**: Threshold-based detection for sustained activity
 3. **Rhythmic Patterns**: Local RMS variance for periodic movements
 4. **Amplitude Trends**: Gradual activation pattern detection
-5. **Combined** (⭐ Recommended): Intelligent holistic optimization
+5. **Combined** (⭐ Recommended): Intelligent holistic optimization with confidence scoring
 
 #### Combined Method: Intelligent Event Detection
 
-The combined method uses a three-stage approach to find optimal segmentation:
+The combined method uses a four-stage approach to find optimal segmentation:
 
 **Stage 1: Multi-Strategy Candidate Generation**
 - Generates 6 different segmentation schemes:
@@ -67,7 +67,7 @@ Each segmentation scheme is scored based on event quality metrics:
    - Score: 0-10 points per event
 
 2. **Duration Reasonableness** (25% weight):
-   - Ideal range: 0.5 - 5.0 seconds for typical muscle contractions
+   - Ideal range: 0.3 - 5.0 seconds for typical muscle contractions
    - Penalizes extremes (too short or too long)
    - Score: 0-10 points per event
 
@@ -87,30 +87,90 @@ event_score = 0.30 × consistency + 0.25 × duration + 0.25 × boundary + 0.20 �
 scheme_score = mean(event_scores) - |num_events - expected_events| × 0.5
 ```
 
-**Stage 3: Intelligent Refinement**
+**⚠️ CRITICAL**: Any scheme containing segments below `min_duration` receives a score of -∞ and is completely rejected.
 
-The best-scoring scheme is post-processed:
+**Stage 3: Confidence-Based Filtering**
+
+Each potential event is assigned a confidence score (0-1) based on:
+
+1. **Amplitude Elevation** (35% weight):
+   - How much RMS exceeds surrounding baseline
+   - Higher elevation = more confident it's real activity
+
+2. **Signal Consistency** (30% weight):
+   - Coefficient of variation within the event
+   - Low CV = coherent single contraction
+
+3. **Boundary Sharpness** (20% weight):
+   - Rapid amplitude changes at start/end
+   - Sharp transitions = clear event boundaries
+
+4. **Duration Reasonableness** (15% weight):
+   - Proximity to typical contraction durations (0.3-5s)
+   - Extreme durations reduce confidence
+
+**Confidence Formula:**
+```
+confidence = 0.35 × amplitude_elevation + 0.30 × consistency + 
+             0.20 × boundary_sharpness + 0.15 × duration_reasonableness
+```
+
+**Confidence Threshold:**
+- Adapts based on sensitivity: `threshold = 0.3 + (sensitivity - 1.0) × 0.1`
+- Lower sensitivity → lower threshold → accepts more events
+- Higher sensitivity → higher threshold → only high-confidence events
+
+**Stage 4: Intelligent Refinement**
+
+The best-scoring scheme with confidence filtering is post-processed:
 - **Boundary Refinement**: Align event boundaries to local RMS minima
 - **Similar Event Merging**: Merge adjacent events that are likely part of the same activity
   - Criteria: Small gap (<200ms), similar amplitudes, significant gap RMS
+- **Final Hard Filter**: Absolutely ensure NO segment violates `min_duration`
 
-#### Duration Constraints
+#### Duration Constraints: Hard vs Soft
 
-- **min_duration**: Optimization constraint (not a hard cutoff)
-  - Events shorter than this are penalized heavily in scoring
-  - Typical range: 0.1 - 0.5 seconds
-  
-- **max_duration**: Optimization guide (optional)
-  - Long events exceeding this trigger intelligent splitting
-  - Uses multiple criteria: ruptures, RMS minima, amplitude drops
-  - Typical range: 3.0 - 10.0 seconds
+**🔒 min_duration (HARD CONSTRAINT)**:
+- **Strictly enforced at ALL stages** - no segment can be shorter than this value
+- Defines the valid solution space
+- Candidate generation filters violations
+- Scoring completely rejects schemes with violations (-∞ score)
+- Post-processing never creates segments below this threshold
+- Typical range: 0.01 - 2.0 seconds
+
+**📏 max_duration (Soft Optimization Guide)**:
+- Optional upper bound for event duration
+- Long events exceeding this trigger intelligent splitting
+- Uses multiple criteria: ruptures, RMS minima, amplitude drops
+- Typical range: 3.0 - 10.0 seconds
+
+#### Algorithm Philosophy
+
+**Duration Constraints = Solution Space Boundaries**
+- min_duration and max_duration define the valid solution space
+- Within this space, the algorithm finds the optimal segmentation
+- Not all candidate boundaries are activated
+- Boundaries only created when:
+  - Event confidence exceeds threshold
+  - Duration constraints are satisfied
+  - Overall segmentation quality improves
+
+**Intelligent Boundary Decisions**
+- Algorithm evaluates confidence difference between adjacent regions
+- Boundaries activated only when confidence gap is significant
+- Prevents over-segmentation while respecting constraints
+- Ensures detected events are physiologically meaningful
 
 #### Parameter Tuning
 
-**sensitivity** parameter (default: 2.0):
+**sensitivity** parameter (default: 1.5):
 - Lower values (0.5 - 1.5): More sensitive, detects subtle activities
+  - Lower confidence threshold
+  - More candidate boundaries considered
 - Medium values (1.5 - 2.5): Balanced, recommended for most cases
 - Higher values (2.5 - 4.0): Stricter, only strong activations
+  - Higher confidence threshold
+  - Fewer boundaries activated
 
 **Example Usage:**
 ```python
@@ -121,21 +181,27 @@ segments = detect_muscle_activity(
     filtered_signal, 
     fs=1000,
     method='combined',
-    min_duration=0.2,      # Minimum 200ms events
-    max_duration=5.0,      # Split events longer than 5s
-    sensitivity=2.0        # Balanced sensitivity
+    min_duration=0.5,      # HARD: NO segment < 500ms
+    max_duration=5.0,      # Soft: split events > 5s
+    sensitivity=1.5        # Balanced sensitivity
 )
 
 # Each segment is a tuple: (start_index, end_index)
 print(f"Detected {len(segments)} muscle activity events")
+
+# Verify: ALL segments meet min_duration
+durations = [(e-s)/1000 for s, e in segments]
+assert all(d >= 0.5 for d in durations), "Duration constraint violated!"
 ```
 
 **Key Advantages:**
 - ✅ Finds meaningful physiological events, not arbitrary segments
+- ✅ Strict enforcement of minimum duration (hard constraint)
+- ✅ Confidence-based filtering removes low-quality detections
 - ✅ Holistic optimization considers overall segmentation quality
-- ✅ Respects duration constraints as optimization guides
-- ✅ Intelligent boundary refinement and event merging
+- ✅ Intelligent boundary activation prevents over-segmentation
 - ✅ Works well across different signal characteristics and noise levels
+- ✅ Adaptive thresholds for diverse sEMG amplitude ranges
 
 ### 3. Feature Extraction / 特征提取
 

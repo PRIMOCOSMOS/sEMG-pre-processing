@@ -289,10 +289,10 @@ def _detect_combined(
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity events using intelligent holistic optimization.
+    Detect muscle activity events using intelligent holistic optimization with confidence scoring.
     
     This method focuses on detecting meaningful muscle activity events (e.g., individual
-    bicep curls) rather than mechanically satisfying parameter constraints. It uses:
+    bicep curls) with strict enforcement of duration constraints. It uses:
     
     1. **Multi-Strategy Candidate Generation**:
        - Ruptures for structural change points
@@ -306,11 +306,18 @@ def _detect_combined(
        - Duration reasonableness (penalize extremes)
        - Transition sharpness (rapid changes at boundaries)
     
-    3. **Holistic Optimization**:
+    3. **Confidence-Based Filtering**:
+       - Calculate confidence score for each potential event
+       - Confidence based on: amplitude elevation, consistency, boundaries, duration
+       - Only high-confidence events are accepted
+       - Adaptive threshold based on sensitivity
+    
+    4. **Holistic Optimization**:
        - Generate multiple segmentation candidates
        - Score each holistically based on event characteristics
        - Select scheme with best overall quality score
        - Refine boundaries and merge similar adjacent events
+       - **HARD CONSTRAINT**: min_duration strictly enforced at all stages
     
     Parameters:
     -----------
@@ -323,10 +330,11 @@ def _detect_combined(
     window_size : int, optional
         Window size for envelope calculation
     min_duration : float
-        Minimum activity duration in seconds (optimization constraint)
+        Minimum activity duration in seconds (HARD CONSTRAINT - strictly enforced)
+        No segment shorter than this will ever be produced
     sensitivity : float
         Detection sensitivity (lower = more sensitive, default: 1.5)
-        Affects candidate generation and scoring
+        Affects candidate generation, scoring, and confidence threshold
     **kwargs : dict
         Additional arguments for ruptures (model, pen, min_size)
     
@@ -334,12 +342,15 @@ def _detect_combined(
     --------
     List[Tuple[int, int]]
         Detected activity events with optimal segmentation
+        ALL segments guaranteed to be >= min_duration
         
     Notes:
     ------
-    This algorithm prioritizes finding meaningful physiological events over
-    mechanical parameter satisfaction. Duration constraints are treated as
-    optimization guides rather than hard cutoffs.
+    This algorithm treats min_duration as an absolute hard constraint that defines
+    the valid solution space. Within that space, it finds the optimal segmentation
+    using confidence scoring and holistic quality assessment. Not all candidate
+    boundaries are activated - only those that create high-confidence, high-quality
+    events while respecting duration constraints.
     """
     if window_size is None:
         window_size = int(fs / 10)
@@ -418,10 +429,25 @@ def _detect_combined(
             data, best_segments, rms_envelope, min_samples
         )
         
+        # Filter by event confidence - remove low-confidence detections
+        # Confidence threshold adapts based on sensitivity
+        confidence_threshold = 0.3 + (sensitivity - 1.0) * 0.1  # Range: 0.3 to 0.5
+        confident_segments = []
+        
+        for seg in refined_segments:
+            confidence = _calculate_event_confidence(
+                data, seg, rms_envelope, fs, sensitivity
+            )
+            if confidence >= confidence_threshold:
+                confident_segments.append(seg)
+        
         # Merge events that are likely part of the same activity
-        final_segments = _merge_similar_events(
-            data, refined_segments, rms_envelope, fs, min_duration
+        merged_segments = _merge_similar_events(
+            data, confident_segments, rms_envelope, fs, min_duration
         )
+        
+        # FINAL HARD FILTER: Absolutely ensure no segment violates min_duration
+        final_segments = [(s, e) for s, e in merged_segments if (e - s) >= min_samples]
     else:
         final_segments = []
     
@@ -1137,7 +1163,7 @@ def _score_segmentation_scheme(
     fs : float
         Sampling frequency
     min_duration : float
-        Minimum duration constraint
+        Minimum duration constraint (HARD LIMIT)
     sensitivity : float
         Sensitivity parameter
     
@@ -1145,20 +1171,22 @@ def _score_segmentation_scheme(
     --------
     float
         Quality score (higher is better)
+        Returns -inf if ANY segment violates minimum duration
     """
     if not segments:
         return -np.inf
     
     min_samples = int(min_duration * fs)
+    
+    # HARD CONSTRAINT: Reject ANY scheme with segments below min_duration
+    for start, end in segments:
+        if (end - start) < min_samples:
+            return -np.inf  # Completely reject this scheme
+    
     total_score = 0.0
     
     for i, (start, end) in enumerate(segments):
         segment_length = end - start
-        
-        # Skip segments that violate minimum duration
-        if segment_length < min_samples:
-            total_score -= 100.0  # Heavy penalty
-            continue
         
         segment_rms = rms_envelope[start:end]
         
@@ -1444,4 +1472,117 @@ def _merge_similar_events(
         merged.append((current_start, current_end))
         i += 1
     
+    # HARD FILTER: Ensure no merged segment violates min_duration
+    min_samples = int(min_duration * fs)
+    merged = [(s, e) for s, e in merged if (e - s) >= min_samples]
+    
     return merged
+
+
+def _calculate_event_confidence(
+    data: np.ndarray,
+    segment: Tuple[int, int],
+    rms_envelope: np.ndarray,
+    fs: float,
+    sensitivity: float
+) -> float:
+    """
+    Calculate confidence score for a potential muscle activity event.
+    
+    Confidence is based on multiple criteria:
+    1. Amplitude elevation above baseline
+    2. Signal consistency within event (low variance = good)
+    3. Boundary sharpness (clear transitions)
+    4. Duration reasonableness for physiological events
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segment : Tuple[int, int]
+        Event segment (start, end)
+    rms_envelope : np.ndarray
+        RMS envelope
+    fs : float
+        Sampling frequency
+    sensitivity : float
+        Sensitivity parameter (affects confidence threshold)
+    
+    Returns:
+    --------
+    float
+        Confidence score (0 to 1, higher = more confident this is a real event)
+    """
+    start, end = segment
+    segment_length = end - start
+    
+    if segment_length == 0:
+        return 0.0
+    
+    segment_rms = rms_envelope[start:end]
+    mean_rms = np.mean(segment_rms)
+    
+    # Criterion 1: Amplitude elevation (how much above baseline)
+    # Compare to surrounding regions
+    window = min(segment_length, int(fs * 0.5))  # 500ms context
+    
+    baseline_rms = 0.0
+    baseline_count = 0
+    
+    if start >= window:
+        baseline_rms += np.mean(rms_envelope[start - window:start])
+        baseline_count += 1
+    if end + window < len(rms_envelope):
+        baseline_rms += np.mean(rms_envelope[end:end + window])
+        baseline_count += 1
+    
+    if baseline_count > 0:
+        baseline_rms /= baseline_count
+        amplitude_elevation = (mean_rms - baseline_rms) / (baseline_rms + 1e-10)
+        amplitude_score = min(1.0, amplitude_elevation / 2.0)  # Normalize to 0-1
+    else:
+        amplitude_score = 0.5  # No baseline, moderate confidence
+    
+    # Criterion 2: Consistency (low variance within event)
+    std_rms = np.std(segment_rms)
+    cv = std_rms / (mean_rms + 1e-10)
+    consistency_score = 1.0 / (1.0 + cv)  # Lower CV = higher score
+    
+    # Criterion 3: Boundary sharpness
+    # Check for sharp transitions at start and end
+    boundary_window = min(int(fs * 0.05), segment_length // 4)  # 50ms
+    
+    start_sharpness = 0.5
+    end_sharpness = 0.5
+    
+    if start >= boundary_window:
+        before_start = np.mean(rms_envelope[start - boundary_window:start])
+        after_start = np.mean(segment_rms[:boundary_window])
+        start_sharpness = min(1.0, (after_start - before_start) / (before_start + 1e-10) / 2.0)
+    
+    if end + boundary_window < len(rms_envelope):
+        before_end = np.mean(segment_rms[-boundary_window:])
+        after_end = np.mean(rms_envelope[end:end + boundary_window])
+        end_sharpness = min(1.0, (before_end - after_end) / (after_end + 1e-10) / 2.0)
+    
+    boundary_score = (start_sharpness + end_sharpness) / 2.0
+    
+    # Criterion 4: Duration reasonableness
+    # Typical muscle contraction: 0.3-5 seconds
+    duration_seconds = segment_length / fs
+    if 0.3 <= duration_seconds <= 5.0:
+        duration_score = 1.0
+    elif duration_seconds < 0.3:
+        duration_score = duration_seconds / 0.3
+    else:
+        duration_score = 5.0 / duration_seconds
+    
+    # Weighted combination
+    confidence = (
+        0.35 * amplitude_score +
+        0.30 * consistency_score +
+        0.20 * boundary_score +
+        0.15 * duration_score
+    )
+    
+    return confidence
