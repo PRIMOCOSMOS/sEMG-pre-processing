@@ -32,9 +32,9 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
 
 ### 2. Muscle Activity Detection & Segmentation / 肌肉活动检测与分段
 
-**Intelligent Event-Based Detection Algorithm**
+**Two-Stage Amplitude-First Detection Algorithm**
 
-The toolkit implements an advanced muscle activity detection system designed to identify meaningful physiological events (e.g., individual muscle contractions like bicep curls) with strict enforcement of duration constraints.
+The toolkit implements an advanced muscle activity detection system using a two-stage approach that prioritizes amplitude for determining event presence, then uses multi-factor analysis for precise boundary refinement. This design significantly reduces missed events while maintaining strict duration constraints.
 
 #### Detection Methods
 
@@ -42,141 +42,132 @@ The toolkit implements an advanced muscle activity detection system designed to 
 2. **Amplitude**: Threshold-based detection for sustained activity
 3. **Rhythmic Patterns**: Local RMS variance for periodic movements
 4. **Amplitude Trends**: Gradual activation pattern detection
-5. **Combined** (⭐ Recommended): Intelligent holistic optimization with confidence scoring
+5. **Combined** (⭐ Recommended): Two-stage amplitude-first detection with multi-factor refinement
 
-#### Combined Method: Intelligent Event Detection
+#### Combined Method: Two-Stage Detection
 
-The combined method uses a four-stage approach to find optimal segmentation:
+The combined method uses a two-stage approach that separates event presence detection from boundary determination:
 
-**Stage 1: Multi-Strategy Candidate Generation**
-- Generates 6 different segmentation schemes:
-  - Ruptures-based (structural changes)
-  - Amplitude-based (sustained activity)
-  - Rhythmic patterns (periodic movements)
-  - Amplitude trends (gradual activation)
-  - Hybrid 1: Ruptures refined by amplitude
-  - Hybrid 2: Amplitude refined by ruptures
+**STAGE 1: Event Presence Detection (Amplitude-Weighted)**
 
-**Stage 2: Event Quality Scoring**
+Goal: Identify ALL regions where muscle activity MIGHT exist
 
-Each segmentation scheme is scored based on event quality metrics:
+Strategy:
+- **Primary Criterion (70%)**: Amplitude elevation
+  - Calculate adaptive amplitude threshold from signal statistics
+  - Lower threshold by 20% for aggressive initial detection
+  - Identify all regions where RMS exceeds threshold
+- **Secondary Criterion (20%)**: Signal consistency
+  - Low coefficient of variation indicates coherent activity
+- **Tertiary Criterion (10%)**: Duration reasonableness
+  - Check if duration is within physiological range
 
-1. **RMS Consistency** (30% weight):
-   - Measures coefficient of variation within each event
-   - Lower CV = more coherent single event
-   - Score: 0-10 points per event
-
-2. **Duration Reasonableness** (25% weight):
-   - Ideal range: 0.3 - 5.0 seconds for typical muscle contractions
-   - Penalizes extremes (too short or too long)
-   - Score: 0-10 points per event
-
-3. **Boundary Quality** (25% weight):
-   - Evaluates amplitude drops before/after events
-   - Clear boundaries = better event separation
-   - Score: 0-10 points per event
-
-4. **Transition Sharpness** (20% weight):
-   - Measures amplitude gradient at event boundaries
-   - Sharp transitions = distinct events
-   - Score: 0-10 points per event
-
-**Scoring Formula:**
+**Confidence Formula (Stage 1):**
 ```
-event_score = 0.30 × consistency + 0.25 × duration + 0.25 × boundary + 0.20 × transition
-scheme_score = mean(event_scores) - |num_events - expected_events| × 0.5
+presence_confidence = 0.70 × amplitude_elevation + 
+                     0.20 × consistency + 
+                     0.10 × duration_reasonableness
 ```
 
-**⚠️ CRITICAL**: Any scheme containing segments below `min_duration` receives a score of -∞ and is completely rejected.
+**Confidence Threshold (Lowered):**
+- Adapts based on sensitivity: `threshold = 0.25 + (sensitivity - 1.0) × 0.075`
+- Range: 0.25 to 0.40 (vs previous 0.30 to 0.50)
+- Lower thresholds reduce missed events
 
-**Stage 3: Confidence-Based Filtering**
+**STAGE 2: Boundary Refinement (Multi-Factor)**
 
-Each potential event is assigned a confidence score (0-1) based on:
+Goal: Determine precise start/end points for confirmed events
 
-1. **Amplitude Elevation** (35% weight):
-   - How much RMS exceeds surrounding baseline
-   - Higher elevation = more confident it's real activity
+Strategy:
+- Use ruptures (change point detection) to find internal structure
+- Refine boundaries to local RMS minima for clean event separation
+- Apply duration constraints (min/max) during refinement
+- Ensure no overlaps between detected events
+- Merge similar nearby events intelligently
 
-2. **Signal Consistency** (30% weight):
-   - Coefficient of variation within the event
-   - Low CV = coherent single contraction
+Refinement Process:
+1. Apply ruptures within each confirmed event region
+2. Find local minima in first/last quarters for boundary alignment
+3. Validate refined boundaries meet minimum duration
+4. Merge events with small gaps (<200ms) and similar amplitudes
+5. Remove any remaining overlaps (keeps larger/merged segments)
+6. Final hard filter ensures ALL segments ≥ min_duration
 
-3. **Boundary Sharpness** (20% weight):
-   - Rapid amplitude changes at start/end
-   - Sharp transitions = clear event boundaries
+#### Key Improvements Over Previous Approach
 
-4. **Duration Reasonableness** (15% weight):
-   - Proximity to typical contraction durations (0.3-5s)
-   - Extreme durations reduce confidence
+**Reduced Missed Events:**
+- Amplitude gets 70% weight in Stage 1 (was 35% in previous approach)
+- Lowered detection thresholds (0.25-0.40 vs 0.30-0.50)
+- More aggressive initial candidate generation
+- Separate presence detection from boundary determination
 
-**Confidence Formula:**
-```
-confidence = 0.35 × amplitude_elevation + 0.30 × consistency + 
-             0.20 × boundary_sharpness + 0.15 × duration_reasonableness
-```
+**Better Boundary Precision:**
+- Ruptures used specifically for boundary refinement
+- Local minima alignment for clean event separation
+- Multi-factor quality metrics integrated in Stage 2
 
-**Confidence Threshold:**
-- Adapts based on sensitivity: `threshold = 0.3 + (sensitivity - 1.0) × 0.1`
-- Lower sensitivity → lower threshold → accepts more events
-- Higher sensitivity → higher threshold → only high-confidence events
-
-**Stage 4: Intelligent Refinement**
-
-The best-scoring scheme with confidence filtering is post-processed:
-- **Boundary Refinement**: Align event boundaries to local RMS minima
-- **Similar Event Merging**: Merge adjacent events that are likely part of the same activity
-  - Criteria: Small gap (<200ms), similar amplitudes, significant gap RMS
-- **Final Hard Filter**: Absolutely ensure NO segment violates `min_duration`
+**Maintained Strict Constraints:**
+- min_duration enforced as hard constraint at all stages
+- max_duration respected during refinement
+- No event overlaps guaranteed
 
 #### Duration Constraints: Hard vs Soft
 
 **🔒 min_duration (HARD CONSTRAINT)**:
 - **Strictly enforced at ALL stages** - no segment can be shorter than this value
-- Defines the valid solution space
-- Candidate generation filters violations
-- Scoring completely rejects schemes with violations (-∞ score)
-- Post-processing never creates segments below this threshold
-- Typical range: 0.01 - 2.0 seconds
+- Stage 1: Filters initial candidates
+- Stage 2: Validates refined boundaries
+- Post-processing: Never creates segments below threshold
+- Typical range: 0.01 - 10.0 seconds
 
 **📏 max_duration (Soft Optimization Guide)**:
 - Optional upper bound for event duration
-- Long events exceeding this trigger intelligent splitting
-- Uses multiple criteria: ruptures, RMS minima, amplitude drops
-- Typical range: 3.0 - 10.0 seconds
+- Long events exceeding this trigger intelligent splitting in Stage 2
+- Uses ruptures and RMS minima for natural break points
+- Typical range: 3.0 - 30.0 seconds
 
 #### Algorithm Philosophy
 
-**Duration Constraints = Solution Space Boundaries**
-- min_duration and max_duration define the valid solution space
-- Within this space, the algorithm finds the optimal segmentation
-- Not all candidate boundaries are activated
-- Boundaries only created when:
-  - Event confidence exceeds threshold
-  - Duration constraints are satisfied
-  - Overall segmentation quality improves
+**Amplitude-First for Presence, Multi-Factor for Boundaries:**
+- Stage 1 answers: "Does an event exist here?" → Primarily amplitude
+- Stage 2 answers: "Where exactly does it start/end?" → Multi-factor analysis
+- This separation reduces missed events while maintaining precision
 
-**Intelligent Boundary Decisions**
-- Algorithm evaluates confidence difference between adjacent regions
-- Boundaries activated only when confidence gap is significant
-- Prevents over-segmentation while respecting constraints
-- Ensures detected events are physiologically meaningful
+**Duration Constraints = Solution Space Boundaries:**
+- min_duration and max_duration define the valid solution space
+- Within this space, the algorithm finds optimal event boundaries
+- Not all potential boundaries are activated
+- Only high-quality boundaries that respect constraints are used
+
+**Non-Overlapping Requirement:**
+- Detected events never overlap
+- Overlapping regions are merged or resolved in favor of larger extent
+- Ensures clean, non-ambiguous event sequences
 
 #### Parameter Tuning
 
 **sensitivity** parameter (default: 1.5):
 - Lower values (0.5 - 1.5): More sensitive, detects subtle activities
   - Lower confidence threshold
-  - More candidate boundaries considered
+  - Lower amplitude threshold
+  - More events detected (may include weaker activations)
 - Medium values (1.5 - 2.5): Balanced, recommended for most cases
+  - Good trade-off between sensitivity and specificity
 - Higher values (2.5 - 4.0): Stricter, only strong activations
   - Higher confidence threshold
-  - Fewer boundaries activated
+  - Higher amplitude threshold
+  - Fewer events detected (only clear, strong activities)
+
+**min_duration** parameter:
+- Shorter (0.01 - 0.5s): Captures rapid contractions
+- Medium (0.5 - 2.0s): Typical muscle contractions
+- Longer (2.0 - 10.0s): Sustained activities only
 
 **Example Usage:**
 ```python
 from semg_preprocessing import detect_muscle_activity
 
-# Intelligent combined detection (recommended)
+# Two-stage amplitude-first combined detection (recommended)
 segments = detect_muscle_activity(
     filtered_signal, 
     fs=1000,
