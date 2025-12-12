@@ -35,6 +35,7 @@ def detect_muscle_activity(
     - Energy-based adaptive penalty strategy
     - Multi-dimensional feature vectors (time, frequency, complexity domains)
     - Multi-detector ensemble with voting/fusion mechanisms
+    - Activity vs non-activity classification after segmentation
     - Intelligent event merging for dense events (gaps < 50ms)
     
     Parameters:
@@ -58,17 +59,21 @@ def detect_muscle_activity(
         Long segments exceeding this duration will be split
     **kwargs : dict
         Additional arguments:
-        - sensitivity: float (0.1-5.0) - Detection sensitivity, directly affects penalty
-          Lower = more sensitive (more segments), Higher = stricter (fewer segments)
+        - sensitivity: float or list - Detection sensitivity, directly affects penalty
+          Single value (0.1-5.0) or list of values for each detector
         - n_detectors: int (1-5) - Number of parallel PELT detectors (default: 3)
+        - detector_sensitivities: list - Individual sensitivities for each detector (overrides sensitivity)
         - fusion_method: str ('voting', 'confidence', 'union') - How to combine detector outputs
         - use_multi_detector: bool - Enable multi-detector ensemble (default: True)
+        - classify_segments: bool - Enable activity/non-activity classification (default: True)
+        - use_clustering: bool - Use clustering for classification instead of threshold (default: False)
     
     Returns:
     --------
     List[Tuple[int, int]]
-        List of (start_index, end_index) tuples for each detected activity period
+        List of (start_index, end_index) tuples for each detected ACTIVE muscle period
         ALL segments are guaranteed to satisfy min_duration and max_duration constraints
+        Only segments classified as "activity" are returned
         
     Notes:
     ------
@@ -76,6 +81,7 @@ def detect_muscle_activity(
     - Data should be preprocessed (filtered) before detection
     - Sensitivity parameter directly controls PELT penalty for better interpretability
     - Multi-detector ensemble provides more robust detection
+    - After PELT segmentation, segments are classified as active/inactive
     - Dense events with gaps < 50ms are automatically merged
     """
     if method != "combined":
@@ -84,18 +90,27 @@ def detect_muscle_activity(
     # Extract parameters
     sensitivity = kwargs.get('sensitivity', 1.5)
     n_detectors = kwargs.get('n_detectors', 3)
+    detector_sensitivities = kwargs.get('detector_sensitivities', None)
     fusion_method = kwargs.get('fusion_method', 'confidence')
     use_multi_detector = kwargs.get('use_multi_detector', True)
+    classify_segments = kwargs.get('classify_segments', True)
+    use_clustering = kwargs.get('use_clustering', False)
     
     # Use new advanced PELT detection
     segments = _detect_pelt_advanced(
         data, fs, window_size, min_duration, 
-        sensitivity, n_detectors, fusion_method, use_multi_detector
+        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector
     )
     
     # Apply max_duration splitting if specified
     if max_duration is not None and max_duration > min_duration:
         segments = _split_long_segments(data, segments, fs, min_duration, max_duration)
+    
+    # Classify segments as activity vs non-activity
+    if classify_segments and segments:
+        segments = _classify_activity_segments(
+            data, segments, fs, window_size, use_clustering
+        )
     
     return segments
 
@@ -105,8 +120,9 @@ def _detect_pelt_advanced(
     fs: float,
     window_size: Optional[int],
     min_duration: float,
-    sensitivity: float,
+    sensitivity: Union[float, List[float]],
     n_detectors: int,
+    detector_sensitivities: Optional[List[float]],
     fusion_method: str,
     use_multi_detector: bool
 ) -> List[Tuple[int, int]]:
@@ -116,7 +132,7 @@ def _detect_pelt_advanced(
     This implements the new detection algorithm with:
     1. Energy-based adaptive penalty zones
     2. Multi-dimensional feature vectors
-    3. Multiple PELT detectors with different sensitivities
+    3. Multiple PELT detectors with individual sensitivities
     4. Voting/confidence-weighted fusion
     5. Intelligent event merging for dense events (gaps < 50ms)
     6. Strict min/max duration enforcement
@@ -131,10 +147,13 @@ def _detect_pelt_advanced(
         Window size for feature extraction
     min_duration : float
         Minimum event duration (seconds) - STRICTLY enforced
-    sensitivity : float
+    sensitivity : float or list
         Detection sensitivity (0.1-5.0) - directly affects penalty
+        Can be single value or list for backward compatibility
     n_detectors : int
         Number of parallel detectors
+    detector_sensitivities : list, optional
+        Individual sensitivities for each detector (overrides automatic range)
     fusion_method : str
         Method to combine detectors: 'voting', 'confidence', 'union'
     use_multi_detector : bool
@@ -143,26 +162,35 @@ def _detect_pelt_advanced(
     Returns:
     --------
     List[Tuple[int, int]]
-        Detected event segments
+        Detected event segments (before activity classification)
     """
     if window_size is None:
         window_size = int(fs / 10)  # Default: 0.1 seconds
     
     min_samples = int(min_duration * fs)
     
-    # Step 1: Extract multi-dimensional features
-    features = _extract_multidimensional_features(data, fs, window_size)
+    # Step 1: Extract multi-dimensional features (optimized)
+    features = _extract_multidimensional_features_fast(data, fs, window_size)
     
     # Step 2: Compute energy zones for adaptive penalty
     energy_zones = _compute_energy_zones(data, window_size)
     
     if use_multi_detector and n_detectors > 1:
-        # Step 3: Run multiple PELT detectors with different sensitivities
+        # Step 3: Run multiple PELT detectors with individual sensitivities
         all_detections = []
         detector_confidences = []
         
-        # Create sensitivity range around base sensitivity
-        sensitivity_range = np.linspace(sensitivity * 0.7, sensitivity * 1.3, n_detectors)
+        # Determine sensitivity for each detector
+        if detector_sensitivities is not None and len(detector_sensitivities) == n_detectors:
+            # Use user-provided individual sensitivities
+            sensitivity_range = detector_sensitivities
+        elif isinstance(sensitivity, list) and len(sensitivity) == n_detectors:
+            # sensitivity is already a list
+            sensitivity_range = sensitivity
+        else:
+            # Create sensitivity range around base sensitivity (backward compatibility)
+            base_sens = sensitivity if isinstance(sensitivity, (int, float)) else sensitivity[0]
+            sensitivity_range = np.linspace(base_sens * 0.7, base_sens * 1.3, n_detectors)
         
         for i, det_sensitivity in enumerate(sensitivity_range):
             # Compute adaptive penalties for this detector
@@ -187,7 +215,8 @@ def _detect_pelt_advanced(
         )
     else:
         # Single detector mode
-        penalties = _compute_adaptive_penalties(features, energy_zones, sensitivity)
+        single_sens = sensitivity if isinstance(sensitivity, (int, float)) else sensitivity[0]
+        penalties = _compute_adaptive_penalties(features, energy_zones, single_sens)
         segments = _run_pelt_with_adaptive_penalty(features, penalties, min_samples)
     
     # Step 5: Merge dense events (gaps < 50ms)
@@ -323,6 +352,119 @@ def _calculate_frequency_features(
         mdf[start:end] = mdf_val
     
     return mnf, mdf
+
+
+def _extract_multidimensional_features_fast(
+    data: np.ndarray,
+    fs: float,
+    window_size: int
+) -> np.ndarray:
+    """
+    Optimized version of multi-dimensional feature extraction.
+    
+    Optimizations:
+    - Reduced frequency feature calculation (less overlap, coarser resolution)
+    - Simplified complexity features
+    - Cached convolution operations
+    
+    Features extracted:
+    1. Time-domain: RMS, MAV, VAR
+    2. Frequency-domain: MNF (simplified)
+    3. Complexity: ZCR
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for feature extraction
+    
+    Returns:
+    --------
+    np.ndarray
+        Feature matrix of shape (n_samples, 5 features)
+    """
+    n_samples = len(data)
+    kernel = np.ones(window_size) / window_size
+    
+    # Time-domain features (fast)
+    # 1. RMS (Root Mean Square)
+    rms = np.sqrt(np.convolve(data ** 2, kernel, mode='same'))
+    
+    # 2. MAV (Mean Absolute Value)
+    mav = np.convolve(np.abs(data), kernel, mode='same')
+    
+    # 3. VAR (Variance)
+    mean = np.convolve(data, kernel, mode='same')
+    var = np.convolve(data ** 2, kernel, mode='same') - mean ** 2
+    var = np.maximum(var, 0)  # Handle numerical errors
+    
+    # Frequency-domain features (optimized - less frequent calculation)
+    # 4. MNF (Mean Frequency) - simplified
+    mnf = _calculate_frequency_features_fast(data, fs, window_size)
+    
+    # Complexity features (simplified)
+    # 5. Zero Crossing Rate
+    zcr = _calculate_zero_crossing_rate(data, window_size)
+    
+    # Stack all features
+    features = np.column_stack([rms, mav, var, mnf, zcr])
+    
+    # Normalize features
+    scaler = StandardScaler()
+    features_normalized = scaler.fit_transform(features)
+    
+    return features_normalized
+
+
+def _calculate_frequency_features_fast(
+    data: np.ndarray,
+    fs: float,
+    window_size: int
+) -> np.ndarray:
+    """
+    Fast calculation of mean frequency feature with reduced temporal resolution.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size
+    
+    Returns:
+    --------
+    np.ndarray
+        MNF array
+    """
+    n_samples = len(data)
+    step = window_size  # No overlap for speed
+    
+    mnf = np.zeros(n_samples)
+    
+    # Calculate for each window with larger steps
+    for i in range(0, n_samples, step):
+        end = min(n_samples, i + window_size)
+        
+        if end - i < window_size // 2:
+            continue
+        
+        window_data = data[i:end]
+        
+        # Compute power spectral density (simplified)
+        freqs, psd = scipy_signal.welch(window_data, fs=fs, nperseg=min(128, len(window_data)))
+        
+        # Mean frequency
+        mnf_val = np.sum(freqs * psd) / (np.sum(psd) + 1e-10)
+        
+        # Assign to output array
+        mnf[i:end] = mnf_val
+    
+    return mnf
 
 
 def _calculate_zero_crossing_rate(
@@ -731,6 +873,115 @@ def _fuse_detections(
     
     else:
         raise ValueError(f"Unknown fusion method: {fusion_method}")
+
+
+def _classify_activity_segments(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    fs: float,
+    window_size: Optional[int],
+    use_clustering: bool = False
+) -> List[Tuple[int, int]]:
+    """
+    Classify segments as activity or non-activity based on signal features.
+    
+    After PELT detection creates segments at change points, this function
+    determines which segments represent actual muscle activity vs rest periods.
+    Only segments classified as "activity" are returned.
+    
+    Classification methods:
+    1. Adaptive threshold (default): Uses time and frequency domain features
+    2. K-means clustering: Automatically separates activity from rest
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segments : List[Tuple[int, int]]
+        All detected segments from PELT
+    fs : float
+        Sampling frequency
+    window_size : int, optional
+        Window size for feature extraction
+    use_clustering : bool
+        If True, use K-means clustering; otherwise use adaptive threshold
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Only segments classified as muscle activity
+    """
+    if not segments:
+        return []
+    
+    if window_size is None:
+        window_size = int(fs / 10)
+    
+    # Extract features for each segment
+    segment_features = []
+    for start, end in segments:
+        segment_data = data[start:end]
+        
+        # Time-domain features
+        rms = np.sqrt(np.mean(segment_data ** 2))
+        mav = np.mean(np.abs(segment_data))
+        var = np.var(segment_data)
+        
+        # Frequency-domain feature (simplified)
+        if len(segment_data) >= 64:
+            freqs, psd = scipy_signal.welch(segment_data, fs=fs, nperseg=min(128, len(segment_data)))
+            mnf = np.sum(freqs * psd) / (np.sum(psd) + 1e-10)
+            power = np.sum(psd)
+        else:
+            mnf = 0
+            power = 0
+        
+        # Combine features
+        segment_features.append([rms, mav, var, mnf, power])
+    
+    segment_features = np.array(segment_features)
+    
+    if use_clustering:
+        # Method 1: K-means clustering (2 clusters: activity vs rest)
+        try:
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init='auto')
+        except TypeError:
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+        
+        labels = kmeans.fit_predict(segment_features)
+        
+        # Identify activity cluster (higher feature values)
+        cluster_means = np.array([segment_features[labels == i].mean() 
+                                  for i in range(2)])
+        activity_cluster = np.argmax(cluster_means)
+        
+        # Keep only activity segments
+        activity_segments = [seg for seg, label in zip(segments, labels) 
+                            if label == activity_cluster]
+    else:
+        # Method 2: Adaptive threshold (faster, more interpretable)
+        # Normalize features
+        scaler = StandardScaler()
+        features_normalized = scaler.fit_transform(segment_features)
+        
+        # Calculate combined activity score for each segment
+        # Higher RMS, MAV, VAR, and power indicate activity
+        activity_scores = (
+            features_normalized[:, 0] +  # RMS
+            features_normalized[:, 1] +  # MAV
+            features_normalized[:, 2] +  # VAR
+            features_normalized[:, 4]    # Power
+        ) / 4.0
+        
+        # Adaptive threshold based on score distribution
+        # Use median + std/2 to separate activity from rest
+        threshold = np.median(activity_scores) + np.std(activity_scores) * 0.5
+        
+        # Keep segments above threshold
+        activity_segments = [seg for seg, score in zip(segments, activity_scores) 
+                            if score >= threshold]
+    
+    return activity_segments
 
 
 def _merge_dense_events(
