@@ -1,10 +1,10 @@
 """
-Example: Muscle activity detection with different methods.
+Example: Muscle activity detection using advanced PELT algorithm.
 
 This script demonstrates:
-1. Detection using ruptures only
-2. Detection using amplitude threshold only
-3. Detection using combined method (recommended)
+1. Detection using the new PELT-based combined method with single detector
+2. Detection using multi-detector ensemble with different fusion methods
+3. Comparison of different detector configurations
 """
 
 import sys
@@ -36,33 +36,41 @@ def main():
     filtered = apply_bandpass_filter(signal, fs, lowcut=20, highcut=450)
     filtered = apply_notch_filter(filtered, fs, freq=50, harmonics=[1, 2, 3])
     
-    # Detect muscle activity using different methods
-    print("\nDetecting muscle activity with different methods...")
+    # Detect muscle activity using different configurations
+    print("\nDetecting muscle activity with advanced PELT algorithm...")
     
-    print("  1. Ruptures method...")
-    segments_ruptures = detect_muscle_activity(
-        filtered, fs, method='ruptures', pen=3
+    print("  1. Single detector (baseline)...")
+    segments_single = detect_muscle_activity(
+        filtered, fs, method='combined', 
+        min_duration=0.1, sensitivity=1.5,
+        use_multi_detector=False
     )
     
-    print("  2. Amplitude threshold method...")
-    segments_amplitude = detect_muscle_activity(
-        filtered, fs, method='amplitude', min_duration=0.1
+    print("  2. Multi-detector with confidence fusion (recommended)...")
+    segments_confidence = detect_muscle_activity(
+        filtered, fs, method='combined',
+        min_duration=0.1, sensitivity=1.5,
+        n_detectors=3, fusion_method='confidence',
+        use_multi_detector=True
     )
     
-    print("  3. Combined method (recommended)...")
-    segments_combined = detect_muscle_activity(
-        filtered, fs, method='combined', pen=3, min_duration=0.1
+    print("  3. Multi-detector with voting fusion...")
+    segments_voting = detect_muscle_activity(
+        filtered, fs, method='combined',
+        min_duration=0.1, sensitivity=1.5,
+        n_detectors=3, fusion_method='voting',
+        use_multi_detector=True
     )
     
     # Print results
     print(f"\nResults:")
-    print(f"  Ruptures method: {len(segments_ruptures)} segments")
-    print(f"  Amplitude method: {len(segments_amplitude)} segments")
-    print(f"  Combined method: {len(segments_combined)} segments")
+    print(f"  Single detector: {len(segments_single)} segments")
+    print(f"  Confidence fusion: {len(segments_confidence)} segments")
+    print(f"  Voting fusion: {len(segments_voting)} segments")
     
     # Get detailed segment information
-    print("\nCombined method segment details:")
-    segments_info = segment_signal(filtered, segments_combined, fs, include_metadata=True)
+    print("\nConfidence fusion segment details:")
+    segments_info = segment_signal(filtered, segments_confidence, fs, include_metadata=True)
     for i, seg in enumerate(segments_info):
         print(f"  Segment {i+1}: "
               f"{seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
@@ -72,25 +80,25 @@ def main():
     # Visualize
     visualize_detection_comparison(
         filtered, 
-        segments_ruptures, 
-        segments_amplitude, 
-        segments_combined,
+        segments_single, 
+        segments_confidence, 
+        segments_voting,
         fs
     )
     
     print("\nVisualization saved!")
 
 
-def visualize_detection_comparison(signal, rupt_segs, amp_segs, comb_segs, fs):
-    """Visualize muscle activity detection results from different methods."""
+def visualize_detection_comparison(signal, single_segs, conf_segs, vote_segs, fs):
+    """Visualize muscle activity detection results from different configurations."""
     time = np.arange(len(signal)) / fs
     
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
     
     methods = [
-        (rupt_segs, 'Ruptures Method', 'blue'),
-        (amp_segs, 'Amplitude Threshold Method', 'green'),
-        (comb_segs, 'Combined Method (Recommended)', 'red')
+        (single_segs, 'Single Detector', 'blue'),
+        (conf_segs, 'Multi-Detector: Confidence Fusion (Recommended)', 'red'),
+        (vote_segs, 'Multi-Detector: Voting Fusion', 'green')
     ]
     
     for ax, (segments, title, color) in zip(axes, methods):
