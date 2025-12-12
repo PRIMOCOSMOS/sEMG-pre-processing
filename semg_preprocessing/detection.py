@@ -2,10 +2,10 @@
 Muscle activity detection and signal segmentation.
 
 This module implements muscle activity event detection using:
-- Ruptures library for change point detection
-- Amplitude-based analysis
-- Combined ruptures and amplitude approach for robust detection
-- Multi-feature fusion detection with adaptive parameters
+- Advanced PELT (Pruned Exact Linear Time) algorithm with adaptive penalty
+- Multi-dimensional feature vectors (time-domain, frequency-domain, complexity)
+- Energy-based penalty zones for improved detection
+- Multi-detector ensemble with voting/fusion mechanisms
 """
 
 import numpy as np
@@ -15,12 +15,13 @@ from scipy import signal as scipy_signal
 from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from scipy.stats import entropy
 
 
 def detect_muscle_activity(
     data: np.ndarray,
     fs: float,
-    method: str = "multi_feature",
+    method: str = "combined",
     amplitude_threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
@@ -28,10 +29,13 @@ def detect_muscle_activity(
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity events in sEMG signal.
+    Detect muscle activity events in sEMG signal using advanced PELT algorithm.
     
-    This function provides multiple detection methods including advanced
-    multi-feature fusion with adaptive parameters.
+    This function uses an enhanced PELT (Pruned Exact Linear Time) algorithm with:
+    - Energy-based adaptive penalty strategy
+    - Multi-dimensional feature vectors (time, frequency, complexity domains)
+    - Multi-detector ensemble with voting/fusion mechanisms
+    - Intelligent event merging for dense events (gaps < 50ms)
     
     Parameters:
     -----------
@@ -40,64 +44,758 @@ def detect_muscle_activity(
     fs : float
         Sampling frequency in Hz
     method : str, optional
-        Detection method: 'ruptures', 'amplitude', 'combined', or 'multi_feature' (default: 'multi_feature')
+        Detection method: only 'combined' is supported (default: 'combined')
+        Note: Other methods have been deprecated
     amplitude_threshold : float, optional
-        Threshold for amplitude-based detection (default: auto-calculated as 2*RMS)
+        Not used in new PELT implementation (kept for API compatibility)
     window_size : int, optional
         Window size for feature calculation (default: fs/10)
     min_duration : float, optional
         Minimum duration of muscle activity in seconds (default: 0.1)
+        This is STRICTLY enforced - no segment shorter than this will be produced
     max_duration : float, optional
         Maximum duration of muscle activity in seconds (default: None = no limit)
-        Long segments exceeding this duration will be split using internal change detection
+        Long segments exceeding this duration will be split
     **kwargs : dict
         Additional arguments:
-        - For ruptures: model, pen, min_size
-        - For multi_feature: use_clustering, adaptive_pen, n_clusters
+        - sensitivity: float (0.1-5.0) - Detection sensitivity, directly affects penalty
+          Lower = more sensitive (more segments), Higher = stricter (fewer segments)
+        - n_detectors: int (1-5) - Number of parallel PELT detectors (default: 3)
+        - fusion_method: str ('voting', 'confidence', 'union') - How to combine detector outputs
+        - use_multi_detector: bool - Enable multi-detector ensemble (default: True)
     
     Returns:
     --------
     List[Tuple[int, int]]
         List of (start_index, end_index) tuples for each detected activity period
+        ALL segments are guaranteed to satisfy min_duration and max_duration constraints
         
     Notes:
     ------
-    - 'multi_feature' method is recommended for most robust detection
-    - 'combined' method provides good balance of speed and accuracy
+    - Only 'combined' method is now supported (uses advanced PELT algorithm)
     - Data should be preprocessed (filtered) before detection
-    - Adjust amplitude_threshold based on signal characteristics
-    - max_duration helps split overly long segments into more meaningful motion periods
+    - Sensitivity parameter directly controls PELT penalty for better interpretability
+    - Multi-detector ensemble provides more robust detection
+    - Dense events with gaps < 50ms are automatically merged
     """
-    # Define valid parameters for each method to prevent TypeError
-    ruptures_params = {'model', 'pen', 'min_size'}
-    multi_feature_params = {'use_clustering', 'adaptive_pen', 'n_clusters', 'sensitivity', 
-                            'model', 'pen', 'min_size'}
+    if method != "combined":
+        raise ValueError(f"Only 'combined' method is supported. Other methods have been deprecated.")
     
-    if method == "ruptures":
-        # Filter kwargs to only valid ruptures parameters
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
-        segments = _detect_ruptures(data, fs, **filtered_kwargs)
-    elif method == "amplitude":
-        # Amplitude method uses sensitivity from kwargs if provided
-        sensitivity = kwargs.get('sensitivity', 2.0)
-        segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
-    elif method == "combined":
-        # Filter kwargs to only valid ruptures parameters for combined
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
-        sensitivity = kwargs.get('sensitivity', 2.0)
-        segments = _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
-    elif method == "multi_feature":
-        # Filter kwargs to only valid multi_feature parameters
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in multi_feature_params}
-        segments = _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'ruptures', 'amplitude', 'combined', or 'multi_feature'")
+    # Extract parameters
+    sensitivity = kwargs.get('sensitivity', 1.5)
+    n_detectors = kwargs.get('n_detectors', 3)
+    fusion_method = kwargs.get('fusion_method', 'confidence')
+    use_multi_detector = kwargs.get('use_multi_detector', True)
+    
+    # Use new advanced PELT detection
+    segments = _detect_pelt_advanced(
+        data, fs, window_size, min_duration, 
+        sensitivity, n_detectors, fusion_method, use_multi_detector
+    )
     
     # Apply max_duration splitting if specified
     if max_duration is not None and max_duration > min_duration:
         segments = _split_long_segments(data, segments, fs, min_duration, max_duration)
     
     return segments
+
+
+def _detect_pelt_advanced(
+    data: np.ndarray,
+    fs: float,
+    window_size: Optional[int],
+    min_duration: float,
+    sensitivity: float,
+    n_detectors: int,
+    fusion_method: str,
+    use_multi_detector: bool
+) -> List[Tuple[int, int]]:
+    """
+    Advanced PELT-based muscle activity detection with multi-detector ensemble.
+    
+    This implements the new detection algorithm with:
+    1. Energy-based adaptive penalty zones
+    2. Multi-dimensional feature vectors
+    3. Multiple PELT detectors with different sensitivities
+    4. Voting/confidence-weighted fusion
+    5. Intelligent event merging for dense events (gaps < 50ms)
+    6. Strict min/max duration enforcement
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input preprocessed sEMG signal
+    fs : float
+        Sampling frequency
+    window_size : int, optional
+        Window size for feature extraction
+    min_duration : float
+        Minimum event duration (seconds) - STRICTLY enforced
+    sensitivity : float
+        Detection sensitivity (0.1-5.0) - directly affects penalty
+    n_detectors : int
+        Number of parallel detectors
+    fusion_method : str
+        Method to combine detectors: 'voting', 'confidence', 'union'
+    use_multi_detector : bool
+        Whether to use multi-detector ensemble
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected event segments
+    """
+    if window_size is None:
+        window_size = int(fs / 10)  # Default: 0.1 seconds
+    
+    min_samples = int(min_duration * fs)
+    
+    # Step 1: Extract multi-dimensional features
+    features = _extract_multidimensional_features(data, fs, window_size)
+    
+    # Step 2: Compute energy zones for adaptive penalty
+    energy_zones = _compute_energy_zones(data, window_size)
+    
+    if use_multi_detector and n_detectors > 1:
+        # Step 3: Run multiple PELT detectors with different sensitivities
+        all_detections = []
+        detector_confidences = []
+        
+        # Create sensitivity range around base sensitivity
+        sensitivity_range = np.linspace(sensitivity * 0.7, sensitivity * 1.3, n_detectors)
+        
+        for i, det_sensitivity in enumerate(sensitivity_range):
+            # Compute adaptive penalties for this detector
+            penalties = _compute_adaptive_penalties(
+                features, energy_zones, det_sensitivity
+            )
+            
+            # Run PELT with zone-specific penalties
+            segments = _run_pelt_with_adaptive_penalty(
+                features, penalties, min_samples
+            )
+            
+            # Calculate confidence scores for each segment
+            confidences = [_calculate_segment_confidence(data, seg, fs) for seg in segments]
+            
+            all_detections.append(segments)
+            detector_confidences.append(confidences)
+        
+        # Step 4: Fuse detections using selected method
+        segments = _fuse_detections(
+            all_detections, detector_confidences, fusion_method, min_samples
+        )
+    else:
+        # Single detector mode
+        penalties = _compute_adaptive_penalties(features, energy_zones, sensitivity)
+        segments = _run_pelt_with_adaptive_penalty(features, penalties, min_samples)
+    
+    # Step 5: Merge dense events (gaps < 50ms)
+    segments = _merge_dense_events(data, segments, fs, min_samples)
+    
+    # Step 6: Final strict enforcement of duration constraints
+    segments = [(s, e) for s, e in segments if (e - s) >= min_samples]
+    
+    return segments
+
+
+def _extract_multidimensional_features(
+    data: np.ndarray,
+    fs: float,
+    window_size: int
+) -> np.ndarray:
+    """
+    Extract multi-dimensional feature vectors including time-domain,
+    frequency-domain, and complexity features for PELT algorithm.
+    
+    Features extracted:
+    1. Time-domain: RMS, MAV, VAR, WL (Waveform Length)
+    2. Frequency-domain: MNF (Mean Frequency), MDF (Median Frequency)
+    3. Complexity: Sample Entropy, Zero Crossing Rate
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for feature extraction
+    
+    Returns:
+    --------
+    np.ndarray
+        Feature matrix of shape (n_samples, n_features)
+    """
+    n_samples = len(data)
+    kernel = np.ones(window_size) / window_size
+    
+    # Time-domain features
+    # 1. RMS (Root Mean Square)
+    rms = np.sqrt(np.convolve(data ** 2, kernel, mode='same'))
+    
+    # 2. MAV (Mean Absolute Value)
+    mav = np.convolve(np.abs(data), kernel, mode='same')
+    
+    # 3. VAR (Variance)
+    mean = np.convolve(data, kernel, mode='same')
+    var = np.convolve(data ** 2, kernel, mode='same') - mean ** 2
+    var = np.maximum(var, 0)  # Handle numerical errors
+    
+    # 4. WL (Waveform Length) - approximated by gradient magnitude
+    wl = np.abs(np.gradient(data))
+    wl = np.convolve(wl, kernel, mode='same')
+    
+    # Frequency-domain features (calculated over sliding windows)
+    # 5. MNF (Mean Frequency) and 6. MDF (Median Frequency)
+    mnf, mdf = _calculate_frequency_features(data, fs, window_size)
+    
+    # Complexity features
+    # 7. Zero Crossing Rate
+    zcr = _calculate_zero_crossing_rate(data, window_size)
+    
+    # 8. Sample Entropy (approximation using local variance ratio)
+    # True sample entropy is computationally expensive, so we use a proxy
+    sampen_proxy = np.log1p(var) / (np.log1p(rms) + 1e-10)
+    
+    # Stack all features
+    features = np.column_stack([rms, mav, var, wl, mnf, mdf, zcr, sampen_proxy])
+    
+    # Normalize features
+    scaler = StandardScaler()
+    features_normalized = scaler.fit_transform(features)
+    
+    return features_normalized
+
+
+def _calculate_frequency_features(
+    data: np.ndarray,
+    fs: float,
+    window_size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate frequency-domain features: MNF (Mean Frequency) and MDF (Median Frequency).
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, np.ndarray]
+        (MNF array, MDF array)
+    """
+    n_samples = len(data)
+    step = window_size // 4  # 75% overlap
+    
+    mnf = np.zeros(n_samples)
+    mdf = np.zeros(n_samples)
+    
+    # Calculate for each window
+    for i in range(0, n_samples, step):
+        start = max(0, i - window_size // 2)
+        end = min(n_samples, i + window_size // 2)
+        
+        if end - start < window_size // 2:
+            continue
+        
+        window_data = data[start:end]
+        
+        # Compute power spectral density
+        freqs, psd = scipy_signal.welch(window_data, fs=fs, nperseg=min(256, len(window_data)))
+        
+        # Mean frequency
+        mnf_val = np.sum(freqs * psd) / (np.sum(psd) + 1e-10)
+        
+        # Median frequency
+        cumsum = np.cumsum(psd)
+        cumsum_norm = cumsum / (cumsum[-1] + 1e-10)
+        mdf_idx = np.argmin(np.abs(cumsum_norm - 0.5))
+        mdf_val = freqs[mdf_idx]
+        
+        # Assign to output arrays
+        mnf[start:end] = mnf_val
+        mdf[start:end] = mdf_val
+    
+    return mnf, mdf
+
+
+def _calculate_zero_crossing_rate(
+    data: np.ndarray,
+    window_size: int
+) -> np.ndarray:
+    """
+    Calculate zero crossing rate over sliding window.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    window_size : int
+        Window size
+    
+    Returns:
+    --------
+    np.ndarray
+        Zero crossing rate
+    """
+    # Find zero crossings
+    zero_crossings = np.abs(np.diff(np.sign(data))) > 0
+    
+    # Count in sliding window
+    kernel = np.ones(window_size)
+    zcr = np.convolve(zero_crossings.astype(float), kernel, mode='same')
+    
+    # Normalize by window size
+    zcr = zcr / window_size
+    
+    # Pad to match input length
+    zcr = np.concatenate([[zcr[0]], zcr])
+    
+    return zcr
+
+
+def _compute_energy_zones(
+    data: np.ndarray,
+    window_size: int,
+    n_zones: int = 3
+) -> np.ndarray:
+    """
+    Compute energy-based zones for adaptive penalty strategy.
+    
+    Divides signal into zones based on local energy:
+    - Low energy zones: use low penalty (more sensitive)
+    - Medium energy zones: use medium penalty
+    - High energy zones: use high penalty (less sensitive)
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    window_size : int
+        Window size for energy calculation
+    n_zones : int
+        Number of energy zones (default: 3)
+    
+    Returns:
+    --------
+    np.ndarray
+        Zone labels (0 to n_zones-1) for each sample
+    """
+    # Calculate local energy
+    energy = data ** 2
+    kernel = np.ones(window_size) / window_size
+    local_energy = np.convolve(energy, kernel, mode='same')
+    
+    # Use K-means clustering to identify energy zones
+    energy_2d = local_energy.reshape(-1, 1)
+    
+    try:
+        kmeans = KMeans(n_clusters=n_zones, random_state=42, n_init='auto')
+    except TypeError:
+        kmeans = KMeans(n_clusters=n_zones, random_state=42, n_init=10)
+    
+    zones = kmeans.fit_predict(energy_2d)
+    
+    # Reorder zones so that 0 = low energy, n_zones-1 = high energy
+    cluster_means = np.array([local_energy[zones == i].mean() for i in range(n_zones)])
+    zone_order = np.argsort(cluster_means)
+    
+    # Remap zones
+    zone_map = {old_label: new_label for new_label, old_label in enumerate(zone_order)}
+    zones_reordered = np.array([zone_map[z] for z in zones])
+    
+    return zones_reordered
+
+
+def _compute_adaptive_penalties(
+    features: np.ndarray,
+    energy_zones: np.ndarray,
+    sensitivity: float
+) -> np.ndarray:
+    """
+    Compute adaptive penalty values based on energy zones and sensitivity.
+    
+    Low energy zones get lower penalties (more sensitive detection).
+    High energy zones get higher penalties (less sensitive, avoid over-segmentation).
+    
+    Parameters:
+    -----------
+    features : np.ndarray
+        Feature matrix
+    energy_zones : np.ndarray
+        Energy zone labels for each sample
+    sensitivity : float
+        Global sensitivity parameter
+    
+    Returns:
+    --------
+    np.ndarray
+        Penalty value for each sample
+    """
+    n_samples = len(energy_zones)
+    n_zones = len(np.unique(energy_zones))
+    
+    # Base penalty from sensitivity (inversely proportional)
+    # sensitivity: 0.1 (very sensitive) -> high base penalty modifier
+    # sensitivity: 5.0 (very strict) -> low base penalty modifier
+    base_penalty = 3.0 * sensitivity
+    
+    # Zone-specific multipliers
+    # Low energy (zone 0): 0.5x base (more sensitive)
+    # Medium energy (zone 1): 1.0x base
+    # High energy (zone 2): 2.0x base (less sensitive)
+    zone_multipliers = np.linspace(0.5, 2.0, n_zones)
+    
+    # Assign penalties based on zones
+    penalties = np.zeros(n_samples)
+    for i in range(n_zones):
+        mask = energy_zones == i
+        penalties[mask] = base_penalty * zone_multipliers[i]
+    
+    return penalties
+
+
+def _run_pelt_with_adaptive_penalty(
+    features: np.ndarray,
+    penalties: np.ndarray,
+    min_samples: int
+) -> List[Tuple[int, int]]:
+    """
+    Run PELT algorithm with position-dependent adaptive penalties.
+    
+    Since ruptures doesn't directly support position-dependent penalties,
+    we use a strategy of running PELT with an average penalty and then
+    refining boundaries based on local penalty values.
+    
+    Parameters:
+    -----------
+    features : np.ndarray
+        Feature matrix
+    penalties : np.ndarray
+        Penalty values for each position
+    min_samples : int
+        Minimum segment size
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected segments
+    """
+    # Use median penalty as the base penalty for PELT
+    median_penalty = np.median(penalties)
+    
+    # Run PELT
+    algo = rpt.Pelt(model='l2', min_size=min_samples).fit(features)
+    change_points = algo.predict(pen=median_penalty)
+    
+    # Remove the last point if it's the end of the signal
+    if change_points and change_points[-1] == len(features):
+        change_points = change_points[:-1]
+    
+    if not change_points:
+        return []
+    
+    # Convert change points to segments
+    segments = []
+    start = 0
+    for cp in change_points:
+        if cp - start >= min_samples:
+            segments.append((start, cp))
+        start = cp
+    
+    # Add final segment if there's remaining data
+    if start < len(features) and len(features) - start >= min_samples:
+        segments.append((start, len(features)))
+    
+    # Refine boundaries based on local penalties
+    # Move boundaries to positions with locally minimal penalty (easier to split)
+    refined_segments = []
+    for i, (start, end) in enumerate(segments):
+        # Check boundaries within a small window
+        search_window = min(min_samples // 2, 50)
+        
+        # Refine start boundary (except for first segment)
+        if i > 0 and start > search_window:
+            window_start = max(0, start - search_window)
+            window_end = min(len(penalties), start + search_window)
+            local_penalties = penalties[window_start:window_end]
+            min_idx = np.argmin(local_penalties)
+            refined_start = window_start + min_idx
+        else:
+            refined_start = start
+        
+        # Refine end boundary (except for last segment)
+        if i < len(segments) - 1 and end < len(penalties) - search_window:
+            window_start = max(0, end - search_window)
+            window_end = min(len(penalties), end + search_window)
+            local_penalties = penalties[window_start:window_end]
+            min_idx = np.argmin(local_penalties)
+            refined_end = window_start + min_idx
+        else:
+            refined_end = end
+        
+        # Ensure minimum duration
+        if refined_end - refined_start >= min_samples:
+            refined_segments.append((refined_start, refined_end))
+    
+    return refined_segments
+
+
+def _calculate_segment_confidence(
+    data: np.ndarray,
+    segment: Tuple[int, int],
+    fs: float
+) -> float:
+    """
+    Calculate confidence score for a detected segment.
+    
+    Confidence is based on:
+    1. Amplitude contrast with surrounding regions
+    2. Internal consistency (low variance)
+    3. Duration reasonableness
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segment : Tuple[int, int]
+        Segment boundaries
+    fs : float
+        Sampling frequency
+    
+    Returns:
+    --------
+    float
+        Confidence score (0 to 1)
+    """
+    start, end = segment
+    segment_length = end - start
+    
+    if segment_length == 0:
+        return 0.0
+    
+    segment_data = data[start:end]
+    segment_rms = np.sqrt(np.mean(segment_data ** 2))
+    
+    # 1. Amplitude contrast
+    window = min(segment_length, int(fs * 0.5))
+    
+    before_rms = 0.0
+    after_rms = 0.0
+    count = 0
+    
+    if start >= window:
+        before_rms = np.sqrt(np.mean(data[start - window:start] ** 2))
+        count += 1
+    if end + window < len(data):
+        after_rms = np.sqrt(np.mean(data[end:end + window] ** 2))
+        count += 1
+    
+    if count > 0:
+        surrounding_rms = (before_rms + after_rms) / count
+        contrast = (segment_rms - surrounding_rms) / (surrounding_rms + 1e-10)
+        contrast_score = min(1.0, contrast / 2.0)
+    else:
+        contrast_score = 0.5
+    
+    # 2. Internal consistency
+    cv = np.std(segment_data) / (segment_rms + 1e-10)
+    consistency_score = 1.0 / (1.0 + cv)
+    
+    # 3. Duration reasonableness
+    duration_seconds = segment_length / fs
+    if 0.1 <= duration_seconds <= 5.0:
+        duration_score = 1.0
+    elif duration_seconds < 0.1:
+        duration_score = duration_seconds / 0.1
+    else:
+        duration_score = 5.0 / duration_seconds
+    
+    # Weighted combination
+    confidence = 0.5 * contrast_score + 0.3 * consistency_score + 0.2 * duration_score
+    
+    return confidence
+
+
+def _fuse_detections(
+    all_detections: List[List[Tuple[int, int]]],
+    detector_confidences: List[List[float]],
+    fusion_method: str,
+    min_samples: int
+) -> List[Tuple[int, int]]:
+    """
+    Fuse detections from multiple PELT detectors using voting or confidence weighting.
+    
+    Parameters:
+    -----------
+    all_detections : List[List[Tuple[int, int]]]
+        Detections from each detector
+    detector_confidences : List[List[float]]
+        Confidence scores for each detection
+    fusion_method : str
+        'voting': majority vote, 'confidence': confidence-weighted, 'union': combine all
+    min_samples : int
+        Minimum segment size
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Fused segments
+    """
+    if fusion_method == 'union':
+        # Simply combine all detections and remove overlaps
+        all_segments = []
+        for detections in all_detections:
+            all_segments.extend(detections)
+        return _merge_overlapping_segments(all_segments)
+    
+    elif fusion_method == 'voting':
+        # Use majority voting: keep segments detected by at least n/2 detectors
+        n_detectors = len(all_detections)
+        threshold = n_detectors // 2 + 1
+        
+        # Create a voting map
+        if not all_detections or not all_detections[0]:
+            return []
+        
+        signal_length = max(end for detections in all_detections for _, end in detections) if any(all_detections) else 0
+        if signal_length == 0:
+            return []
+        
+        vote_map = np.zeros(signal_length, dtype=int)
+        
+        for detections in all_detections:
+            for start, end in detections:
+                vote_map[start:end] += 1
+        
+        # Find regions with enough votes
+        above_threshold = vote_map >= threshold
+        
+        # Find transitions
+        diff = np.diff(above_threshold.astype(int))
+        starts = np.where(diff == 1)[0] + 1
+        ends = np.where(diff == -1)[0] + 1
+        
+        # Handle edge cases
+        if above_threshold[0]:
+            starts = np.concatenate([[0], starts])
+        if above_threshold[-1]:
+            ends = np.concatenate([ends, [len(above_threshold)]])
+        
+        segments = [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= min_samples]
+        return segments
+    
+    elif fusion_method == 'confidence':
+        # Confidence-weighted fusion: weight each detector's contribution by confidence
+        if not all_detections or not all_detections[0]:
+            return []
+        
+        signal_length = max(end for detections in all_detections for _, end in detections) if any(all_detections) else 0
+        if signal_length == 0:
+            return []
+        
+        confidence_map = np.zeros(signal_length, dtype=float)
+        
+        for detections, confidences in zip(all_detections, detector_confidences):
+            for (start, end), conf in zip(detections, confidences):
+                confidence_map[start:end] += conf
+        
+        # Normalize by number of detectors
+        confidence_map /= len(all_detections)
+        
+        # Use adaptive threshold based on confidence distribution
+        threshold = np.percentile(confidence_map[confidence_map > 0], 50) if np.any(confidence_map > 0) else 0.5
+        
+        # Find regions above threshold
+        above_threshold = confidence_map >= threshold
+        
+        # Find transitions
+        diff = np.diff(above_threshold.astype(int))
+        starts = np.where(diff == 1)[0] + 1
+        ends = np.where(diff == -1)[0] + 1
+        
+        # Handle edge cases
+        if above_threshold[0]:
+            starts = np.concatenate([[0], starts])
+        if above_threshold[-1]:
+            ends = np.concatenate([ends, [len(above_threshold)]])
+        
+        segments = [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= min_samples]
+        return segments
+    
+    else:
+        raise ValueError(f"Unknown fusion method: {fusion_method}")
+
+
+def _merge_dense_events(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    fs: float,
+    min_samples: int
+) -> List[Tuple[int, int]]:
+    """
+    Intelligently merge events with gaps < 50ms (dense events).
+    
+    This prevents over-segmentation in rhythmic or rapid muscle activity.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segments : List[Tuple[int, int]]
+        Detected segments
+    fs : float
+        Sampling frequency
+    min_samples : int
+        Minimum segment size
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Merged segments
+    """
+    if len(segments) <= 1:
+        return segments
+    
+    # 50ms in samples
+    merge_threshold = int(0.05 * fs)
+    
+    merged = []
+    i = 0
+    
+    while i < len(segments):
+        current_start, current_end = segments[i]
+        
+        # Try to merge with next segments
+        while i + 1 < len(segments):
+            next_start, next_end = segments[i + 1]
+            gap = next_start - current_end
+            
+            if gap < merge_threshold:
+                # Merge: extend current segment to include next
+                current_end = next_end
+                i += 1
+            else:
+                break
+        
+        # Add merged segment if it meets minimum duration
+        if current_end - current_start >= min_samples:
+            merged.append((current_start, current_end))
+        
+        i += 1
+    
+    return merged
+
+
+# ============================================================================
+# Legacy functions (kept for compatibility and helper functions)
+# ============================================================================
 
 
 def _detect_ruptures(
