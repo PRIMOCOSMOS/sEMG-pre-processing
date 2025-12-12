@@ -160,16 +160,64 @@ def _detect_ruptures(
     return segments
 
 
+def _calculate_adaptive_threshold(
+    data: np.ndarray,
+    envelope: np.ndarray,
+    sensitivity: float = 1.5
+) -> float:
+    """
+    Calculate adaptive threshold based on signal characteristics.
+    
+    This function analyzes the signal to determine appropriate threshold
+    that works for both high and low amplitude sEMG recordings.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    envelope : np.ndarray
+        RMS envelope of signal
+    sensitivity : float
+        Sensitivity multiplier (lower = more sensitive, default: 1.5)
+    
+    Returns:
+    --------
+    float
+        Adaptive threshold value
+    """
+    # Calculate signal statistics
+    signal_rms = np.sqrt(np.mean(data ** 2))
+    envelope_mean = np.mean(envelope)
+    envelope_std = np.std(envelope)
+    envelope_percentiles = np.percentile(envelope, [25, 50, 75, 90])
+    
+    # For very low amplitude signals, use percentile-based threshold
+    if signal_rms < 0.01 * np.max(np.abs(data)):
+        # Use 50th percentile + sensitivity factor
+        threshold = envelope_percentiles[1] + sensitivity * 0.5 * envelope_std
+    else:
+        # For normal amplitude signals, use mean + sensitivity * std
+        # Lower base multiplier from 2.0 to 1.5 for easier event recognition
+        base_multiplier = 1.0 + (sensitivity - 1.0) * 0.5
+        threshold = envelope_mean + base_multiplier * envelope_std
+    
+    # Ensure threshold is not too low (prevents noise detection)
+    min_threshold = 0.1 * envelope_percentiles[2]  # At least 10% of 75th percentile
+    threshold = max(threshold, min_threshold)
+    
+    return threshold
+
+
 def _detect_amplitude(
     data: np.ndarray,
     fs: float,
     threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
-    sensitivity: float = 2.0
+    sensitivity: float = 1.5
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity based on amplitude threshold.
+    Detect muscle activity based on amplitude threshold with adaptive mechanisms.
     
     Parameters:
     -----------
@@ -178,19 +226,24 @@ def _detect_amplitude(
     fs : float
         Sampling frequency
     threshold : float, optional
-        Amplitude threshold (default: calculated from RMS and sensitivity)
+        Amplitude threshold (default: calculated adaptively from signal characteristics)
     window_size : int, optional
         Window size for envelope calculation
     min_duration : float
         Minimum activity duration in seconds
     sensitivity : float
-        Sensitivity multiplier for threshold (lower = more sensitive, default: 2.0)
+        Sensitivity multiplier for threshold (lower = more sensitive, default: 1.5)
         Range: 0.5 (very sensitive) to 5.0 (very strict)
     
     Returns:
     --------
     List[Tuple[int, int]]
         Detected activity periods
+        
+    Notes:
+    ------
+    Default sensitivity lowered from 2.0 to 1.5 to make event recognition easier.
+    Adaptive threshold mechanism adjusts automatically for different signal amplitudes.
     """
     if window_size is None:
         window_size = int(fs / 10)  # Default: 0.1 seconds
@@ -198,11 +251,9 @@ def _detect_amplitude(
     # Calculate envelope using RMS (Root Mean Square)
     envelope = _calculate_rms_envelope(data, window_size)
     
-    # Auto-calculate threshold if not provided
+    # Auto-calculate threshold if not provided using adaptive mechanism
     if threshold is None:
-        # Use sensitivity * RMS value of the signal as threshold
-        # Lower sensitivity = lower threshold = more segments detected
-        threshold = sensitivity * np.sqrt(np.mean(data ** 2))
+        threshold = _calculate_adaptive_threshold(data, envelope, sensitivity)
     
     # Find regions above threshold
     above_threshold = envelope > threshold
@@ -274,7 +325,7 @@ def _detect_combined(
     min_duration : float
         Minimum activity duration in seconds (optimization constraint)
     sensitivity : float
-        Detection sensitivity (lower = more sensitive, default: 2.0)
+        Detection sensitivity (lower = more sensitive, default: 1.5)
         Affects candidate generation and scoring
     **kwargs : dict
         Additional arguments for ruptures (model, pen, min_size)
@@ -297,6 +348,10 @@ def _detect_combined(
     
     # Calculate RMS envelope for quality assessment
     rms_envelope = _calculate_rms_envelope(data, window_size)
+    
+    # Use adaptive threshold for amplitude-based detection
+    if amplitude_threshold is None:
+        amplitude_threshold = _calculate_adaptive_threshold(data, rms_envelope, sensitivity)
     
     # Filter kwargs to only pass valid ruptures parameters
     valid_ruptures_params = {'model', 'pen', 'min_size'}
@@ -895,7 +950,8 @@ def _detect_amplitude_trends(
     
     # Adaptive threshold: regions where envelope exceeds local baseline
     # Lower sensitivity = more sensitive to small changes
-    threshold_multiplier = 0.5 + (sensitivity - 1.0) * 0.3  # Range: 0.5 to 1.1
+    # Adjusted multiplier for better low-amplitude detection
+    threshold_multiplier = 0.4 + (sensitivity - 1.0) * 0.25  # Range: 0.4 to 1.0
     adaptive_threshold = local_mean + threshold_multiplier * local_std
     
     # Detect regions above adaptive threshold
@@ -1117,9 +1173,10 @@ def _score_segmentation_scheme(
             consistency_score = 0.0
         
         # Metric 2: Duration reasonableness
-        # Ideal duration range: 0.5 to 5 seconds for typical muscle contractions
+        # Ideal duration range: 0.3 to 5 seconds for typical muscle contractions
+        # Lowered minimum from 0.5 to 0.3 for more flexible event recognition
         duration_seconds = segment_length / fs
-        ideal_duration_range = (0.5, 5.0)
+        ideal_duration_range = (0.3, 5.0)
         
         if ideal_duration_range[0] <= duration_seconds <= ideal_duration_range[1]:
             duration_score = 10.0

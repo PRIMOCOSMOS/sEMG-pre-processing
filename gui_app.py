@@ -1713,11 +1713,11 @@ def create_gui():
                                     value="multi_feature",
                                     label="Detection Method"
                                 )
-                                min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
+                                min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                               label="Minimum segment duration (s)")
                                 max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
                                                               label="Maximum segment duration (s, 0=no limit)")
-                                sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
+                                sensitivity_input = gr.Slider(0.1, 3.0, value=1.5, step=0.1,
                                                              label="Detection Sensitivity")
                                 clustering_input = gr.Checkbox(value=True, label="Use clustering")
                                 adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
@@ -1744,11 +1744,11 @@ def create_gui():
                                     value="multi_feature",
                                     label="Detection Method"
                                 )
-                                batch_min_duration_input = gr.Slider(0.05, 1.0, value=0.1, step=0.05,
+                                batch_min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                                     label="Minimum segment duration (s)")
                                 batch_max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
                                                                     label="Maximum segment duration (s, 0=no limit)")
-                                batch_sensitivity_input = gr.Slider(0.1, 3.0, value=1.0, step=0.1,
+                                batch_sensitivity_input = gr.Slider(0.1, 3.0, value=1.5, step=0.1,
                                                                    label="Detection Sensitivity")
                                 batch_clustering_input = gr.Checkbox(value=True, label="Use clustering")
                                 batch_adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
