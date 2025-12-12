@@ -12,6 +12,7 @@ import numpy as np
 import ruptures as rpt
 from typing import List, Tuple, Optional, Dict, Union
 from scipy import signal as scipy_signal
+from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
@@ -23,6 +24,7 @@ def detect_muscle_activity(
     amplitude_threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
+    max_duration: Optional[float] = None,
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
@@ -45,6 +47,9 @@ def detect_muscle_activity(
         Window size for feature calculation (default: fs/10)
     min_duration : float, optional
         Minimum duration of muscle activity in seconds (default: 0.1)
+    max_duration : float, optional
+        Maximum duration of muscle activity in seconds (default: None = no limit)
+        Long segments exceeding this duration will be split using internal change detection
     **kwargs : dict
         Additional arguments:
         - For ruptures: model, pen, min_size
@@ -61,6 +66,7 @@ def detect_muscle_activity(
     - 'combined' method provides good balance of speed and accuracy
     - Data should be preprocessed (filtered) before detection
     - Adjust amplitude_threshold based on signal characteristics
+    - max_duration helps split overly long segments into more meaningful motion periods
     """
     # Define valid parameters for each method to prevent TypeError
     ruptures_params = {'model', 'pen', 'min_size'}
@@ -70,22 +76,28 @@ def detect_muscle_activity(
     if method == "ruptures":
         # Filter kwargs to only valid ruptures parameters
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
-        return _detect_ruptures(data, fs, **filtered_kwargs)
+        segments = _detect_ruptures(data, fs, **filtered_kwargs)
     elif method == "amplitude":
         # Amplitude method uses sensitivity from kwargs if provided
         sensitivity = kwargs.get('sensitivity', 2.0)
-        return _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
+        segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
     elif method == "combined":
         # Filter kwargs to only valid ruptures parameters for combined
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in ruptures_params}
         sensitivity = kwargs.get('sensitivity', 2.0)
-        return _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
+        segments = _detect_combined(data, fs, amplitude_threshold, window_size, min_duration, sensitivity, **filtered_kwargs)
     elif method == "multi_feature":
         # Filter kwargs to only valid multi_feature parameters
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in multi_feature_params}
-        return _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
+        segments = _detect_multi_feature(data, fs, window_size, min_duration, **filtered_kwargs)
     else:
         raise ValueError(f"Unknown method: {method}. Use 'ruptures', 'amplitude', 'combined', or 'multi_feature'")
+    
+    # Apply max_duration splitting if specified
+    if max_duration is not None and max_duration > min_duration:
+        segments = _split_long_segments(data, segments, fs, min_duration, max_duration)
+    
+    return segments
 
 
 def _detect_ruptures(
@@ -148,16 +160,64 @@ def _detect_ruptures(
     return segments
 
 
+def _calculate_adaptive_threshold(
+    data: np.ndarray,
+    envelope: np.ndarray,
+    sensitivity: float = 1.5
+) -> float:
+    """
+    Calculate adaptive threshold based on signal characteristics.
+    
+    This function analyzes the signal to determine appropriate threshold
+    that works for both high and low amplitude sEMG recordings.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    envelope : np.ndarray
+        RMS envelope of signal
+    sensitivity : float
+        Sensitivity multiplier (lower = more sensitive, default: 1.5)
+    
+    Returns:
+    --------
+    float
+        Adaptive threshold value
+    """
+    # Calculate signal statistics
+    signal_rms = np.sqrt(np.mean(data ** 2))
+    envelope_mean = np.mean(envelope)
+    envelope_std = np.std(envelope)
+    envelope_percentiles = np.percentile(envelope, [25, 50, 75, 90])
+    
+    # For very low amplitude signals, use percentile-based threshold
+    if signal_rms < 0.01 * np.max(np.abs(data)):
+        # Use 50th percentile + sensitivity factor
+        threshold = envelope_percentiles[1] + sensitivity * 0.5 * envelope_std
+    else:
+        # For normal amplitude signals, use mean + sensitivity * std
+        # Lower base multiplier from 2.0 to 1.5 for easier event recognition
+        base_multiplier = 1.0 + (sensitivity - 1.0) * 0.5
+        threshold = envelope_mean + base_multiplier * envelope_std
+    
+    # Ensure threshold is not too low (prevents noise detection)
+    min_threshold = 0.1 * envelope_percentiles[2]  # At least 10% of 75th percentile
+    threshold = max(threshold, min_threshold)
+    
+    return threshold
+
+
 def _detect_amplitude(
     data: np.ndarray,
     fs: float,
     threshold: Optional[float] = None,
     window_size: Optional[int] = None,
     min_duration: float = 0.1,
-    sensitivity: float = 2.0
+    sensitivity: float = 1.5
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity based on amplitude threshold.
+    Detect muscle activity based on amplitude threshold with adaptive mechanisms.
     
     Parameters:
     -----------
@@ -166,19 +226,24 @@ def _detect_amplitude(
     fs : float
         Sampling frequency
     threshold : float, optional
-        Amplitude threshold (default: calculated from RMS and sensitivity)
+        Amplitude threshold (default: calculated adaptively from signal characteristics)
     window_size : int, optional
         Window size for envelope calculation
     min_duration : float
         Minimum activity duration in seconds
     sensitivity : float
-        Sensitivity multiplier for threshold (lower = more sensitive, default: 2.0)
+        Sensitivity multiplier for threshold (lower = more sensitive, default: 1.5)
         Range: 0.5 (very sensitive) to 5.0 (very strict)
     
     Returns:
     --------
     List[Tuple[int, int]]
         Detected activity periods
+        
+    Notes:
+    ------
+    Default sensitivity lowered from 2.0 to 1.5 to make event recognition easier.
+    Adaptive threshold mechanism adjusts automatically for different signal amplitudes.
     """
     if window_size is None:
         window_size = int(fs / 10)  # Default: 0.1 seconds
@@ -186,11 +251,9 @@ def _detect_amplitude(
     # Calculate envelope using RMS (Root Mean Square)
     envelope = _calculate_rms_envelope(data, window_size)
     
-    # Auto-calculate threshold if not provided
+    # Auto-calculate threshold if not provided using adaptive mechanism
     if threshold is None:
-        # Use sensitivity * RMS value of the signal as threshold
-        # Lower sensitivity = lower threshold = more segments detected
-        threshold = sensitivity * np.sqrt(np.mean(data ** 2))
+        threshold = _calculate_adaptive_threshold(data, envelope, sensitivity)
     
     # Find regions above threshold
     above_threshold = envelope > threshold
@@ -226,10 +289,33 @@ def _detect_combined(
     **kwargs
 ) -> List[Tuple[int, int]]:
     """
-    Detect muscle activity using combined ruptures and amplitude approach.
+    Detect muscle activity events using two-stage amplitude-first approach.
     
-    This method first uses ruptures to detect potential change points,
-    then uses amplitude analysis to refine the detection.
+    **TWO-STAGE DETECTION ALGORITHM:**
+    
+    **Stage 1 - Event Presence Detection (Amplitude-Weighted):**
+    Primary reliance on amplitude to determine IF events exist. This reduces missed
+    events by using a liberal amplitude-based initial detection.
+    
+    **Stage 2 - Boundary Refinement (Multi-Factor):**
+    Once event presence is confirmed, use ruptures and other quality metrics to
+    determine precise WHERE events start and end.
+    
+    **Key Improvements:**
+    - Amplitude gets 70% weight in presence detection (vs 35% in confidence scoring)
+    - Significantly lowered detection thresholds to catch more events
+    - Separate presence detection from boundary determination
+    - Ensures no event overlaps
+    - Strict enforcement of min/max duration constraints
+    
+    **Algorithm Flow:**
+    1. Calculate adaptive amplitude threshold based on signal statistics
+    2. Identify ALL regions exceeding amplitude threshold (candidate events)
+    3. For each candidate: calculate confidence score (amplitude-weighted 70%)
+    4. Accept candidates meeting lowered confidence threshold (0.25-0.40 range)
+    5. Refine boundaries using ruptures and local minima for precise start/end
+    6. Merge similar nearby events while respecting min_duration
+    7. Final filtering ensures no overlaps and duration constraints met
     
     Parameters:
     -----------
@@ -238,52 +324,150 @@ def _detect_combined(
     fs : float
         Sampling frequency
     amplitude_threshold : float, optional
-        Amplitude threshold
+        Amplitude threshold (auto-calculated if None)
     window_size : int, optional
         Window size for envelope calculation
     min_duration : float
-        Minimum activity duration in seconds
+        Minimum activity duration in seconds (HARD CONSTRAINT - strictly enforced)
+        No segment shorter than this will ever be produced
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive, default: 1.5)
+        Affects amplitude threshold and confidence threshold
     **kwargs : dict
         Additional arguments for ruptures (model, pen, min_size)
-        Note: use_clustering and adaptive_pen are ignored for this method
     
     Returns:
     --------
     List[Tuple[int, int]]
-        Detected activity periods
+        Detected activity events with non-overlapping segments
+        ALL segments guaranteed to be >= min_duration
+        
+    Notes:
+    ------
+    This two-stage approach significantly reduces missed events by prioritizing
+    amplitude for presence detection, then using multi-factor analysis for precise
+    boundary determination. Duration constraints are absolute hard limits.
     """
-    # Filter kwargs to only pass valid ruptures parameters
+    if window_size is None:
+        window_size = int(fs / 10)
+    
+    min_samples = int(min_duration * fs)
+    
+    # Calculate RMS envelope for all stages
+    rms_envelope = _calculate_rms_envelope(data, window_size)
+    
+    # Use adaptive threshold for amplitude-based detection (liberal for Stage 1)
+    if amplitude_threshold is None:
+        amplitude_threshold = _calculate_adaptive_threshold(data, rms_envelope, sensitivity)
+    
+    # Lower the threshold further to catch more events in Stage 1
+    # This reduces missed events by being more aggressive initially
+    amplitude_threshold *= 0.8  # 20% lower threshold for presence detection
+    
+    # ===========================================
+    # === STAGE 1: EVENT PRESENCE DETECTION ===
+    # ===========================================
+    #
+    # Goal: Identify ALL regions where muscle activity MIGHT exist
+    # Strategy: Liberal amplitude-based detection with lowered thresholds
+    
+    # Find all regions where RMS exceeds the lowered amplitude threshold
+    above_threshold = rms_envelope > amplitude_threshold
+    
+    # Find transitions
+    diff = np.diff(above_threshold.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases
+    if above_threshold[0]:
+        starts = np.concatenate([[0], starts])
+    if above_threshold[-1]:
+        ends = np.concatenate([ends, [len(above_threshold)]])
+    
+    # Generate candidate event regions (liberal, may include false positives)
+    candidate_regions = []
+    for start, end in zip(starts, ends):
+        if end - start >= min_samples:  # Respect minimum duration
+            candidate_regions.append((int(start), int(end)))
+    
+    if not candidate_regions:
+        return []  # No activity detected
+    
+    # For each candidate region, calculate confidence score (amplitude-weighted 70%)
+    # Lowered confidence threshold: 0.25 to 0.40 (vs previous 0.30 to 0.50)
+    confidence_threshold = 0.25 + (sensitivity - 1.0) * 0.075  # Range: 0.25 to 0.40
+    
+    confirmed_events = []
+    for region in candidate_regions:
+        # Calculate confidence with HIGH weight on amplitude
+        confidence = _calculate_event_presence_confidence(
+            data, region, rms_envelope, fs, amplitude_threshold
+        )
+        
+        if confidence >= confidence_threshold:
+            confirmed_events.append(region)
+    
+    if not confirmed_events:
+        return []  # No confident events found
+    
+    # ===============================================
+    # === STAGE 2: BOUNDARY REFINEMENT ===
+    # ===============================================
+    #
+    # Goal: Determine precise start/end points for confirmed events
+    # Strategy: Use ruptures and quality metrics to refine boundaries
+    
+    # Prepare ruptures parameters
     valid_ruptures_params = {'model', 'pen', 'min_size'}
     ruptures_kwargs = {k: v for k, v in kwargs.items() if k in valid_ruptures_params}
     
-    # Get segments from both methods
-    ruptures_segments = _detect_ruptures(data, fs, **ruptures_kwargs)
-    amplitude_segments = _detect_amplitude(data, fs, amplitude_threshold, window_size, min_duration, sensitivity)
+    if 'pen' not in ruptures_kwargs:
+        ruptures_kwargs['pen'] = 3.0 * sensitivity / 2.0
     
-    # Combine segments by finding overlaps
-    combined_segments = []
+    refined_events = []
     
-    for r_start, r_end in ruptures_segments:
-        for a_start, a_end in amplitude_segments:
-            # Check for overlap
-            overlap_start = max(r_start, a_start)
-            overlap_end = min(r_end, a_end)
+    for event in confirmed_events:
+        start, end = event
+        event_data = data[start:end]
+        event_rms = rms_envelope[start:end]
+        
+        # Use ruptures to find internal structure and refine boundaries
+        try:
+            # Apply ruptures within this event region
+            algo = rpt.Pelt(**ruptures_kwargs)
+            algo.fit(event_data)
+            internal_breaks = algo.predict(pen=ruptures_kwargs.get('pen', 3.0))
             
-            if overlap_start < overlap_end:
-                # There is overlap, merge the segments
-                merged_start = min(r_start, a_start)
-                merged_end = max(r_end, a_end)
-                combined_segments.append((merged_start, merged_end))
+            # Use breaks to find the most coherent sub-segment
+            # Or refine boundaries to local minima
+            refined_start, refined_end = _refine_event_boundaries_with_ruptures(
+                event_data, event_rms, internal_breaks, start, end, min_samples
+            )
+            
+            refined_events.append((refined_start, refined_end))
+        except:
+            # If ruptures fails, use local minima to refine boundaries
+            refined_start = start + np.argmin(event_rms[:len(event_rms)//4])  # First quarter
+            refined_end = start + len(event_rms)//4*3 + np.argmin(event_rms[len(event_rms)//4*3:])  # Last quarter
+            
+            if refined_end - refined_start >= min_samples:
+                refined_events.append((refined_start, refined_end))
+            else:
+                refined_events.append((start, end))  # Keep original if refinement too short
     
-    # Merge overlapping segments in combined list
-    if combined_segments:
-        combined_segments = _merge_overlapping_segments(combined_segments)
+    # Merge nearby similar events while respecting min_duration
+    merged_events = _merge_similar_events(
+        data, refined_events, rms_envelope, fs, min_duration
+    )
     
-    # If no combined segments found, use amplitude detection as fallback
-    if not combined_segments:
-        combined_segments = amplitude_segments
+    # Ensure no overlaps (critical requirement)
+    non_overlapping_events = _remove_overlaps(merged_events, min_samples)
     
-    return combined_segments
+    # FINAL HARD FILTER: Absolutely ensure no segment violates min_duration
+    final_events = [(s, e) for s, e in non_overlapping_events if (e - s) >= min_samples]
+    
+    return final_events
 
 
 def _calculate_rms_envelope(data: np.ndarray, window_size: int) -> np.ndarray:
@@ -691,3 +875,904 @@ def _filter_segments_by_clustering(
                         if label == activity_cluster]
     
     return activity_segments
+
+
+def _detect_rhythmic_patterns(
+    data: np.ndarray,
+    fs: float,
+    window_size: int,
+    min_duration: float,
+    sensitivity: float = 2.0
+) -> List[Tuple[int, int]]:
+    """
+    Detect rhythmic muscle activity patterns using local RMS variance analysis.
+    
+    This method is particularly sensitive to rhythmic outbursts with varying amplitude,
+    which are common in sEMG during repetitive movements.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for local analysis
+    min_duration : float
+        Minimum duration in seconds
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive)
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected rhythmic segments
+    """
+    # Calculate RMS envelope
+    rms_envelope = _calculate_rms_envelope(data, window_size)
+    
+    # Calculate local variance of RMS (captures rhythmicity)
+    rms_variance = _calculate_sliding_variance(rms_envelope, window_size)
+    
+    # Normalize variance
+    rms_variance_normalized = rms_variance / (np.mean(rms_variance) + 1e-10)
+    
+    # Adaptive threshold based on sensitivity
+    # Lower sensitivity -> lower threshold -> more segments
+    threshold = sensitivity * 0.5
+    
+    # Find regions with high RMS variance (rhythmic activity)
+    rhythmic_regions = rms_variance_normalized > threshold
+    
+    # Find transitions
+    diff = np.diff(rhythmic_regions.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases
+    if rhythmic_regions[0]:
+        starts = np.concatenate([[0], starts])
+    if rhythmic_regions[-1]:
+        ends = np.concatenate([ends, [len(rhythmic_regions)]])
+    
+    # Filter by minimum duration
+    min_samples = int(min_duration * fs)
+    segments = []
+    for start, end in zip(starts, ends):
+        if end - start >= min_samples:
+            segments.append((int(start), int(end)))
+    
+    return segments
+
+
+def _detect_amplitude_trends(
+    data: np.ndarray,
+    fs: float,
+    window_size: int,
+    min_duration: float,
+    sensitivity: float = 2.0
+) -> List[Tuple[int, int]]:
+    """
+    Detect low-amplitude outbursts using amplitude trend analysis.
+    
+    This method is designed to catch gradual amplitude increases that might
+    be missed by simple threshold-based detection, especially in rhythmic movements
+    where amplitude varies over time.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input signal
+    fs : float
+        Sampling frequency
+    window_size : int
+        Window size for trend calculation
+    min_duration : float
+        Minimum duration in seconds
+    sensitivity : float
+        Detection sensitivity (lower = more sensitive)
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Detected trend-based segments
+    """
+    # Calculate absolute amplitude envelope
+    abs_envelope = np.abs(data)
+    kernel = np.ones(window_size) / window_size
+    smoothed_envelope = np.convolve(abs_envelope, kernel, mode='same')
+    
+    # Calculate the gradient (rate of change) of the envelope
+    gradient = np.gradient(smoothed_envelope)
+    gradient_smoothed = np.convolve(gradient, kernel, mode='same')
+    
+    # Calculate local mean and std of the envelope for adaptive threshold
+    local_mean = np.convolve(smoothed_envelope, kernel, mode='same')
+    local_std = np.sqrt(np.convolve((smoothed_envelope - local_mean)**2, kernel, mode='same'))
+    
+    # Adaptive threshold: regions where envelope exceeds local baseline
+    # Lower sensitivity = more sensitive to small changes
+    # Adjusted multiplier for better low-amplitude detection
+    threshold_multiplier = 0.4 + (sensitivity - 1.0) * 0.25  # Range: 0.4 to 1.0
+    adaptive_threshold = local_mean + threshold_multiplier * local_std
+    
+    # Detect regions above adaptive threshold
+    above_threshold = smoothed_envelope > adaptive_threshold
+    
+    # Also consider regions with significant positive gradient (rising activity)
+    gradient_threshold = np.percentile(np.abs(gradient_smoothed), 60) / sensitivity
+    rising_activity = gradient_smoothed > gradient_threshold
+    
+    # Combine both criteria
+    activity_regions = above_threshold | rising_activity
+    
+    # Find transitions
+    diff = np.diff(activity_regions.astype(int))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    
+    # Handle edge cases
+    if activity_regions[0]:
+        starts = np.concatenate([[0], starts])
+    if activity_regions[-1]:
+        ends = np.concatenate([ends, [len(activity_regions)]])
+    
+    # Filter by minimum duration
+    min_samples = int(min_duration * fs)
+    segments = []
+    for start, end in zip(starts, ends):
+        if end - start >= min_samples:
+            segments.append((int(start), int(end)))
+    
+    return segments
+
+
+def _split_long_segments(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    fs: float,
+    min_duration: float,
+    max_duration: float
+) -> List[Tuple[int, int]]:
+    """
+    Split segments that exceed maximum duration using internal change detection.
+    
+    This function uses multiple criteria to split long segments:
+    1. Rupture-based change points within the segment
+    2. Local minima in RMS envelope (natural breaks)
+    3. Amplitude drops below local threshold
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segments : List[Tuple[int, int]]
+        Input segments
+    fs : float
+        Sampling frequency
+    min_duration : float
+        Minimum duration in seconds
+    max_duration : float
+        Maximum duration in seconds
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Split segments (all within max_duration)
+    """
+    max_samples = int(max_duration * fs)
+    min_samples = int(min_duration * fs)
+    split_segments = []
+    
+    for start, end in segments:
+        segment_length = end - start
+        
+        # If segment is within limit, keep as is
+        if segment_length <= max_samples:
+            split_segments.append((start, end))
+            continue
+        
+        # Segment is too long, need to split it
+        segment_data = data[start:end]
+        
+        # Method 1: Use ruptures to find internal change points
+        try:
+            data_2d = segment_data.reshape(-1, 1)
+            # Use lower penalty to detect more change points
+            algo = rpt.Pelt(model='l2', min_size=min_samples).fit(data_2d)
+            internal_cps = algo.predict(pen=1.5)
+            
+            # Remove last point if it's the end
+            if internal_cps and internal_cps[-1] == len(segment_data):
+                internal_cps = internal_cps[:-1]
+        except:
+            internal_cps = []
+        
+        # Method 2: Find local minima in RMS envelope as natural break points
+        window_size = int(fs / 10)
+        rms_envelope = _calculate_rms_envelope(segment_data, window_size)
+        
+        # Find local minima (potential breaks)
+        # Invert to find minima
+        peaks, _ = find_peaks(-rms_envelope, distance=min_samples, prominence=np.std(rms_envelope) * 0.3)
+        local_minima = peaks.tolist()
+        
+        # Method 3: Find amplitude drops
+        mean_rms = np.mean(rms_envelope)
+        std_rms = np.std(rms_envelope)
+        low_amplitude_threshold = mean_rms - 0.5 * std_rms
+        below_threshold = rms_envelope < low_amplitude_threshold
+        
+        # Find midpoints of low-amplitude regions as potential splits
+        diff = np.diff(below_threshold.astype(int))
+        low_amp_starts = np.where(diff == 1)[0] + 1
+        low_amp_ends = np.where(diff == -1)[0] + 1
+        
+        # Get midpoints of low-amplitude regions
+        amplitude_drops = []
+        for la_start, la_end in zip(low_amp_starts, low_amp_ends):
+            if la_end - la_start > min_samples // 2:  # Only consider significant drops
+                midpoint = (la_start + la_end) // 2
+                amplitude_drops.append(midpoint)
+        
+        # Combine all potential split points
+        all_split_points = sorted(set(internal_cps + local_minima + amplitude_drops))
+        
+        # Filter split points: must be at least min_samples apart
+        filtered_splits = []
+        last_split = 0
+        for sp in all_split_points:
+            if sp - last_split >= min_samples:
+                filtered_splits.append(sp)
+                last_split = sp
+        
+        # Create sub-segments
+        if filtered_splits:
+            sub_start = 0
+            for split_point in filtered_splits:
+                if split_point - sub_start >= min_samples:
+                    split_segments.append((start + sub_start, start + split_point))
+                    sub_start = split_point
+            
+            # Add final sub-segment
+            if len(segment_data) - sub_start >= min_samples:
+                split_segments.append((start + sub_start, end))
+        else:
+            # No good split points found, force split at max_duration intervals
+            num_splits = int(np.ceil(segment_length / max_samples))
+            split_size = segment_length // num_splits
+            
+            for i in range(num_splits):
+                sub_start = start + i * split_size
+                sub_end = start + (i + 1) * split_size if i < num_splits - 1 else end
+                if sub_end - sub_start >= min_samples:
+                    split_segments.append((sub_start, sub_end))
+    
+    return split_segments
+
+
+def _score_segmentation_scheme(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    rms_envelope: np.ndarray,
+    fs: float,
+    min_duration: float,
+    sensitivity: float
+) -> float:
+    """
+    Score a segmentation scheme based on event quality metrics.
+    
+    Scoring criteria:
+    1. RMS consistency within events (higher is better)
+    2. Boundary quality (clear amplitude drops between events)
+    3. Duration reasonableness (penalize too short/long events)
+    4. Transition sharpness (rapid changes at boundaries)
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segments : List[Tuple[int, int]]
+        Segmentation scheme to score
+    rms_envelope : np.ndarray
+        RMS envelope of signal
+    fs : float
+        Sampling frequency
+    min_duration : float
+        Minimum duration constraint (HARD LIMIT)
+    sensitivity : float
+        Sensitivity parameter
+    
+    Returns:
+    --------
+    float
+        Quality score (higher is better)
+        Returns -inf if ANY segment violates minimum duration
+    """
+    if not segments:
+        return -np.inf
+    
+    min_samples = int(min_duration * fs)
+    
+    # HARD CONSTRAINT: Reject ANY scheme with segments below min_duration
+    for start, end in segments:
+        if (end - start) < min_samples:
+            return -np.inf  # Completely reject this scheme
+    
+    total_score = 0.0
+    
+    for i, (start, end) in enumerate(segments):
+        segment_length = end - start
+        
+        segment_rms = rms_envelope[start:end]
+        
+        # Metric 1: RMS consistency within event (coefficient of variation)
+        # Lower CV = more consistent = better single event
+        mean_rms = np.mean(segment_rms)
+        std_rms = np.std(segment_rms)
+        if mean_rms > 1e-10:
+            cv = std_rms / mean_rms
+            consistency_score = 10.0 * (1.0 / (1.0 + cv))  # 0 to 10
+        else:
+            consistency_score = 0.0
+        
+        # Metric 2: Duration reasonableness
+        # Ideal duration range: 0.3 to 5 seconds for typical muscle contractions
+        # Lowered minimum from 0.5 to 0.3 for more flexible event recognition
+        duration_seconds = segment_length / fs
+        ideal_duration_range = (0.3, 5.0)
+        
+        if ideal_duration_range[0] <= duration_seconds <= ideal_duration_range[1]:
+            duration_score = 10.0
+        elif duration_seconds < ideal_duration_range[0]:
+            # Too short
+            ratio = duration_seconds / ideal_duration_range[0]
+            duration_score = 10.0 * ratio
+        else:
+            # Too long
+            ratio = ideal_duration_range[1] / duration_seconds
+            duration_score = 10.0 * ratio
+        
+        # Metric 3: Boundary quality (amplitude drop before/after)
+        boundary_score = 0.0
+        boundary_window = min(int(fs * 0.1), segment_length // 4)  # 100ms window
+        
+        # Check start boundary
+        if start > boundary_window:
+            before_rms = np.mean(rms_envelope[start - boundary_window:start])
+            event_start_rms = np.mean(segment_rms[:boundary_window])
+            if event_start_rms > before_rms:
+                boundary_score += 5.0 * (event_start_rms / (before_rms + 1e-10))
+        
+        # Check end boundary
+        if end + boundary_window < len(rms_envelope):
+            after_rms = np.mean(rms_envelope[end:end + boundary_window])
+            event_end_rms = np.mean(segment_rms[-boundary_window:])
+            if event_end_rms > after_rms:
+                boundary_score += 5.0 * (event_end_rms / (after_rms + 1e-10))
+        
+        boundary_score = min(boundary_score, 10.0)  # Cap at 10
+        
+        # Metric 4: Transition sharpness (rapid amplitude change at boundaries)
+        transition_score = 0.0
+        
+        # Start transition
+        if start + boundary_window < end:
+            start_gradient = np.abs(segment_rms[boundary_window] - segment_rms[0])
+            transition_score += min(start_gradient / (mean_rms + 1e-10) * 5.0, 5.0)
+        
+        # End transition
+        if end - boundary_window > start:
+            end_gradient = np.abs(segment_rms[-1] - segment_rms[-boundary_window])
+            transition_score += min(end_gradient / (mean_rms + 1e-10) * 5.0, 5.0)
+        
+        # Combine scores with weights
+        event_score = (
+            0.30 * consistency_score +
+            0.25 * duration_score +
+            0.25 * boundary_score +
+            0.20 * transition_score
+        )
+        
+        total_score += event_score
+    
+    # Normalize by number of segments to favor schemes with reasonable event counts
+    num_segments = len(segments)
+    if num_segments > 0:
+        avg_score = total_score / num_segments
+        
+        # Bonus for reasonable number of events (not too many, not too few)
+        signal_duration = len(data) / fs
+        expected_events = max(1, int(signal_duration / 2.0))  # Rough estimate
+        event_count_penalty = abs(num_segments - expected_events) * 0.5
+        
+        final_score = avg_score - event_count_penalty
+    else:
+        final_score = -np.inf
+    
+    return final_score
+
+
+def _refine_segments_by_amplitude(
+    segments: List[Tuple[int, int]],
+    rms_envelope: np.ndarray,
+    min_samples: int,
+    sensitivity: float
+) -> List[Tuple[int, int]]:
+    """
+    Refine ruptures-based segments using amplitude information.
+    
+    Splits segments at points where amplitude drops significantly,
+    indicating potential event boundaries.
+    """
+    refined = []
+    threshold_factor = 0.7  # 70% of mean RMS
+    
+    for start, end in segments:
+        segment_rms = rms_envelope[start:end]
+        mean_rms = np.mean(segment_rms)
+        threshold = mean_rms * threshold_factor
+        
+        # Find points below threshold
+        below = segment_rms < threshold
+        
+        # Find transitions
+        diff = np.diff(below.astype(int))
+        drop_starts = np.where(diff == 1)[0] + 1
+        drop_ends = np.where(diff == -1)[0] + 1
+        
+        # Use significant drops as split points
+        split_points = []
+        for ds, de in zip(drop_starts, drop_ends):
+            if de - ds > min_samples // 4:  # Significant drop
+                midpoint = (ds + de) // 2
+                split_points.append(start + midpoint)
+        
+        # Create sub-segments
+        if split_points:
+            sub_start = start
+            for sp in split_points:
+                if sp - sub_start >= min_samples:
+                    refined.append((sub_start, sp))
+                    sub_start = sp
+            
+            if end - sub_start >= min_samples:
+                refined.append((sub_start, end))
+        else:
+            refined.append((start, end))
+    
+    return refined
+
+
+def _refine_segments_by_ruptures(
+    segments: List[Tuple[int, int]],
+    data: np.ndarray,
+    fs: float,
+    min_samples: int,
+    ruptures_kwargs: dict
+) -> List[Tuple[int, int]]:
+    """
+    Refine amplitude-based segments using rupture detection.
+    
+    Applies ruptures within each amplitude segment to find internal
+    change points that may indicate separate events.
+    """
+    refined = []
+    
+    for start, end in segments:
+        segment_data = data[start:end]
+        
+        if len(segment_data) < 2 * min_samples:
+            refined.append((start, end))
+            continue
+        
+        # Apply ruptures within segment
+        try:
+            data_2d = segment_data.reshape(-1, 1)
+            algo = rpt.Pelt(model='l2', min_size=min_samples // 2).fit(data_2d)
+            internal_cps = algo.predict(pen=2.0)
+            
+            if internal_cps and internal_cps[-1] == len(segment_data):
+                internal_cps = internal_cps[:-1]
+            
+            if internal_cps:
+                sub_start = 0
+                for cp in internal_cps:
+                    if cp - sub_start >= min_samples:
+                        refined.append((start + sub_start, start + cp))
+                        sub_start = cp
+                
+                if len(segment_data) - sub_start >= min_samples:
+                    refined.append((start + sub_start, end))
+            else:
+                refined.append((start, end))
+        except:
+            refined.append((start, end))
+    
+    return refined
+
+
+def _refine_event_boundaries(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    rms_envelope: np.ndarray,
+    min_samples: int
+) -> List[Tuple[int, int]]:
+    """
+    Refine event boundaries to better align with amplitude changes.
+    
+    Adjusts segment start/end points to local minima in RMS envelope
+    for cleaner event separation.
+    """
+    refined = []
+    search_window = min(min_samples // 2, 50)  # Search within this range
+    
+    for start, end in segments:
+        new_start = start
+        new_end = end
+        
+        # Refine start boundary
+        if start > search_window:
+            search_region = rms_envelope[start - search_window:start + search_window]
+            local_min_idx = np.argmin(search_region)
+            new_start = start - search_window + local_min_idx
+        
+        # Refine end boundary
+        if end + search_window < len(rms_envelope):
+            search_region = rms_envelope[end - search_window:end + search_window]
+            local_min_idx = np.argmin(search_region)
+            new_end = end - search_window + local_min_idx
+        
+        # Ensure minimum duration is maintained
+        if new_end - new_start >= min_samples:
+            refined.append((new_start, new_end))
+        else:
+            refined.append((start, end))  # Keep original if refinement violates constraint
+    
+    return refined
+
+
+def _merge_similar_events(
+    data: np.ndarray,
+    segments: List[Tuple[int, int]],
+    rms_envelope: np.ndarray,
+    fs: float,
+    min_duration: float
+) -> List[Tuple[int, int]]:
+    """
+    Merge adjacent events that are likely part of the same activity.
+    
+    Criteria for merging:
+    1. Short gap between events (< 200ms)
+    2. Similar amplitude levels
+    3. Gap amplitude is significant (not complete rest)
+    """
+    if len(segments) <= 1:
+        return segments
+    
+    merged = []
+    i = 0
+    max_gap_samples = int(fs * 0.2)  # 200ms max gap for merging
+    
+    while i < len(segments):
+        current_start, current_end = segments[i]
+        
+        # Try to merge with next segment
+        while i + 1 < len(segments):
+            next_start, next_end = segments[i + 1]
+            gap = next_start - current_end
+            
+            # Check if should merge
+            should_merge = False
+            
+            if gap <= max_gap_samples:
+                # Gap is small
+                current_rms = np.mean(rms_envelope[current_start:current_end])
+                next_rms = np.mean(rms_envelope[next_start:next_end])
+                gap_rms = np.mean(rms_envelope[current_end:next_start])
+                
+                # Merge if amplitudes are similar and gap is not complete rest
+                amplitude_similar = abs(current_rms - next_rms) / (current_rms + 1e-10) < 0.5
+                gap_significant = gap_rms > 0.3 * min(current_rms, next_rms)
+                
+                if amplitude_similar and gap_significant:
+                    should_merge = True
+            
+            if should_merge:
+                # Merge by extending current segment
+                current_end = next_end
+                i += 1
+            else:
+                break
+        
+        merged.append((current_start, current_end))
+        i += 1
+    
+    # HARD FILTER: Ensure no merged segment violates min_duration
+    min_samples = int(min_duration * fs)
+    merged = [(s, e) for s, e in merged if (e - s) >= min_samples]
+    
+    return merged
+
+
+def _calculate_event_confidence(
+    data: np.ndarray,
+    segment: Tuple[int, int],
+    rms_envelope: np.ndarray,
+    fs: float,
+    sensitivity: float
+) -> float:
+    """
+    Calculate confidence score for a potential muscle activity event.
+    
+    Confidence is based on multiple criteria:
+    1. Amplitude elevation above baseline
+    2. Signal consistency within event (low variance = good)
+    3. Boundary sharpness (clear transitions)
+    4. Duration reasonableness for physiological events
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    segment : Tuple[int, int]
+        Event segment (start, end)
+    rms_envelope : np.ndarray
+        RMS envelope
+    fs : float
+        Sampling frequency
+    sensitivity : float
+        Sensitivity parameter (affects confidence threshold)
+    
+    Returns:
+    --------
+    float
+        Confidence score (0 to 1, higher = more confident this is a real event)
+    """
+    start, end = segment
+    segment_length = end - start
+    
+    if segment_length == 0:
+        return 0.0
+    
+    segment_rms = rms_envelope[start:end]
+    mean_rms = np.mean(segment_rms)
+    
+    # Criterion 1: Amplitude elevation (how much above baseline)
+    # Compare to surrounding regions
+    window = min(segment_length, int(fs * 0.5))  # 500ms context
+    
+    baseline_rms = 0.0
+    baseline_count = 0
+    
+    if start >= window:
+        baseline_rms += np.mean(rms_envelope[start - window:start])
+        baseline_count += 1
+    if end + window < len(rms_envelope):
+        baseline_rms += np.mean(rms_envelope[end:end + window])
+        baseline_count += 1
+    
+    if baseline_count > 0:
+        baseline_rms /= baseline_count
+        amplitude_elevation = (mean_rms - baseline_rms) / (baseline_rms + 1e-10)
+        amplitude_score = min(1.0, amplitude_elevation / 2.0)  # Normalize to 0-1
+    else:
+        amplitude_score = 0.5  # No baseline, moderate confidence
+    
+    # Criterion 2: Consistency (low variance within event)
+    std_rms = np.std(segment_rms)
+    cv = std_rms / (mean_rms + 1e-10)
+    consistency_score = 1.0 / (1.0 + cv)  # Lower CV = higher score
+    
+    # Criterion 3: Boundary sharpness
+    # Check for sharp transitions at start and end
+    boundary_window = min(int(fs * 0.05), segment_length // 4)  # 50ms
+    
+    start_sharpness = 0.5
+    end_sharpness = 0.5
+    
+    if start >= boundary_window:
+        before_start = np.mean(rms_envelope[start - boundary_window:start])
+        after_start = np.mean(segment_rms[:boundary_window])
+        start_sharpness = min(1.0, (after_start - before_start) / (before_start + 1e-10) / 2.0)
+    
+    if end + boundary_window < len(rms_envelope):
+        before_end = np.mean(segment_rms[-boundary_window:])
+        after_end = np.mean(rms_envelope[end:end + boundary_window])
+        end_sharpness = min(1.0, (before_end - after_end) / (after_end + 1e-10) / 2.0)
+    
+    boundary_score = (start_sharpness + end_sharpness) / 2.0
+    
+    # Criterion 4: Duration reasonableness
+    # Typical muscle contraction: 0.3-5 seconds
+    duration_seconds = segment_length / fs
+    if 0.3 <= duration_seconds <= 5.0:
+        duration_score = 1.0
+    elif duration_seconds < 0.3:
+        duration_score = duration_seconds / 0.3
+    else:
+        duration_score = 5.0 / duration_seconds
+    
+    # Weighted combination
+    confidence = (
+        0.35 * amplitude_score +
+        0.30 * consistency_score +
+        0.20 * boundary_score +
+        0.15 * duration_score
+    )
+    
+    return confidence
+
+
+def _calculate_event_presence_confidence(
+    data: np.ndarray,
+    region: Tuple[int, int],
+    rms_envelope: np.ndarray,
+    fs: float,
+    amplitude_threshold: float
+) -> float:
+    """
+    Calculate confidence score for event PRESENCE (Stage 1).
+    
+    This function emphasizes amplitude (70% weight) to determine if an event
+    likely exists in the given region. Other factors are secondary.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Original signal
+    region : Tuple[int, int]
+        Candidate event region (start, end)
+    rms_envelope : np.ndarray
+        RMS envelope
+    fs : float
+        Sampling frequency
+    amplitude_threshold : float
+        Amplitude threshold used for detection
+    
+    Returns:
+    --------
+    float
+        Presence confidence score (0 to 1, higher = more likely a real event)
+    """
+    start, end = region
+    region_length = end - start
+    
+    if region_length == 0:
+        return 0.0
+    
+    region_rms = rms_envelope[start:end]
+    mean_rms = np.mean(region_rms)
+    
+    # PRIMARY CRITERION (70%): Amplitude elevation
+    # How much above the detection threshold
+    amplitude_ratio = mean_rms / (amplitude_threshold + 1e-10)
+    amplitude_score = min(1.0, amplitude_ratio / 2.0)  # Normalize: 2x threshold = perfect
+    
+    # SECONDARY CRITERION (20%): Signal consistency
+    std_rms = np.std(region_rms)
+    cv = std_rms / (mean_rms + 1e-10)
+    consistency_score = 1.0 / (1.0 + cv)
+    
+    # TERTIARY CRITERION (10%): Duration reasonableness
+    duration_seconds = region_length / fs
+    if 0.3 <= duration_seconds <= 5.0:
+        duration_score = 1.0
+    elif duration_seconds < 0.3:
+        duration_score = duration_seconds / 0.3
+    else:
+        duration_score = 5.0 / duration_seconds
+    
+    # Weighted combination - HEAVILY weighted toward amplitude
+    confidence = (
+        0.70 * amplitude_score +      # PRIMARY: amplitude determines presence
+        0.20 * consistency_score +     # SECONDARY: consistency support
+        0.10 * duration_score          # TERTIARY: duration check
+    )
+    
+    return confidence
+
+
+def _refine_event_boundaries_with_ruptures(
+    event_data: np.ndarray,
+    event_rms: np.ndarray,
+    internal_breaks: List[int],
+    global_start: int,
+    global_end: int,
+    min_samples: int
+) -> Tuple[int, int]:
+    """
+    Refine event boundaries using ruptures internal structure.
+    
+    Parameters:
+    -----------
+    event_data : np.ndarray
+        Signal data for this event
+    event_rms : np.ndarray
+        RMS envelope for this event
+    internal_breaks : List[int]
+        Break points from ruptures within event
+    global_start : int
+        Global start index of event
+    global_end : int
+        Global end index of event
+    min_samples : int
+        Minimum samples for valid segment
+    
+    Returns:
+    --------
+    Tuple[int, int]
+        Refined (start, end) indices in global coordinates
+    """
+    # Find local minima near start and end for better boundaries
+    quarter_len = len(event_rms) // 4
+    
+    if quarter_len > 0:
+        # Refine start: find minimum in first quarter
+        start_region = event_rms[:quarter_len]
+        local_start = np.argmin(start_region)
+        
+        # Refine end: find minimum in last quarter
+        end_region = event_rms[-quarter_len:]
+        local_end = len(event_rms) - quarter_len + np.argmin(end_region)
+        
+        refined_start = global_start + local_start
+        refined_end = global_start + local_end
+        
+        # Ensure minimum duration
+        if refined_end - refined_start >= min_samples:
+            return (refined_start, refined_end)
+    
+    # If refinement fails, return original
+    return (global_start, global_end)
+
+
+def _remove_overlaps(
+    segments: List[Tuple[int, int]],
+    min_samples: int
+) -> List[Tuple[int, int]]:
+    """
+    Remove overlapping segments while respecting minimum duration.
+    
+    When segments overlap, keep the one with larger extent or merge them
+    if they're close enough.
+    
+    Parameters:
+    -----------
+    segments : List[Tuple[int, int]]
+        List of (start, end) tuples
+    min_samples : int
+        Minimum samples for valid segment
+    
+    Returns:
+    --------
+    List[Tuple[int, int]]
+        Non-overlapping segments
+    """
+    if not segments:
+        return []
+    
+    # Sort by start index
+    sorted_segs = sorted(segments, key=lambda x: x[0])
+    
+    non_overlapping = [sorted_segs[0]]
+    
+    for current_start, current_end in sorted_segs[1:]:
+        last_start, last_end = non_overlapping[-1]
+        
+        # Check for overlap
+        if current_start < last_end:
+            # Overlap detected - merge or keep larger
+            merged_start = min(last_start, current_start)
+            merged_end = max(last_end, current_end)
+            
+            # Replace last segment with merged one
+            if merged_end - merged_start >= min_samples:
+                non_overlapping[-1] = (merged_start, merged_end)
+            # else keep the previous one
+        else:
+            # No overlap - add as new segment
+            if current_end - current_start >= min_samples:
+                non_overlapping.append((current_start, current_end))
+    
+    return non_overlapping

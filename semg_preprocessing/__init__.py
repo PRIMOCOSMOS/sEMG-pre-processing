@@ -6,7 +6,7 @@ including filtering, noise removal, muscle activity detection, HHT analysis,
 CEEMDAN decomposition, feature extraction, and data augmentation.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .filters import (
     apply_highpass_filter,
@@ -23,6 +23,8 @@ from .detection import (
 
 from .utils import (
     load_csv_data,
+    load_mat_data,
+    load_signal_file,
     save_processed_data,
     export_segments_to_csv,
 )
@@ -66,6 +68,8 @@ __all__ = [
     "segment_signal",
     # I/O
     "load_csv_data",
+    "load_mat_data",
+    "load_signal_file",
     "save_processed_data",
     "export_segments_to_csv",
     # HHT
