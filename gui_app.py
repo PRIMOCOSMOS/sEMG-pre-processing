@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from semg_preprocessing import (
     load_csv_data,
+    load_mat_data,
+    load_signal_file,
     apply_bandpass_filter,
     apply_notch_filter,
     detect_muscle_activity,

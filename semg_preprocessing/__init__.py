@@ -23,6 +23,8 @@ from .detection import (
 
 from .utils import (
     load_csv_data,
+    load_mat_data,
+    load_signal_file,
     save_processed_data,
     export_segments_to_csv,
 )
@@ -66,6 +68,8 @@ __all__ = [
     "segment_signal",
     # I/O
     "load_csv_data",
+    "load_mat_data",
+    "load_signal_file",
     "save_processed_data",
     "export_segments_to_csv",
     # HHT
