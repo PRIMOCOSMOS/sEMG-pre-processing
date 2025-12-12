@@ -364,7 +364,8 @@ class EMGProcessorGUI:
             return f"❌ Error applying batch filters: {str(e)}\n{traceback.format_exc()}", None
     
     def detect_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
-                       use_multi_detector, use_clustering, detector_sens_str, progress=gr.Progress()):
+                       use_multi_detector, use_clustering, detector_sens_str, classification_threshold, 
+                       progress=gr.Progress()):
         """Detect muscle activity segments using advanced PELT algorithm."""
         try:
             if self.filtered_signal is None:
@@ -388,7 +389,7 @@ class EMGProcessorGUI:
             
             # Detect muscle activity using combined method (only supported method now)
             progress(0.3, desc="Detecting muscle activity with PELT...")
-            self.segments = detect_muscle_activity(
+            result = detect_muscle_activity(
                 self.filtered_signal,
                 fs=self.fs,
                 method="combined",
@@ -400,8 +401,14 @@ class EMGProcessorGUI:
                 fusion_method=fusion_method,
                 use_multi_detector=use_multi_detector,
                 classify_segments=True,
-                use_clustering=use_clustering
+                use_clustering=use_clustering,
+                classification_threshold=float(classification_threshold),
+                return_changepoints=True
             )
+            
+            # Extract segments and changepoints from result
+            self.segments = result['segments']
+            changepoints = result['changepoints']
             
             # Get detailed segment information
             progress(0.6, desc="Extracting segment information...")
@@ -419,6 +426,10 @@ class EMGProcessorGUI:
             
             ax.plot(time, self.filtered_signal, 'k-', linewidth=0.5, alpha=0.5, label='Filtered Signal')
             
+            # Mark all PELT changepoints with vertical lines
+            for cp in changepoints:
+                ax.axvline(cp/self.fs, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+            
             # Highlight detected segments
             colors = plt.cm.Set1(np.linspace(0, 1, max(len(self.segments), 1)))
             for i, (start, end) in enumerate(self.segments):
@@ -427,7 +438,7 @@ class EMGProcessorGUI:
             
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('Amplitude')
-            ax.set_title(f'Muscle Activity Detection ({len(self.segments)} active segments)')
+            ax.set_title(f'Muscle Activity Detection ({len(self.segments)} active segments, {len(changepoints)} changepoints)')
             ax.grid(True, alpha=0.3)
             if self.segments:
                 ax.legend(loc='upper right', ncol=2)
@@ -436,7 +447,7 @@ class EMGProcessorGUI:
             
             # Create info text
             progress(0.9, desc="Formatting results...")
-            info = f"✅ Detected {len(self.segments)} muscle activity segments:\n\n"
+            info = f"✅ Detected {len(self.segments)} muscle activity segments from {len(changepoints)} PELT changepoints:\n\n"
             for i, seg in enumerate(self.segment_data[:10], 1):
                 info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
                 info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
@@ -451,7 +462,8 @@ class EMGProcessorGUI:
             return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
     
     def detect_batch_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
-                             use_multi_detector, use_clustering, detector_sens_str, progress=gr.Progress()):
+                             use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
+                             progress=gr.Progress()):
         """Detect muscle activity in all batch-filtered files using advanced PELT algorithm."""
         try:
             if not self.batch_filtered:
@@ -491,7 +503,8 @@ class EMGProcessorGUI:
                     fusion_method=fusion_method,
                     use_multi_detector=use_multi_detector,
                     classify_segments=True,
-                    use_clustering=use_clustering
+                    use_clustering=use_clustering,
+                    classification_threshold=float(classification_threshold)
                 )
                 
                 # Get detailed segment information
@@ -1775,6 +1788,11 @@ def create_gui():
                                 )
                                 
                                 gr.Markdown("**Activity Classification:**")
+                                classification_threshold_input = gr.Slider(
+                                    0.0, 2.0, value=0.5, step=0.1,
+                                    label="Classification Strictness",
+                                    info="Lower = less strict (more segments), Higher = more strict (fewer segments)"
+                                )
                                 use_clustering_input = gr.Checkbox(
                                     value=False, 
                                     label="Use Clustering for Classification",
@@ -1791,7 +1809,7 @@ def create_gui():
                             fn=processor.detect_activity,
                             inputs=[min_duration_input, max_duration_input, sensitivity_input, 
                                    n_detectors_input, fusion_method_input, use_multi_detector_input,
-                                   use_clustering_input, detector_sens_input],
+                                   use_clustering_input, detector_sens_input, classification_threshold_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
@@ -1823,6 +1841,11 @@ def create_gui():
                                 )
                                 
                                 gr.Markdown("**Activity Classification:**")
+                                batch_classification_threshold_input = gr.Slider(
+                                    0.0, 2.0, value=0.5, step=0.1,
+                                    label="Classification Strictness",
+                                    info="Lower = less strict, Higher = more strict"
+                                )
                                 batch_use_clustering_input = gr.Checkbox(
                                     value=False,
                                     label="Use Clustering for Classification"
@@ -1838,7 +1861,7 @@ def create_gui():
                             fn=processor.detect_batch_activity,
                             inputs=[batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
                                    batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
-                                   batch_use_clustering_input, batch_detector_sens_input],
+                                   batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         

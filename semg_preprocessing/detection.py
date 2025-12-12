@@ -27,7 +27,7 @@ def detect_muscle_activity(
     min_duration: float = 0.1,
     max_duration: Optional[float] = None,
     **kwargs
-) -> List[Tuple[int, int]]:
+) -> Union[List[Tuple[int, int]], Dict[str, Union[List[Tuple[int, int]], List[int]]]]:
     """
     Detect muscle activity events in sEMG signal using advanced PELT algorithm.
     
@@ -67,13 +67,23 @@ def detect_muscle_activity(
         - use_multi_detector: bool - Enable multi-detector ensemble (default: True)
         - classify_segments: bool - Enable activity/non-activity classification (default: True)
         - use_clustering: bool - Use clustering for classification instead of threshold (default: False)
+        - classification_threshold: float - Controls classification strictness (default: 0.5)
+          Lower values = less strict (more segments classified as activity)
+          Higher values = more strict (fewer segments classified as activity)
+          Range: 0.0-2.0, where 0.5 is balanced
+        - return_changepoints: bool - If True, return dict with segments and changepoints (default: False)
     
     Returns:
     --------
-    List[Tuple[int, int]]
-        List of (start_index, end_index) tuples for each detected ACTIVE muscle period
+    List[Tuple[int, int]] or Dict
+        If return_changepoints=False (default):
+            List of (start_index, end_index) tuples for each detected ACTIVE muscle period
+        If return_changepoints=True:
+            Dict with keys:
+                'segments': List of (start_index, end_index) tuples for active segments
+                'changepoints': List of all PELT-detected change point indices
         ALL segments are guaranteed to satisfy min_duration and max_duration constraints
-        Only segments classified as "activity" are returned
+        Only segments classified as "activity" are returned (if classify_segments=True)
         
     Notes:
     ------
@@ -82,6 +92,7 @@ def detect_muscle_activity(
     - Sensitivity parameter directly controls PELT penalty for better interpretability
     - Multi-detector ensemble provides more robust detection
     - After PELT segmentation, segments are classified as active/inactive
+    - classification_threshold allows control over classification strictness
     - Dense events with gaps < 50ms are automatically merged
     """
     if method != "combined":
@@ -95,9 +106,11 @@ def detect_muscle_activity(
     use_multi_detector = kwargs.get('use_multi_detector', True)
     classify_segments = kwargs.get('classify_segments', True)
     use_clustering = kwargs.get('use_clustering', False)
+    classification_threshold = kwargs.get('classification_threshold', 0.5)
+    return_changepoints = kwargs.get('return_changepoints', False)
     
     # Use new advanced PELT detection
-    segments = _detect_pelt_advanced(
+    segments, changepoints = _detect_pelt_advanced(
         data, fs, window_size, min_duration, 
         sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector
     )
@@ -109,10 +122,17 @@ def detect_muscle_activity(
     # Classify segments as activity vs non-activity
     if classify_segments and segments:
         segments = _classify_activity_segments(
-            data, segments, fs, window_size, use_clustering
+            data, segments, fs, window_size, use_clustering, classification_threshold
         )
     
-    return segments
+    # Return results based on return_changepoints flag
+    if return_changepoints:
+        return {
+            'segments': segments,
+            'changepoints': changepoints
+        }
+    else:
+        return segments
 
 
 def _detect_pelt_advanced(
@@ -125,7 +145,7 @@ def _detect_pelt_advanced(
     detector_sensitivities: Optional[List[float]],
     fusion_method: str,
     use_multi_detector: bool
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Advanced PELT-based muscle activity detection with multi-detector ensemble.
     
@@ -161,8 +181,9 @@ def _detect_pelt_advanced(
     
     Returns:
     --------
-    List[Tuple[int, int]]
-        Detected event segments (before activity classification)
+    Tuple[List[Tuple[int, int]], List[int]]
+        - Detected event segments (before activity classification)
+        - All PELT-detected change point indices
     """
     if window_size is None:
         window_size = int(fs / 10)  # Default: 0.1 seconds
@@ -174,6 +195,8 @@ def _detect_pelt_advanced(
     
     # Step 2: Compute energy zones for adaptive penalty
     energy_zones = _compute_energy_zones(data, window_size)
+    
+    all_changepoints = []
     
     if use_multi_detector and n_detectors > 1:
         # Step 3: Run multiple PELT detectors with individual sensitivities
@@ -199,9 +222,12 @@ def _detect_pelt_advanced(
             )
             
             # Run PELT with zone-specific penalties
-            segments = _run_pelt_with_adaptive_penalty(
+            segments, changepoints = _run_pelt_with_adaptive_penalty(
                 features, penalties, min_samples
             )
+            
+            # Collect all changepoints
+            all_changepoints.extend(changepoints)
             
             # Calculate confidence scores for each segment
             confidences = [_calculate_segment_confidence(data, seg, fs) for seg in segments]
@@ -217,7 +243,11 @@ def _detect_pelt_advanced(
         # Single detector mode
         single_sens = sensitivity if isinstance(sensitivity, (int, float)) else sensitivity[0]
         penalties = _compute_adaptive_penalties(features, energy_zones, single_sens)
-        segments = _run_pelt_with_adaptive_penalty(features, penalties, min_samples)
+        segments, changepoints = _run_pelt_with_adaptive_penalty(features, penalties, min_samples)
+        all_changepoints.extend(changepoints)
+    
+    # Remove duplicate changepoints and sort
+    all_changepoints = sorted(list(set(all_changepoints)))
     
     # Step 5: Merge dense events (gaps < 50ms)
     segments = _merge_dense_events(data, segments, fs, min_samples)
@@ -225,7 +255,7 @@ def _detect_pelt_advanced(
     # Step 6: Final strict enforcement of duration constraints
     segments = [(s, e) for s, e in segments if (e - s) >= min_samples]
     
-    return segments
+    return segments, all_changepoints
 
 
 def _extract_multidimensional_features(
@@ -607,7 +637,7 @@ def _run_pelt_with_adaptive_penalty(
     features: np.ndarray,
     penalties: np.ndarray,
     min_samples: int
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Run PELT algorithm with position-dependent adaptive penalties.
     
@@ -626,8 +656,9 @@ def _run_pelt_with_adaptive_penalty(
     
     Returns:
     --------
-    List[Tuple[int, int]]
-        Detected segments
+    Tuple[List[Tuple[int, int]], List[int]]
+        - Detected segments
+        - Change point indices detected by PELT
     """
     # Use median penalty as the base penalty for PELT
     median_penalty = np.median(penalties)
@@ -636,12 +667,15 @@ def _run_pelt_with_adaptive_penalty(
     algo = rpt.Pelt(model='l2', min_size=min_samples).fit(features)
     change_points = algo.predict(pen=median_penalty)
     
+    # Store original changepoints for return
+    original_changepoints = change_points.copy()
+    
     # Remove the last point if it's the end of the signal
     if change_points and change_points[-1] == len(features):
         change_points = change_points[:-1]
     
     if not change_points:
-        return []
+        return [], original_changepoints
     
     # Convert change points to segments
     segments = []
@@ -686,7 +720,7 @@ def _run_pelt_with_adaptive_penalty(
         if refined_end - refined_start >= min_samples:
             refined_segments.append((refined_start, refined_end))
     
-    return refined_segments
+    return refined_segments, original_changepoints
 
 
 def _calculate_segment_confidence(
@@ -880,7 +914,8 @@ def _classify_activity_segments(
     segments: List[Tuple[int, int]],
     fs: float,
     window_size: Optional[int],
-    use_clustering: bool = False
+    use_clustering: bool = False,
+    classification_threshold: float = 0.5
 ) -> List[Tuple[int, int]]:
     """
     Classify segments as activity or non-activity based on signal features.
@@ -905,6 +940,11 @@ def _classify_activity_segments(
         Window size for feature extraction
     use_clustering : bool
         If True, use K-means clustering; otherwise use adaptive threshold
+    classification_threshold : float
+        Controls classification strictness (default: 0.5)
+        For adaptive threshold: multiplier on std deviation (lower = less strict)
+        For clustering: percentile threshold to separate clusters (0-1)
+        Range: 0.0-2.0, where lower values are less strict
     
     Returns:
     --------
@@ -950,14 +990,32 @@ def _classify_activity_segments(
         
         labels = kmeans.fit_predict(segment_features)
         
+        # Calculate normalized feature sum for each segment
+        scaler = StandardScaler()
+        features_normalized = scaler.fit_transform(segment_features)
+        activity_scores = features_normalized.mean(axis=1)
+        
         # Identify activity cluster (higher feature values)
-        cluster_means = np.array([segment_features[labels == i].mean() 
+        cluster_means = np.array([activity_scores[labels == i].mean() 
                                   for i in range(2)])
         activity_cluster = np.argmax(cluster_means)
         
-        # Keep only activity segments
-        activity_segments = [seg for seg, label in zip(segments, labels) 
-                            if label == activity_cluster]
+        # Apply threshold within activity cluster based on classification_threshold
+        # Lower threshold = less strict (keep more segments)
+        activity_cluster_scores = activity_scores[labels == activity_cluster]
+        if len(activity_cluster_scores) > 0:
+            # Use percentile based on threshold: 0.5 -> 50th percentile (median)
+            # Lower values (e.g., 0.2) -> 20th percentile (less strict)
+            # Higher values (e.g., 0.8) -> 80th percentile (more strict)
+            percentile = classification_threshold * 100
+            percentile = np.clip(percentile, 0, 100)
+            score_threshold = np.percentile(activity_cluster_scores, percentile)
+        else:
+            score_threshold = cluster_means[activity_cluster]
+        
+        # Keep segments in activity cluster with scores above threshold
+        activity_segments = [seg for seg, label, score in zip(segments, labels, activity_scores) 
+                            if label == activity_cluster and score >= score_threshold]
     else:
         # Method 2: Adaptive threshold (faster, more interpretable)
         # Normalize features
@@ -974,8 +1032,10 @@ def _classify_activity_segments(
         ) / 4.0
         
         # Adaptive threshold based on score distribution
-        # Use median + std/2 to separate activity from rest
-        threshold = np.median(activity_scores) + np.std(activity_scores) * 0.5
+        # Use median + (std * classification_threshold) to separate activity from rest
+        # Lower classification_threshold = less strict (more segments classified as activity)
+        # Default 0.5 gives median + 0.5*std
+        threshold = np.median(activity_scores) + np.std(activity_scores) * classification_threshold
         
         # Keep segments above threshold
         activity_segments = [seg for seg, score in zip(segments, activity_scores) 
