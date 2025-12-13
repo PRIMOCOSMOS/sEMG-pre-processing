@@ -68,9 +68,11 @@ def detect_muscle_activity(
         - classify_segments: bool - Enable activity/non-activity classification (default: True)
         - use_clustering: bool - Use clustering for classification instead of threshold (default: False)
         - classification_threshold: float - Controls classification strictness (default: 0.5)
-          Lower values = less strict (more segments classified as activity)
-          Higher values = more strict (fewer segments classified as activity)
-          Range: 0.0-2.0, where 0.5 is balanced
+          Negative values = very lenient (includes low-intensity events)
+          0.0 = median threshold (50% of segments)
+          Positive values = more strict (fewer segments)
+          Range: -2.0 to 2.0, where 0.5 is balanced
+          Can be negative to handle cases where high-amplitude bursts skew the mean
         - return_changepoints: bool - If True, return dict with segments and changepoints (default: False)
     
     Returns:
@@ -942,9 +944,13 @@ def _classify_activity_segments(
         If True, use K-means clustering; otherwise use adaptive threshold
     classification_threshold : float
         Controls classification strictness (default: 0.5)
-        For adaptive threshold: multiplier on std deviation (lower = less strict)
+        For adaptive threshold: 
+          - Can be negative (e.g., -1.0) for very lenient classification
+          - 0.0 uses median as threshold (50% of segments)
+          - Positive values are more strict
+          - Range: -2.0 to 2.0, allows handling high-amplitude bursts that skew mean
         For clustering: percentile threshold to separate clusters (0-1)
-        Range: 0.0-2.0, where lower values are less strict
+        Range: -2.0 to 2.0, where lower values are less strict
     
     Returns:
     --------
@@ -1018,23 +1024,31 @@ def _classify_activity_segments(
                             if label == activity_cluster and score >= score_threshold]
     else:
         # Method 2: Adaptive threshold (faster, more interpretable)
-        # Normalize features
+        # Normalize each feature individually to ensure equal weight
+        # This prevents features with larger scales from dominating
         scaler = StandardScaler()
         features_normalized = scaler.fit_transform(segment_features)
         
         # Calculate combined activity score for each segment
-        # Higher RMS, MAV, VAR, and power indicate activity
+        # Use only intensity-related features: RMS, MAV, VAR, and Power (skip MNF at index 3)
+        # Each feature is already normalized (mean=0, std=1), giving equal weight
         activity_scores = (
-            features_normalized[:, 0] +  # RMS
-            features_normalized[:, 1] +  # MAV
-            features_normalized[:, 2] +  # VAR
-            features_normalized[:, 4]    # Power
+            features_normalized[:, 0] +  # RMS (normalized)
+            features_normalized[:, 1] +  # MAV (normalized)
+            features_normalized[:, 2] +  # VAR (normalized)
+            features_normalized[:, 4]    # Power (normalized)
         ) / 4.0
         
         # Adaptive threshold based on score distribution
         # Use median + (std * classification_threshold) to separate activity from rest
-        # Lower classification_threshold = less strict (more segments classified as activity)
-        # Default 0.5 gives median + 0.5*std
+        # classification_threshold can be negative to be less strict
+        # Negative values allow segments below median to be classified as activity
+        # Examples:
+        #   -1.0: median - 1.0*std (very lenient, includes low-intensity events)
+        #   -0.5: median - 0.5*std (lenient)
+        #    0.0: median (balanced, 50% of segments)
+        #    0.5: median + 0.5*std (default, moderately strict)
+        #    1.0: median + 1.0*std (strict)
         threshold = np.median(activity_scores) + np.std(activity_scores) * classification_threshold
         
         # Keep segments above threshold

@@ -1789,9 +1789,9 @@ def create_gui():
                                 
                                 gr.Markdown("**Activity Classification:**")
                                 classification_threshold_input = gr.Slider(
-                                    0.0, 2.0, value=0.5, step=0.1,
+                                    -2.0, 2.0, value=0.5, step=0.1,
                                     label="Classification Strictness",
-                                    info="Lower = less strict (more segments), Higher = more strict (fewer segments)"
+                                    info="Negative = very lenient, 0 = median, Positive = strict. Can be negative for signals with high-amplitude bursts."
                                 )
                                 use_clustering_input = gr.Checkbox(
                                     value=False, 
@@ -1842,9 +1842,9 @@ def create_gui():
                                 
                                 gr.Markdown("**Activity Classification:**")
                                 batch_classification_threshold_input = gr.Slider(
-                                    0.0, 2.0, value=0.5, step=0.1,
+                                    -2.0, 2.0, value=0.5, step=0.1,
                                     label="Classification Strictness",
-                                    info="Lower = less strict, Higher = more strict"
+                                    info="Negative = very lenient, 0 = median, Positive = strict"
                                 )
                                 batch_use_clustering_input = gr.Checkbox(
                                     value=False,
