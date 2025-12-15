@@ -123,6 +123,8 @@ def detect_muscle_activity(
           Range: -2.0 to 2.0, where 0.5 is balanced
           Can be negative to handle cases where high-amplitude bursts skew the mean
         - use_tkeo: bool - Apply TKEO preprocessing for improved changepoint detection (default: True)
+        - merge_threshold: float - Energy ratio threshold for segment merging (default: 0.7)
+          Range: 0.4-0.9, where lower = more aggressive merging
         - return_changepoints: bool - If True, return dict with segments and changepoints (default: False)
     
     Returns:
@@ -162,11 +164,12 @@ def detect_muscle_activity(
     classification_threshold = kwargs.get('classification_threshold', 0.5)
     return_changepoints = kwargs.get('return_changepoints', False)
     use_tkeo = kwargs.get('use_tkeo', True)
+    merge_threshold = kwargs.get('merge_threshold', 0.7)
     
     # Use new advanced PELT detection
     segments, changepoints = _detect_pelt_advanced(
         data, fs, window_size, min_duration, 
-        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector, use_tkeo
+        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector, use_tkeo, merge_threshold
     )
     
     # Apply max_duration splitting if specified
@@ -199,7 +202,8 @@ def _detect_pelt_advanced(
     detector_sensitivities: Optional[List[float]],
     fusion_method: str,
     use_multi_detector: bool,
-    use_tkeo: bool = True
+    use_tkeo: bool = True,
+    merge_threshold: float = 0.7
 ) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Advanced PELT-based muscle activity detection with multi-detector ensemble.
@@ -236,6 +240,8 @@ def _detect_pelt_advanced(
         Whether to use multi-detector ensemble
     use_tkeo : bool
         Whether to apply TKEO preprocessing for changepoint detection
+    merge_threshold : float
+        Energy ratio threshold for segment merging (default: 0.7)
     
     Returns:
     --------
@@ -323,8 +329,8 @@ def _detect_pelt_advanced(
     # Remove duplicate changepoints and sort
     all_changepoints = sorted(list(set(all_changepoints)))
     
-    # Step 5: Merge dense events (gaps < 50ms)
-    segments = _merge_dense_events(data, segments, fs, min_samples)
+    # Step 5: Merge dense events (gaps < 50ms) with adaptive threshold
+    segments = _merge_dense_events(data, segments, fs, min_samples, merge_threshold)
     
     # Step 6: Final strict enforcement of duration constraints
     segments = [(s, e) for s, e in segments if (e - s) >= min_samples]
@@ -1134,7 +1140,8 @@ def _merge_dense_events(
     data: np.ndarray,
     segments: List[Tuple[int, int]],
     fs: float,
-    min_samples: int
+    min_samples: int,
+    adaptive_threshold: float = 0.7
 ) -> List[Tuple[int, int]]:
     """
     Intelligently merge adjacent events based on boundary energy state.
@@ -1148,6 +1155,11 @@ def _merge_dense_events(
     This addresses the issue where arm lift/lower transitions can create strong
     changepoints that split a single dumbbell action into multiple segments.
     
+    The threshold is adaptive based on signal characteristics:
+    - Base threshold can be adjusted via adaptive_threshold parameter
+    - Automatically adjusts for signals with high variance (multiple energy levels)
+    - For uniform signals, uses the base threshold directly
+    
     Parameters:
     -----------
     data : np.ndarray
@@ -1158,6 +1170,11 @@ def _merge_dense_events(
         Sampling frequency
     min_samples : int
         Minimum segment size
+    adaptive_threshold : float, optional
+        Base energy ratio threshold for merging (default: 0.7)
+        Lower values = more aggressive merging
+        Higher values = more conservative merging
+        Range: 0.4 - 0.9 recommended
     
     Returns:
     --------
@@ -1175,6 +1192,29 @@ def _merge_dense_events(
     # Compute global energy statistics for adaptive thresholding
     signal_rms_mean = np.mean(rms_envelope)
     signal_rms_std = np.std(rms_envelope)
+    
+    # Calculate coefficient of variation (CV) to assess signal variability
+    # CV = std / mean, measures relative variability
+    if signal_rms_mean > 1e-10:
+        energy_cv = signal_rms_std / signal_rms_mean
+    else:
+        energy_cv = 0.0
+    
+    # Adaptive threshold adjustment based on signal characteristics
+    # For signals with high variability (CV > 0.5), use a slightly lower threshold
+    # to better capture transitions within the same action
+    # For signals with low variability (CV < 0.3), use the base threshold
+    if energy_cv > 0.5:
+        # High variability signal - be more aggressive in merging
+        adjusted_threshold = adaptive_threshold * 0.9
+    elif energy_cv < 0.3:
+        # Low variability signal - use base threshold
+        adjusted_threshold = adaptive_threshold
+    else:
+        # Medium variability - interpolate
+        # Linear interpolation between 0.9x and 1.0x based on CV in [0.3, 0.5]
+        interpolation_factor = 0.9 + 0.1 * (0.5 - energy_cv) / 0.2
+        adjusted_threshold = adaptive_threshold * interpolation_factor
     
     merged = []
     i = 0
@@ -1238,9 +1278,8 @@ def _merge_dense_events(
                     energy_ratio = 1.0
                 
                 # Adaptive threshold based on signal characteristics
-                # If boundary energy is >= 70% of surrounding energy → HIGH energy state → MERGE
-                # If boundary energy is < 70% of surrounding energy → LOW energy state → DON'T MERGE
-                high_energy_threshold = 0.7
+                # Use the adjusted threshold calculated from global signal statistics
+                high_energy_threshold = adjusted_threshold
                 
                 if energy_ratio >= high_energy_threshold:
                     # Boundary is in HIGH energy state

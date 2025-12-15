@@ -364,8 +364,8 @@ class EMGProcessorGUI:
             return f"❌ Error applying batch filters: {str(e)}\n{traceback.format_exc()}", None
     
     def detect_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
-                       use_multi_detector, use_clustering, detector_sens_str, classification_threshold, 
-                       progress=gr.Progress()):
+                       use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
+                       use_tkeo, merge_threshold, progress=gr.Progress()):
         """Detect muscle activity segments using advanced PELT algorithm."""
         try:
             if self.filtered_signal is None:
@@ -403,6 +403,8 @@ class EMGProcessorGUI:
                 classify_segments=True,
                 use_clustering=use_clustering,
                 classification_threshold=float(classification_threshold),
+                use_tkeo=use_tkeo,
+                merge_threshold=float(merge_threshold),
                 return_changepoints=True
             )
             
@@ -463,7 +465,7 @@ class EMGProcessorGUI:
     
     def detect_batch_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                              use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
-                             progress=gr.Progress()):
+                             use_tkeo, merge_threshold, progress=gr.Progress()):
         """Detect muscle activity in all batch-filtered files using advanced PELT algorithm."""
         try:
             if not self.batch_filtered:
@@ -504,7 +506,9 @@ class EMGProcessorGUI:
                     use_multi_detector=use_multi_detector,
                     classify_segments=True,
                     use_clustering=use_clustering,
-                    classification_threshold=float(classification_threshold)
+                    classification_threshold=float(classification_threshold),
+                    use_tkeo=use_tkeo,
+                    merge_threshold=float(merge_threshold)
                 )
                 
                 # Get detailed segment information
@@ -1534,40 +1538,68 @@ The CSV contains all extracted features for each segment.
             
             progress(0.5, desc="Exporting HHT results...")
             
-            # Export HHT results
-            if export_hht and self.hht_results:
-                hht_dir = os.path.join(output_dir, 'hht')
-                os.makedirs(hht_dir, exist_ok=True)
+            # Export HHT results - batch export for all segments
+            if export_hht and self.segment_data:
+                from semg_preprocessing.hht import export_activity_segments_hht
                 
-                # Save spectrum as NPZ
-                spectrum_path = os.path.join(hht_dir, f'{prefix}_hilbert_spectrum.npz')
-                save_hilbert_spectrum(
-                    self.hht_results['spectrum'],
-                    self.hht_results['time'],
-                    self.hht_results['frequency'],
-                    spectrum_path,
-                    format='npz'
-                )
-                results.append(f"✅ Saved Hilbert spectrum to: {spectrum_path}")
+                # Create HHT directories
+                hht_matrices_dir = os.path.join(output_dir, 'hht_matrices')
+                hht_images_dir = os.path.join(output_dir, 'hht_images')
+                os.makedirs(hht_matrices_dir, exist_ok=True)
+                os.makedirs(hht_images_dir, exist_ok=True)
                 
-                # Save spectrum as image
-                fig, ax = plt.subplots(figsize=(12, 6))
-                im = ax.pcolormesh(
-                    self.hht_results['time'],
-                    self.hht_results['frequency'],
-                    self.hht_results['spectrum'],
-                    shading='auto', cmap='hot'
-                )
-                ax.set_xlabel('Time (s)')
-                ax.set_ylabel('Frequency (Hz)')
-                ax.set_title('Hilbert Spectrum')
-                plt.colorbar(im, ax=ax, label='Amplitude')
-                plt.tight_layout()
-                
-                img_path = os.path.join(hht_dir, f'{prefix}_hilbert_spectrum.png')
-                fig.savefig(img_path, dpi=150)
-                plt.close(fig)
-                results.append(f"✅ Saved spectrum image to: {img_path}")
+                # Export Hilbert spectra for all detected segments
+                try:
+                    # Extract segment boundaries
+                    segment_tuples = [(int(seg['start_sample']), int(seg['end_sample'])) 
+                                     for seg in self.segment_data]
+                    
+                    # Export matrices to hht_matrices directory
+                    export_info_matrices = export_activity_segments_hht(
+                        self.filtered_signal,
+                        segment_tuples,
+                        fs=self.fs,
+                        output_dir=hht_matrices_dir,
+                        base_filename=prefix if prefix else 'segment',
+                        n_freq_bins=256,
+                        normalize_length=256,
+                        use_ceemdan=True,
+                        save_visualization=False  # We'll save images separately
+                    )
+                    
+                    # Save visualizations to hht_images directory
+                    import matplotlib.pyplot as plt
+                    for idx, (start, end) in enumerate(segment_tuples):
+                        segment_num = idx + 1
+                        segment_signal = self.filtered_signal[start:end]
+                        
+                        # Load the saved spectrum
+                        npz_file = os.path.join(hht_matrices_dir, f'{prefix if prefix else "segment"}_{segment_num:03d}.npz')
+                        data = np.load(npz_file)
+                        spectrum = data['spectrum']
+                        time = data['time']
+                        frequency = data['frequency']
+                        
+                        # Create visualization
+                        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+                        im = ax.pcolormesh(time, frequency, spectrum, shading='auto', cmap='jet')
+                        ax.set_xlabel('Normalized Time', fontsize=12)
+                        ax.set_ylabel('Frequency (Hz)', fontsize=12)
+                        ax.set_title(f'Hilbert Spectrum - Segment {segment_num:03d}', fontsize=14, fontweight='bold')
+                        cbar = fig.colorbar(im, ax=ax)
+                        cbar.set_label('Amplitude (Log Scale)', fontsize=11)
+                        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+                        plt.tight_layout()
+                        
+                        # Save to images directory
+                        img_path = os.path.join(hht_images_dir, f'{prefix if prefix else "segment"}_{segment_num:03d}.png')
+                        fig.savefig(img_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+                    
+                    results.append(f"✅ Saved {len(segment_tuples)} Hilbert spectrum matrices to: {hht_matrices_dir}")
+                    results.append(f"✅ Saved {len(segment_tuples)} Hilbert spectrum images to: {hht_images_dir}")
+                except Exception as e:
+                    results.append(f"⚠️  Error exporting HHT: {str(e)}")
             
             progress(0.7, desc="Exporting augmented signals...")
             
@@ -1799,6 +1831,18 @@ def create_gui():
                                     info="K-means clustering (slower but automatic)"
                                 )
                                 
+                                gr.Markdown("**Advanced Detection Settings:**")
+                                use_tkeo_input = gr.Checkbox(
+                                    value=True,
+                                    label="Enable TKEO Preprocessing",
+                                    info="Teager-Kaiser Energy Operator enhances changepoint detection"
+                                )
+                                merge_threshold_input = gr.Slider(
+                                    0.4, 0.9, value=0.7, step=0.05,
+                                    label="Segment Merge Threshold",
+                                    info="Energy ratio for merging adjacent segments (lower = more aggressive merging)"
+                                )
+                                
                                 detect_btn = gr.Button("Detect Activity", variant="primary")
                             
                             with gr.Column(scale=2):
@@ -1809,7 +1853,8 @@ def create_gui():
                             fn=processor.detect_activity,
                             inputs=[min_duration_input, max_duration_input, sensitivity_input, 
                                    n_detectors_input, fusion_method_input, use_multi_detector_input,
-                                   use_clustering_input, detector_sens_input, classification_threshold_input],
+                                   use_clustering_input, detector_sens_input, classification_threshold_input,
+                                   use_tkeo_input, merge_threshold_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
@@ -1851,6 +1896,18 @@ def create_gui():
                                     label="Use Clustering for Classification"
                                 )
                                 
+                                gr.Markdown("**Advanced Detection Settings:**")
+                                batch_use_tkeo_input = gr.Checkbox(
+                                    value=True,
+                                    label="Enable TKEO Preprocessing",
+                                    info="Teager-Kaiser Energy Operator enhances changepoint detection"
+                                )
+                                batch_merge_threshold_input = gr.Slider(
+                                    0.4, 0.9, value=0.7, step=0.05,
+                                    label="Segment Merge Threshold",
+                                    info="Energy ratio for merging (lower = more aggressive)"
+                                )
+                                
                                 batch_detect_btn = gr.Button("🎯 Detect in All Files", variant="primary")
                             
                             with gr.Column(scale=2):
@@ -1861,7 +1918,8 @@ def create_gui():
                             fn=processor.detect_batch_activity,
                             inputs=[batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
                                    batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
-                                   batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input],
+                                   batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input,
+                                   batch_use_tkeo_input, batch_merge_threshold_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         
