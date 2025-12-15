@@ -365,7 +365,7 @@ class EMGProcessorGUI:
     
     def detect_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                        use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
-                       use_tkeo, merge_threshold, progress=gr.Progress()):
+                       use_tkeo, merge_threshold, max_merge_count, progress=gr.Progress()):
         """Detect muscle activity segments using advanced PELT algorithm."""
         try:
             if self.filtered_signal is None:
@@ -405,6 +405,7 @@ class EMGProcessorGUI:
                 classification_threshold=float(classification_threshold),
                 use_tkeo=use_tkeo,
                 merge_threshold=float(merge_threshold),
+                max_merge_count=int(max_merge_count),
                 return_changepoints=True
             )
             
@@ -465,7 +466,7 @@ class EMGProcessorGUI:
     
     def detect_batch_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                              use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
-                             use_tkeo, merge_threshold, progress=gr.Progress()):
+                             use_tkeo, merge_threshold, max_merge_count, progress=gr.Progress()):
         """Detect muscle activity in all batch-filtered files using advanced PELT algorithm."""
         try:
             if not self.batch_filtered:
@@ -508,7 +509,8 @@ class EMGProcessorGUI:
                     use_clustering=use_clustering,
                     classification_threshold=float(classification_threshold),
                     use_tkeo=use_tkeo,
-                    merge_threshold=float(merge_threshold)
+                    merge_threshold=float(merge_threshold),
+                    max_merge_count=int(max_merge_count)
                 )
                 
                 # Get detailed segment information
@@ -1550,8 +1552,8 @@ The CSV contains all extracted features for each segment.
                 
                 # Export Hilbert spectra for all detected segments
                 try:
-                    # Extract segment boundaries
-                    segment_tuples = [(int(seg['start_sample']), int(seg['end_sample'])) 
+                    # Extract segment boundaries - use correct keys from segment_signal()
+                    segment_tuples = [(int(seg['start_index']), int(seg['end_index'])) 
                                      for seg in self.segment_data]
                     
                     # Export matrices to hht_matrices directory
@@ -1838,9 +1840,14 @@ def create_gui():
                                     info="Teager-Kaiser Energy Operator enhances changepoint detection"
                                 )
                                 merge_threshold_input = gr.Slider(
-                                    0.4, 0.9, value=0.7, step=0.05,
+                                    0.3, 0.9, value=0.7, step=0.05,
                                     label="Segment Merge Threshold",
-                                    info="Energy ratio for merging adjacent segments (lower = more aggressive merging)"
+                                    info="Energy ratio for merging (lower = more aggressive, extended range 0.3-0.9)"
+                                )
+                                max_merge_count_input = gr.Slider(
+                                    1, 5, value=3, step=1,
+                                    label="Max Segments to Merge",
+                                    info="Maximum PELT segments merged into one event (prevents merging independent actions)"
                                 )
                                 
                                 detect_btn = gr.Button("Detect Activity", variant="primary")
@@ -1854,7 +1861,7 @@ def create_gui():
                             inputs=[min_duration_input, max_duration_input, sensitivity_input, 
                                    n_detectors_input, fusion_method_input, use_multi_detector_input,
                                    use_clustering_input, detector_sens_input, classification_threshold_input,
-                                   use_tkeo_input, merge_threshold_input],
+                                   use_tkeo_input, merge_threshold_input, max_merge_count_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
@@ -1903,9 +1910,14 @@ def create_gui():
                                     info="Teager-Kaiser Energy Operator enhances changepoint detection"
                                 )
                                 batch_merge_threshold_input = gr.Slider(
-                                    0.4, 0.9, value=0.7, step=0.05,
+                                    0.3, 0.9, value=0.7, step=0.05,
                                     label="Segment Merge Threshold",
-                                    info="Energy ratio for merging (lower = more aggressive)"
+                                    info="Energy ratio for merging (lower = more aggressive, range 0.3-0.9)"
+                                )
+                                batch_max_merge_count_input = gr.Slider(
+                                    1, 5, value=3, step=1,
+                                    label="Max Segments to Merge",
+                                    info="Maximum PELT segments merged into one event"
                                 )
                                 
                                 batch_detect_btn = gr.Button("🎯 Detect in All Files", variant="primary")
@@ -1919,7 +1931,7 @@ def create_gui():
                             inputs=[batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
                                    batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
                                    batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input,
-                                   batch_use_tkeo_input, batch_merge_threshold_input],
+                                   batch_use_tkeo_input, batch_merge_threshold_input, batch_max_merge_count_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         

@@ -124,7 +124,9 @@ def detect_muscle_activity(
           Can be negative to handle cases where high-amplitude bursts skew the mean
         - use_tkeo: bool - Apply TKEO preprocessing for improved changepoint detection (default: True)
         - merge_threshold: float - Energy ratio threshold for segment merging (default: 0.7)
-          Range: 0.4-0.9, where lower = more aggressive merging
+          Range: 0.3-0.9, where lower = more aggressive merging (extended range for robustness)
+        - max_merge_count: int - Maximum number of PELT segments to merge into one event (default: 3)
+          Prevents merging of truly independent actions
         - return_changepoints: bool - If True, return dict with segments and changepoints (default: False)
     
     Returns:
@@ -165,11 +167,12 @@ def detect_muscle_activity(
     return_changepoints = kwargs.get('return_changepoints', False)
     use_tkeo = kwargs.get('use_tkeo', True)
     merge_threshold = kwargs.get('merge_threshold', 0.7)
+    max_merge_count = kwargs.get('max_merge_count', 3)
     
     # Use new advanced PELT detection
     segments, changepoints = _detect_pelt_advanced(
         data, fs, window_size, min_duration, 
-        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector, use_tkeo, merge_threshold
+        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector, use_tkeo, merge_threshold, max_merge_count
     )
     
     # Apply max_duration splitting if specified
@@ -203,7 +206,8 @@ def _detect_pelt_advanced(
     fusion_method: str,
     use_multi_detector: bool,
     use_tkeo: bool = True,
-    merge_threshold: float = 0.7
+    merge_threshold: float = 0.7,
+    max_merge_count: int = 3
 ) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Advanced PELT-based muscle activity detection with multi-detector ensemble.
@@ -215,7 +219,8 @@ def _detect_pelt_advanced(
     4. Multiple PELT detectors with individual sensitivities
     5. Voting/confidence-weighted fusion
     6. Intelligent event merging with energy-aware boundary evaluation
-    7. Strict min/max duration enforcement
+    7. Limit on number of merged segments to prevent merging independent actions
+    8. Strict min/max duration enforcement
     
     Parameters:
     -----------
@@ -242,6 +247,8 @@ def _detect_pelt_advanced(
         Whether to apply TKEO preprocessing for changepoint detection
     merge_threshold : float
         Energy ratio threshold for segment merging (default: 0.7)
+    max_merge_count : int
+        Maximum number of PELT segments to merge into one event (default: 3)
     
     Returns:
     --------
@@ -329,8 +336,8 @@ def _detect_pelt_advanced(
     # Remove duplicate changepoints and sort
     all_changepoints = sorted(list(set(all_changepoints)))
     
-    # Step 5: Merge dense events (gaps < 50ms) with adaptive threshold
-    segments = _merge_dense_events(data, segments, fs, min_samples, merge_threshold)
+    # Step 5: Merge dense events (gaps < 50ms) with adaptive threshold and merge limit
+    segments = _merge_dense_events(data, segments, fs, min_samples, merge_threshold, max_merge_count)
     
     # Step 6: Final strict enforcement of duration constraints
     segments = [(s, e) for s, e in segments if (e - s) >= min_samples]
@@ -1141,7 +1148,8 @@ def _merge_dense_events(
     segments: List[Tuple[int, int]],
     fs: float,
     min_samples: int,
-    adaptive_threshold: float = 0.7
+    adaptive_threshold: float = 0.7,
+    max_merge_count: int = 3
 ) -> List[Tuple[int, int]]:
     """
     Intelligently merge adjacent events based on boundary energy state.
@@ -1151,6 +1159,7 @@ def _merge_dense_events(
     2. For adjacent segments (directly touching): Evaluate boundary energy state
        - If boundary is in HIGH energy state → MERGE (part of same action)
        - If boundary is in LOW energy state → KEEP SEPARATE (different actions)
+    3. Limit merging to max_merge_count segments to prevent merging independent actions
     
     This addresses the issue where arm lift/lower transitions can create strong
     changepoints that split a single dumbbell action into multiple segments.
@@ -1159,6 +1168,7 @@ def _merge_dense_events(
     - Base threshold can be adjusted via adaptive_threshold parameter
     - Automatically adjusts for signals with high variance (multiple energy levels)
     - For uniform signals, uses the base threshold directly
+    - More aggressive merging in high-amplitude regions to keep peaks within events
     
     Parameters:
     -----------
@@ -1174,7 +1184,10 @@ def _merge_dense_events(
         Base energy ratio threshold for merging (default: 0.7)
         Lower values = more aggressive merging
         Higher values = more conservative merging
-        Range: 0.4 - 0.9 recommended
+        Range: 0.3 - 0.9 recommended (extended for more aggressive merging)
+    max_merge_count : int, optional
+        Maximum number of original PELT segments to merge into one event (default: 3)
+        Prevents merging of truly independent actions
     
     Returns:
     --------
@@ -1201,19 +1214,21 @@ def _merge_dense_events(
         energy_cv = 0.0
     
     # Adaptive threshold adjustment based on signal characteristics
-    # For signals with high variability (CV > 0.5), use a slightly lower threshold
-    # to better capture transitions within the same action
-    # For signals with low variability (CV < 0.3), use the base threshold
+    # More aggressive strategy for high-amplitude regions:
+    # - For signals with high variability (CV > 0.5), be MORE aggressive (lower threshold)
+    # - This helps keep envelope peaks within detected events
+    # - For signals with low variability (CV < 0.3), use base threshold
     if energy_cv > 0.5:
-        # High variability signal - be more aggressive in merging
-        adjusted_threshold = adaptive_threshold * 0.9
+        # High variability signal - be significantly more aggressive in merging
+        # Use 0.8× threshold to capture more transitions within same action
+        adjusted_threshold = adaptive_threshold * 0.8
     elif energy_cv < 0.3:
         # Low variability signal - use base threshold
         adjusted_threshold = adaptive_threshold
     else:
         # Medium variability - interpolate
-        # Linear interpolation between 0.9x and 1.0x based on CV in [0.3, 0.5]
-        interpolation_factor = 0.9 + 0.1 * (0.5 - energy_cv) / 0.2
+        # Linear interpolation between 0.8× and 1.0× based on CV in [0.3, 0.5]
+        interpolation_factor = 0.8 + 0.2 * (0.5 - energy_cv) / 0.2
         adjusted_threshold = adaptive_threshold * interpolation_factor
     
     merged = []
@@ -1221,9 +1236,10 @@ def _merge_dense_events(
     
     while i < len(segments):
         current_start, current_end = segments[i]
+        merge_count = 1  # Track how many segments have been merged
         
         # Try to merge with next segments (only if adjacent or nearly adjacent)
-        while i + 1 < len(segments):
+        while i + 1 < len(segments) and merge_count < max_merge_count:
             next_start, next_end = segments[i + 1]
             gap = next_start - current_end
             
@@ -1299,6 +1315,7 @@ def _merge_dense_events(
             if should_merge:
                 # Merge: extend current segment to include next
                 current_end = next_end
+                merge_count += 1  # Increment merge counter
                 i += 1
             else:
                 # Don't merge: stop trying to merge with subsequent segments
