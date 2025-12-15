@@ -1,9 +1,11 @@
 """
-Example: Multi-Feature Detection and Segment Extraction
+Example: Advanced PELT Detection and Segment Extraction
 
-This script demonstrates the new advanced features:
-1. Multi-feature fusion detection with adaptive parameters
-2. Exporting detected segments as individual CSV files
+This script demonstrates the new advanced PELT-based detection:
+1. Multi-dimensional feature extraction
+2. Energy-based adaptive penalties
+3. Multi-detector ensemble with different fusion methods
+4. Exporting detected segments as individual CSV files
 """
 
 import sys
@@ -31,7 +33,7 @@ def main():
     fs = 1000.0
     
     print("=" * 70)
-    print("Multi-Feature Detection & Segment Extraction Demo")
+    print("Advanced PELT Detection & Segment Extraction Demo")
     print("=" * 70)
     
     # Load data
@@ -45,42 +47,47 @@ def main():
     filtered = apply_notch_filter(filtered, fs, freq=50, harmonics=[1, 2, 3])
     print("  ✓ Bandpass and notch filters applied")
     
-    # Detect with different methods for comparison
-    print("\n[3/5] Detecting muscle activity with different methods...")
+    # Detect with different configurations for comparison
+    print("\n[3/5] Detecting muscle activity with advanced PELT...")
     
     methods_results = {}
     
-    # Method 1: Traditional combined
-    print("  Testing 'combined' method...")
-    seg_combined = detect_muscle_activity(filtered, fs, method='combined')
-    methods_results['combined'] = seg_combined
-    print(f"    → Detected {len(seg_combined)} segments")
+    # Config 1: Single detector
+    print("  Testing single detector...")
+    seg_single = detect_muscle_activity(
+        filtered, fs, method='combined',
+        min_duration=0.1, sensitivity=1.5,
+        use_multi_detector=False
+    )
+    methods_results['single_detector'] = seg_single
+    print(f"    → Detected {len(seg_single)} segments")
     
-    # Method 2: Multi-feature without clustering
-    print("  Testing 'multi_feature' (no clustering)...")
-    seg_multi_no_clust = detect_muscle_activity(
+    # Config 2: Multi-detector with confidence fusion (recommended)
+    print("  Testing multi-detector with confidence fusion...")
+    seg_confidence = detect_muscle_activity(
         filtered, fs, 
-        method='multi_feature',
-        use_clustering=False,
-        adaptive_pen=True
+        method='combined',
+        min_duration=0.1, sensitivity=1.5,
+        n_detectors=3, fusion_method='confidence',
+        use_multi_detector=True
     )
-    methods_results['multi_feature (no clustering)'] = seg_multi_no_clust
-    print(f"    → Detected {len(seg_multi_no_clust)} segments")
+    methods_results['confidence_fusion'] = seg_confidence
+    print(f"    → Detected {len(seg_confidence)} segments")
     
-    # Method 3: Multi-feature with clustering (recommended)
-    print("  Testing 'multi_feature' with clustering (recommended)...")
-    seg_multi_clust = detect_muscle_activity(
+    # Config 3: Multi-detector with voting fusion
+    print("  Testing multi-detector with voting fusion...")
+    seg_voting = detect_muscle_activity(
         filtered, fs,
-        method='multi_feature',
-        use_clustering=True,
-        adaptive_pen=True,
-        min_duration=0.1
+        method='combined',
+        min_duration=0.1, sensitivity=1.5,
+        n_detectors=3, fusion_method='voting',
+        use_multi_detector=True
     )
-    methods_results['multi_feature (with clustering)'] = seg_multi_clust
-    print(f"    → Detected {len(seg_multi_clust)} segments")
+    methods_results['voting_fusion'] = seg_voting
+    print(f"    → Detected {len(seg_voting)} segments")
     
-    # Use the best method for export
-    best_segments = seg_multi_clust
+    # Use the confidence fusion method for export (recommended)
+    best_segments = seg_confidence
     
     # Get detailed info
     print("\n[4/5] Extracting segment metadata...")
@@ -111,11 +118,11 @@ def main():
     print("Demo complete!")
     print("=" * 70)
     print(f"\nSegment files saved to: {output_dir}")
-    print("Comparison plot saved to: data/multi_feature_comparison.png")
+    print("Comparison plot saved to: data/pelt_detector_comparison.png")
 
 
 def visualize_comparison(signal, methods_results, fs, project_dir):
-    """Create comparison visualization of different detection methods."""
+    """Create comparison visualization of different detection configurations."""
     time = np.arange(len(signal)) / fs
     
     n_methods = len(methods_results)
@@ -124,7 +131,7 @@ def visualize_comparison(signal, methods_results, fs, project_dir):
     if n_methods == 1:
         axes = [axes]
     
-    colors = ['blue', 'green', 'red', 'purple', 'orange']
+    colors = ['blue', 'red', 'green', 'purple', 'orange']
     
     for ax, (method_name, segments), color in zip(axes, methods_results.items(), colors):
         ax.plot(time, signal, 'k-', alpha=0.4, linewidth=0.5, label='Filtered Signal')
@@ -143,7 +150,7 @@ def visualize_comparison(signal, methods_results, fs, project_dir):
     axes[-1].set_xlabel('Time (s)')
     plt.tight_layout()
     
-    output_path = os.path.join(project_dir, 'data', 'multi_feature_comparison.png')
+    output_path = os.path.join(project_dir, 'data', 'pelt_detector_comparison.png')
     plt.savefig(output_path, dpi=150)
     print(f"  Comparison plot saved to: {output_path}")
 

@@ -363,8 +363,10 @@ class EMGProcessorGUI:
             import traceback
             return f"❌ Error applying batch filters: {str(e)}\n{traceback.format_exc()}", None
     
-    def detect_activity(self, method, min_duration, max_duration, sensitivity, use_clustering, adaptive_pen, progress=gr.Progress()):
-        """Detect muscle activity segments."""
+    def detect_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
+                       use_multi_detector, use_clustering, detector_sens_str, classification_threshold, 
+                       progress=gr.Progress()):
+        """Detect muscle activity segments using advanced PELT algorithm."""
         try:
             if self.filtered_signal is None:
                 return "❌ Please apply filters first", None
@@ -374,18 +376,39 @@ class EMGProcessorGUI:
             # Convert max_duration (None or float)
             max_dur = float(max_duration) if max_duration and max_duration > 0 else None
             
-            # Detect muscle activity
-            progress(0.3, desc="Detecting muscle activity...")
-            self.segments = detect_muscle_activity(
+            # Parse individual detector sensitivities if provided
+            detector_sensitivities = None
+            if use_multi_detector and detector_sens_str and detector_sens_str.strip():
+                try:
+                    # Parse comma-separated values
+                    detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
+                    if len(detector_sensitivities) != n_detectors:
+                        return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
+                except ValueError:
+                    return "❌ Invalid detector sensitivities format. Use comma-separated numbers (e.g., 1.0, 1.5, 2.0)", None
+            
+            # Detect muscle activity using combined method (only supported method now)
+            progress(0.3, desc="Detecting muscle activity with PELT...")
+            result = detect_muscle_activity(
                 self.filtered_signal,
                 fs=self.fs,
-                method=method,
+                method="combined",
                 min_duration=float(min_duration),
                 max_duration=max_dur,
                 sensitivity=float(sensitivity),
+                n_detectors=int(n_detectors),
+                detector_sensitivities=detector_sensitivities,
+                fusion_method=fusion_method,
+                use_multi_detector=use_multi_detector,
+                classify_segments=True,
                 use_clustering=use_clustering,
-                adaptive_pen=adaptive_pen
+                classification_threshold=float(classification_threshold),
+                return_changepoints=True
             )
+            
+            # Extract segments and changepoints from result
+            self.segments = result['segments']
+            changepoints = result['changepoints']
             
             # Get detailed segment information
             progress(0.6, desc="Extracting segment information...")
@@ -403,6 +426,10 @@ class EMGProcessorGUI:
             
             ax.plot(time, self.filtered_signal, 'k-', linewidth=0.5, alpha=0.5, label='Filtered Signal')
             
+            # Mark all PELT changepoints with vertical lines
+            for cp in changepoints:
+                ax.axvline(cp/self.fs, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+            
             # Highlight detected segments
             colors = plt.cm.Set1(np.linspace(0, 1, max(len(self.segments), 1)))
             for i, (start, end) in enumerate(self.segments):
@@ -411,7 +438,7 @@ class EMGProcessorGUI:
             
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('Amplitude')
-            ax.set_title(f'Muscle Activity Detection ({len(self.segments)} segments detected)')
+            ax.set_title(f'Muscle Activity Detection ({len(self.segments)} active segments, {len(changepoints)} changepoints)')
             ax.grid(True, alpha=0.3)
             if self.segments:
                 ax.legend(loc='upper right', ncol=2)
@@ -420,7 +447,7 @@ class EMGProcessorGUI:
             
             # Create info text
             progress(0.9, desc="Formatting results...")
-            info = f"✅ Detected {len(self.segments)} muscle activity segments:\n\n"
+            info = f"✅ Detected {len(self.segments)} muscle activity segments from {len(changepoints)} PELT changepoints:\n\n"
             for i, seg in enumerate(self.segment_data[:10], 1):
                 info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
                 info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
@@ -434,8 +461,10 @@ class EMGProcessorGUI:
             import traceback
             return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
     
-    def detect_batch_activity(self, method, min_duration, max_duration, sensitivity, use_clustering, adaptive_pen, progress=gr.Progress()):
-        """Detect muscle activity in all batch-filtered files."""
+    def detect_batch_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
+                             use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
+                             progress=gr.Progress()):
+        """Detect muscle activity in all batch-filtered files using advanced PELT algorithm."""
         try:
             if not self.batch_filtered:
                 return "❌ Please apply batch filters first", None
@@ -448,19 +477,34 @@ class EMGProcessorGUI:
             # Convert max_duration
             max_dur = float(max_duration) if max_duration and max_duration > 0 else None
             
+            # Parse individual detector sensitivities if provided
+            detector_sensitivities = None
+            if use_multi_detector and detector_sens_str and detector_sens_str.strip():
+                try:
+                    detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
+                    if len(detector_sensitivities) != n_detectors:
+                        return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
+                except ValueError:
+                    return "❌ Invalid detector sensitivities format. Use comma-separated numbers", None
+            
             for i, data in enumerate(self.batch_filtered):
                 progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']}...")
                 
-                # Detect muscle activity
+                # Detect muscle activity using combined method
                 segments = detect_muscle_activity(
                     data['filtered'],
                     fs=self.fs,
-                    method=method,
+                    method="combined",
                     min_duration=float(min_duration),
                     max_duration=max_dur,
                     sensitivity=float(sensitivity),
+                    n_detectors=int(n_detectors),
+                    detector_sensitivities=detector_sensitivities,
+                    fusion_method=fusion_method,
+                    use_multi_detector=use_multi_detector,
+                    classify_segments=True,
                     use_clustering=use_clustering,
-                    adaptive_pen=adaptive_pen
+                    classification_threshold=float(classification_threshold)
                 )
                 
                 # Get detailed segment information
@@ -1697,9 +1741,20 @@ def create_gui():
             # Tab 3: Detect Activity
             with gr.Tab("🎯 Detect Activity / 检测肌肉活动"):
                 gr.Markdown("""
-                ### Detect muscle activity segments
+                ### Advanced PELT-based Muscle Activity Detection
                 
-                **Sensitivity**: Lower values = more sensitive (detects more segments including low-amplitude rhythmic patterns)
+                **New Algorithm Features:**
+                - Energy-based adaptive penalty zones (low energy = more sensitive)
+                - Multi-dimensional features (time, frequency, complexity domains)
+                - Multi-detector ensemble with individual sensitivity control
+                - Activity/Non-activity classification (filters out rest periods)
+                - Intelligent merging of dense events (gaps < 50ms)
+                
+                **Sensitivity**: Lower = more sensitive (more segments), Higher = stricter (fewer segments)
+                
+                **Multi-Detector**: Enable ensemble of detectors with individual sensitivities for robust detection
+                
+                **Activity Classification**: Automatically filters out non-activity segments after PELT detection
                 
                 **Max Duration**: Limits segment length by splitting long detections (0 = no limit)
                 """)
@@ -1708,19 +1763,41 @@ def create_gui():
                     with gr.Tab("Single File"):
                         with gr.Row():
                             with gr.Column(scale=1):
-                                method_input = gr.Radio(
-                                    ["multi_feature", "combined", "amplitude", "ruptures"],
-                                    value="multi_feature",
-                                    label="Detection Method"
-                                )
                                 min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                               label="Minimum segment duration (s)")
                                 max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
                                                               label="Maximum segment duration (s, 0=no limit)")
-                                sensitivity_input = gr.Slider(0.1, 3.0, value=1.5, step=0.1,
-                                                             label="Detection Sensitivity")
-                                clustering_input = gr.Checkbox(value=True, label="Use clustering")
-                                adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
+                                sensitivity_input = gr.Slider(0.1, 5.0, value=1.5, step=0.1,
+                                                             label="Base Detection Sensitivity")
+                                
+                                gr.Markdown("**Multi-Detector Ensemble Settings:**")
+                                use_multi_detector_input = gr.Checkbox(value=True, label="Enable Multi-Detector Ensemble")
+                                n_detectors_input = gr.Slider(1, 5, value=3, step=1,
+                                                             label="Number of Detectors")
+                                detector_sens_input = gr.Textbox(
+                                    label="Individual Detector Sensitivities (optional)",
+                                    placeholder="e.g., 1.0, 1.5, 2.0 (leave blank for auto range)",
+                                    value="",
+                                    info="Comma-separated sensitivity values, one per detector"
+                                )
+                                fusion_method_input = gr.Radio(
+                                    ["confidence", "voting", "union"],
+                                    value="confidence",
+                                    label="Fusion Method",
+                                    info="confidence: weighted by scores, voting: majority, union: combine all"
+                                )
+                                
+                                gr.Markdown("**Activity Classification:**")
+                                classification_threshold_input = gr.Slider(
+                                    -2.0, 2.0, value=0.5, step=0.1,
+                                    label="Classification Strictness",
+                                    info="Negative = very lenient, 0 = median, Positive = strict. Can be negative for signals with high-amplitude bursts."
+                                )
+                                use_clustering_input = gr.Checkbox(
+                                    value=False, 
+                                    label="Use Clustering for Classification",
+                                    info="K-means clustering (slower but automatic)"
+                                )
                                 
                                 detect_btn = gr.Button("Detect Activity", variant="primary")
                             
@@ -1730,28 +1807,49 @@ def create_gui():
                         
                         detect_btn.click(
                             fn=processor.detect_activity,
-                            inputs=[method_input, min_duration_input, max_duration_input, sensitivity_input, clustering_input, adaptive_pen_input],
+                            inputs=[min_duration_input, max_duration_input, sensitivity_input, 
+                                   n_detectors_input, fusion_method_input, use_multi_detector_input,
+                                   use_clustering_input, detector_sens_input, classification_threshold_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
                     with gr.Tab("Batch Detection / 批量检测"):
-                        gr.Markdown("### Detect activity in all batch-filtered files")
+                        gr.Markdown("### Detect activity in all batch-filtered files using PELT")
                         
                         with gr.Row():
                             with gr.Column(scale=1):
-                                batch_method_input = gr.Radio(
-                                    ["multi_feature", "combined", "amplitude", "ruptures"],
-                                    value="multi_feature",
-                                    label="Detection Method"
-                                )
                                 batch_min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                                     label="Minimum segment duration (s)")
                                 batch_max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
                                                                     label="Maximum segment duration (s, 0=no limit)")
-                                batch_sensitivity_input = gr.Slider(0.1, 3.0, value=1.5, step=0.1,
-                                                                   label="Detection Sensitivity")
-                                batch_clustering_input = gr.Checkbox(value=True, label="Use clustering")
-                                batch_adaptive_pen_input = gr.Checkbox(value=True, label="Use adaptive penalty")
+                                batch_sensitivity_input = gr.Slider(0.1, 5.0, value=1.5, step=0.1,
+                                                                   label="Base Detection Sensitivity")
+                                
+                                gr.Markdown("**Multi-Detector Ensemble Settings:**")
+                                batch_use_multi_detector_input = gr.Checkbox(value=True, label="Enable Multi-Detector Ensemble")
+                                batch_n_detectors_input = gr.Slider(1, 5, value=3, step=1,
+                                                                   label="Number of Detectors")
+                                batch_detector_sens_input = gr.Textbox(
+                                    label="Individual Detector Sensitivities (optional)",
+                                    placeholder="e.g., 1.0, 1.5, 2.0",
+                                    value=""
+                                )
+                                batch_fusion_method_input = gr.Radio(
+                                    ["confidence", "voting", "union"],
+                                    value="confidence",
+                                    label="Fusion Method"
+                                )
+                                
+                                gr.Markdown("**Activity Classification:**")
+                                batch_classification_threshold_input = gr.Slider(
+                                    -2.0, 2.0, value=0.5, step=0.1,
+                                    label="Classification Strictness",
+                                    info="Negative = very lenient, 0 = median, Positive = strict"
+                                )
+                                batch_use_clustering_input = gr.Checkbox(
+                                    value=False,
+                                    label="Use Clustering for Classification"
+                                )
                                 
                                 batch_detect_btn = gr.Button("🎯 Detect in All Files", variant="primary")
                             
@@ -1761,8 +1859,9 @@ def create_gui():
                         
                         batch_detect_btn.click(
                             fn=processor.detect_batch_activity,
-                            inputs=[batch_method_input, batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
-                                   batch_clustering_input, batch_adaptive_pen_input],
+                            inputs=[batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
+                                   batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
+                                   batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         
@@ -2131,7 +2230,7 @@ def create_gui():
                 - **Single File**: Detect in single file
                 - **Batch Detection**: Detect in all batch-filtered files at once
                 - **Extract Features**: Extract features from all detected segments
-                - **multi_feature** method recommended
+                - **Advanced PELT algorithm** with multi-detector ensemble
                 
                 ### 4. HHT Analysis (希尔伯特-黄变换)
                 - **CEEMDAN** decomposition for stable IMFs (recommended)

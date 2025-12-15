@@ -32,122 +32,99 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
 
 ### 2. Muscle Activity Detection & Segmentation / 肌肉活动检测与分段
 
-**Two-Stage Amplitude-First Detection Algorithm**
+**Advanced PELT-Based Detection with Multi-Detector Ensemble**
 
-The toolkit implements an advanced muscle activity detection system using a two-stage approach that prioritizes amplitude for determining event presence, then uses multi-factor analysis for precise boundary refinement. This design significantly reduces missed events while maintaining strict duration constraints.
+The toolkit now implements a state-of-the-art muscle activity detection system using an enhanced PELT (Pruned Exact Linear Time) algorithm with multi-dimensional feature analysis and ensemble detection mechanisms.
 
-#### Detection Methods
+#### Detection Algorithm: Advanced PELT
 
-1. **Ruptures**: Change point detection for structural signal changes
-2. **Amplitude**: Threshold-based detection for sustained activity
-3. **Rhythmic Patterns**: Local RMS variance for periodic movements
-4. **Amplitude Trends**: Gradual activation pattern detection
-5. **Combined** (⭐ Recommended): Two-stage amplitude-first detection with multi-factor refinement
+The new detection system uses only the **Combined** method, which is now powered by an advanced PELT algorithm with the following innovations:
 
-#### Combined Method: Two-Stage Detection
+**1. Energy-Based Adaptive Penalty Zones**
+- Signal is divided into energy zones (low, medium, high) using K-means clustering
+- Low energy zones: Lower penalty (more sensitive detection)
+- High energy zones: Higher penalty (prevents over-segmentation)
+- Formula: `penalty = base_penalty × zone_multiplier`
+  - Low energy zone: 0.5× base penalty
+  - Medium energy zone: 1.0× base penalty  
+  - High energy zone: 2.0× base penalty
 
-The combined method uses a two-stage approach that separates event presence detection from boundary determination:
+**2. Multi-Dimensional Feature Vectors**
 
-**STAGE 1: Event Presence Detection (Amplitude-Weighted)**
+The algorithm extracts 8 features across three domains:
 
-Goal: Identify ALL regions where muscle activity MIGHT exist
+**Time-Domain Features:**
+- RMS (Root Mean Square) - signal energy
+- MAV (Mean Absolute Value) - amplitude level
+- VAR (Variance) - signal variability
+- WL (Waveform Length) - signal complexity
 
-Strategy:
-- **Primary Criterion (70%)**: Amplitude elevation
-  - Calculate adaptive amplitude threshold from signal statistics
-  - Lower threshold by 20% for aggressive initial detection
-  - Identify all regions where RMS exceeds threshold
-- **Secondary Criterion (20%)**: Signal consistency
-  - Low coefficient of variation indicates coherent activity
-- **Tertiary Criterion (10%)**: Duration reasonableness
-  - Check if duration is within physiological range
+**Frequency-Domain Features:**
+- MNF (Mean Frequency) - spectral centroid
+- MDF (Median Frequency) - spectral median
 
-**Confidence Formula (Stage 1):**
-```
-presence_confidence = 0.70 × amplitude_elevation + 
-                     0.20 × consistency + 
-                     0.10 × duration_reasonableness
-```
+**Complexity Features:**
+- ZCR (Zero Crossing Rate) - frequency indicator
+- Sample Entropy (proxy) - signal regularity
 
-**Confidence Threshold (Lowered):**
-- Adapts based on sensitivity: `threshold = 0.25 + (sensitivity - 1.0) × 0.075`
-- Range: 0.25 to 0.40 (vs previous 0.30 to 0.50)
-- Lower thresholds reduce missed events
+All features are normalized and fed to PELT for robust change point detection.
 
-**STAGE 2: Boundary Refinement (Multi-Factor)**
+**3. Multi-Detector Ensemble**
 
-Goal: Determine precise start/end points for confirmed events
+Runs multiple PELT detectors in parallel with different sensitivity levels:
+- Number of detectors: 1-5 (default: 3)
+- Sensitivity range: automatically distributed around base sensitivity
+- Each detector independently identifies events
 
-Strategy:
-- Use ruptures (change point detection) to find internal structure
-- Refine boundaries to local RMS minima for clean event separation
-- Apply duration constraints (min/max) during refinement
-- Ensure no overlaps between detected events
-- Merge similar nearby events intelligently
+**Fusion Methods:**
+- **Confidence** (recommended): Weighted by confidence scores
+  - Each segment scored based on amplitude contrast, consistency, and duration
+  - Confidence map created across all detectors
+  - Threshold at 50th percentile of positive confidences
+- **Voting**: Majority vote across detectors
+  - Requires ≥50% of detectors to agree on a region
+  - More conservative, reduces false positives
+- **Union**: Combines all detections
+  - Most sensitive, may include more false positives
+  - Overlaps are merged
 
-Refinement Process:
-1. Apply ruptures within each confirmed event region
-2. Find local minima in first/last quarters for boundary alignment
-3. Validate refined boundaries meet minimum duration
-4. Merge events with small gaps (<200ms) and similar amplitudes
-5. Remove any remaining overlaps (keeps larger/merged segments)
-6. Final hard filter ensures ALL segments ≥ min_duration
+**4. Intelligent Dense Event Merging**
 
-#### Key Improvements Over Previous Approach
+Automatically merges events with gaps < 50ms:
+- Prevents over-segmentation in rhythmic/rapid activity
+- Common in repetitive muscle contractions
+- Merged segments must still satisfy min_duration constraint
 
-**Reduced Missed Events:**
-- Amplitude gets 70% weight in Stage 1 (was 35% in previous approach)
-- Lowered detection thresholds (0.25-0.40 vs 0.30-0.50)
-- More aggressive initial candidate generation
-- Separate presence detection from boundary determination
-
-**Better Boundary Precision:**
-- Ruptures used specifically for boundary refinement
-- Local minima alignment for clean event separation
-- Multi-factor quality metrics integrated in Stage 2
-
-**Maintained Strict Constraints:**
-- min_duration enforced as hard constraint at all stages
-- max_duration respected during refinement
-- No event overlaps guaranteed
-
-#### Duration Constraints: Hard vs Soft
+**5. Strict Duration Enforcement**
 
 **🔒 min_duration (HARD CONSTRAINT)**:
-- **Strictly enforced at ALL stages** - no segment can be shorter than this value
-- Stage 1: Filters initial candidates
-- Stage 2: Validates refined boundaries
-- Post-processing: Never creates segments below threshold
+- Absolutely enforced at ALL stages
+- Applied to: initial detection, merging, final output
+- No segment can ever be shorter than this value
 - Typical range: 0.01 - 10.0 seconds
 
-**📏 max_duration (Soft Optimization Guide)**:
-- Optional upper bound for event duration
-- Long events exceeding this trigger intelligent splitting in Stage 2
-- Uses ruptures and RMS minima for natural break points
+**📏 max_duration (Optional Split Trigger)**:
+- Long events exceeding this are split intelligently
+- Uses PELT change points and RMS minima for natural breaks
+- Each split segment must satisfy min_duration
 - Typical range: 3.0 - 30.0 seconds
 
-#### Algorithm Philosophy
+#### Algorithm Flow
 
-**Amplitude-First for Presence, Multi-Factor for Boundaries:**
-- Stage 1 answers: "Does an event exist here?" → Primarily amplitude
-- Stage 2 answers: "Where exactly does it start/end?" → Multi-factor analysis
-- This separation reduces missed events while maintaining precision
-
-**Duration Constraints = Solution Space Boundaries:**
-- min_duration and max_duration define the valid solution space
-- Within this space, the algorithm finds optimal event boundaries
-- Not all potential boundaries are activated
-- Only high-quality boundaries that respect constraints are used
-
-**Non-Overlapping Requirement:**
-- Detected events never overlap
-- Overlapping regions are merged or resolved in favor of larger extent
-- Ensures clean, non-ambiguous event sequences
+1. **Feature Extraction**: Extract 8-dimensional feature vectors from preprocessed signal
+2. **Energy Zone Computation**: Cluster signal into energy zones for adaptive penalties
+3. **Multi-Detector Ensemble** (if enabled):
+   - Run N detectors with sensitivity range [0.7×base, 1.3×base]
+   - Each detector uses zone-specific adaptive penalties
+   - Calculate confidence for each detected segment
+4. **Fusion**: Combine detections using selected method (voting/confidence/union)
+5. **Dense Event Merging**: Merge events with gaps < 50ms
+6. **Duration Enforcement**: Final filter ensures all constraints satisfied
 
 #### Parameter Tuning
 
 **sensitivity** parameter (default: 1.5):
-- Lower values (0.5 - 1.5): More sensitive, detects subtle activities
+- Lower values (0.1 - 1.5): More sensitive, detects more segments
   - Lower confidence threshold
   - Lower amplitude threshold
   - More events detected (may include weaker activations)
@@ -171,10 +148,13 @@ from semg_preprocessing import detect_muscle_activity
 segments = detect_muscle_activity(
     filtered_signal, 
     fs=1000,
-    method='combined',
-    min_duration=0.5,      # HARD: NO segment < 500ms
-    max_duration=5.0,      # Soft: split events > 5s
-    sensitivity=1.5        # Balanced sensitivity
+    method='combined',           # Only supported method (PELT-based)
+    min_duration=0.5,            # HARD: NO segment < 500ms
+    max_duration=5.0,            # Soft: split events > 5s
+    sensitivity=1.5,             # Controls PELT penalty (lower = more sensitive)
+    n_detectors=3,               # Multi-detector ensemble
+    fusion_method='confidence',  # How to combine detectors
+    use_multi_detector=True      # Enable ensemble
 )
 
 # Each segment is a tuple: (start_index, end_index)
@@ -186,13 +166,13 @@ assert all(d >= 0.5 for d in durations), "Duration constraint violated!"
 ```
 
 **Key Advantages:**
-- ✅ Finds meaningful physiological events, not arbitrary segments
+- ✅ Multi-dimensional feature analysis (time, frequency, complexity)
+- ✅ Energy-based adaptive penalty (context-aware detection)
+- ✅ Multi-detector ensemble for robust detection
+- ✅ Automatic dense event merging (gaps < 50ms)
 - ✅ Strict enforcement of minimum duration (hard constraint)
-- ✅ Confidence-based filtering removes low-quality detections
-- ✅ Holistic optimization considers overall segmentation quality
-- ✅ Intelligent boundary activation prevents over-segmentation
 - ✅ Works well across different signal characteristics and noise levels
-- ✅ Adaptive thresholds for diverse sEMG amplitude ranges
+- ✅ Direct interpretability: sensitivity → PELT penalty
 
 ### 3. Feature Extraction / 特征提取
 

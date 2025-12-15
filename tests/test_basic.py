@@ -80,31 +80,42 @@ def test_detection():
     burst2_end = int(1.7 * fs)
     signal[burst2_start:burst2_end] += 2.5 * np.random.randn(burst2_end - burst2_start)
     
-    # Test amplitude method with manual threshold
+    # Test combined method (only supported method now)
     segments = detect_muscle_activity(
         signal, fs, 
-        method='amplitude', 
+        method='combined', 
         min_duration=0.1,
-        amplitude_threshold=0.5  # Manual threshold
+        sensitivity=1.5,
+        use_multi_detector=False,
+        classification_threshold=0.3  # Less strict to ensure detection
     )
     
     assert len(segments) > 0, "Should detect at least one segment"
     assert all(isinstance(s, tuple) and len(s) == 2 for s in segments), "Segments should be tuples of (start, end)"
     assert all(s[1] > s[0] for s in segments), "End should be after start"
     
-    print(f"✓ Amplitude detection test passed ({len(segments)} segments detected)")
+    print(f"✓ Single detector test passed ({len(segments)} segments detected)")
     
-    # Test multi-feature method
+    # Test multi-detector ensemble
     segments_multi = detect_muscle_activity(
         signal, fs,
-        method='multi_feature',
+        method='combined',
         min_duration=0.1,
-        use_clustering=False,
-        adaptive_pen=True
+        sensitivity=1.5,
+        n_detectors=3,
+        fusion_method='confidence',
+        use_multi_detector=True,
+        classification_threshold=0.3  # Less strict to ensure detection
     )
     
-    assert len(segments_multi) > 0, "Multi-feature should detect at least one segment"
-    print(f"✓ Multi-feature detection test passed ({len(segments_multi)} segments detected)")
+    assert len(segments_multi) > 0, "Multi-detector should detect at least one segment"
+    print(f"✓ Multi-detector ensemble test passed ({len(segments_multi)} segments detected)")
+    
+    # Test that all segments meet minimum duration
+    min_samples = int(0.1 * fs)
+    for start, end in segments + segments_multi:
+        assert (end - start) >= min_samples, f"Segment ({start}, {end}) violates min_duration"
+    print("✓ Duration constraints verified")
 
 
 def test_segmentation():
