@@ -6,12 +6,40 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
 
 ## 📚 Documentation / 文档
 
+- **[Enhanced Features Guide](ENHANCED_FEATURES.md)** - **NEW!** TKEO preprocessing, energy-aware merging, and batch HHT export
 - **[Feature Algorithms](FEATURE_ALGORITHMS.md)** - Detailed mathematical formulas and physical meanings for all feature extraction algorithms
 - **[GUI Guide](GUI_GUIDE.md)** - Graphical user interface usage guide
 - **[Implementation Summary](IMPLEMENTATION_SUMMARY.md)** - Technical implementation details
 - **[Project Structure](PROJECT_STRUCTURE.md)** - Code organization and architecture
 
 ## 🎯 Key Features / 核心功能
+
+### ⭐ NEW: Enhanced Detection Features
+
+**Latest improvements for dumbbell exercise recognition and HHT analysis:**
+
+1. **TKEO (Teager-Kaiser Energy Operator) Preprocessing** 🆕
+   - Enhances changepoint detection by emphasizing rapid amplitude/frequency changes
+   - Significantly improves detection of muscle activity boundaries
+   - Used internally by PELT algorithm (original signal preserved for analysis)
+   - Can be enabled/disabled via `use_tkeo` parameter (default: True)
+   - Research-backed approach: Li et al. (2007), Solnik et al. (2010)
+
+2. **Energy-Aware Segment Merging** 🆕
+   - Intelligent merging based on boundary energy states
+   - Correctly identifies complete dumbbell actions (lift + lower as one event)
+   - HIGH energy boundary → MERGE (transition within action)
+   - LOW energy boundary → KEEP SEPARATE (different actions)
+   - Non-adjacent segments always kept separate
+
+3. **Batch HHT Hilbert Spectrum Export** 🆕
+   - Export Hilbert spectra for ALL activity segments at once
+   - One NPZ matrix file + one PNG visualization per segment
+   - Automatic sequential numbering (segment_001, segment_002, ...)
+   - Publication-ready visualizations with proper labels
+   - Simple API: `export_activity_segments_hht(signal, segments, fs, output_dir)`
+
+**📖 See [ENHANCED_FEATURES.md](ENHANCED_FEATURES.md) for detailed documentation and examples.**
 
 ### 1. EMG Data Preprocessing / EMG数据预处理
 
