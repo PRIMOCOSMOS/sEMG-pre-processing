@@ -1646,3 +1646,248 @@ def export_features_to_csv(
     # Save to CSV
     df.to_csv(filepath, index=False, float_format='%.6f')
     print(f"Features exported to: {filepath}")
+
+
+def export_hilbert_spectra_batch(
+    segments: List[np.ndarray],
+    fs: float,
+    output_dir: str,
+    base_filename: str = "segment",
+    n_freq_bins: int = 256,
+    normalize_length: int = 256,
+    max_freq: Optional[float] = None,
+    use_ceemdan: bool = True,
+    save_visualization: bool = True,
+    dpi: int = 150
+) -> List[Dict[str, str]]:
+    """
+    Export Hilbert spectra for all activity segments in batch.
+    
+    For each sEMG activity segment, exports:
+    1. NPZ file containing spectrum matrix, time axis, and frequency axis
+    2. PNG visualization image of the Hilbert spectrum
+    
+    This function addresses requirement #3: export Hilbert spectra for ALL detected
+    activity segments, with one matrix file and one visualization per segment.
+    
+    Parameters:
+    -----------
+    segments : List[np.ndarray]
+        List of sEMG activity segments (1D arrays)
+    fs : float
+        Sampling frequency in Hz
+    output_dir : str
+        Directory to save output files
+    base_filename : str, optional
+        Base name for output files (default: "segment")
+        Files will be named: {base_filename}_001.npz, {base_filename}_001.png, etc.
+    n_freq_bins : int, optional
+        Number of frequency bins (default: 256)
+    normalize_length : int, optional
+        Target time axis length (default: 256)
+    max_freq : float, optional
+        Maximum frequency in Hz (default: fs/2)
+    use_ceemdan : bool, optional
+        Use CEEMDAN decomposition (default: True)
+    save_visualization : bool, optional
+        Whether to save PNG visualizations (default: True)
+    dpi : int, optional
+        DPI for PNG images (default: 150)
+    
+    Returns:
+    --------
+    List[Dict[str, str]]
+        List of dictionaries containing file paths for each segment:
+        [
+            {
+                'segment_index': 0,
+                'npz_path': '/path/to/segment_001.npz',
+                'png_path': '/path/to/segment_001.png'  # if save_visualization=True
+            },
+            ...
+        ]
+    
+    Examples:
+    ---------
+    >>> from semg_preprocessing import detect_muscle_activity, segment_signal
+    >>> from semg_preprocessing.hht import export_hilbert_spectra_batch
+    >>> 
+    >>> # Detect activity segments
+    >>> activity_periods = detect_muscle_activity(filtered_signal, fs=1000)
+    >>> segments = segment_signal(filtered_signal, activity_periods, fs=1000)
+    >>> 
+    >>> # Extract just the data arrays
+    >>> segment_arrays = [seg['data'] for seg in segments]
+    >>> 
+    >>> # Export all Hilbert spectra
+    >>> export_info = export_hilbert_spectra_batch(
+    >>>     segment_arrays, 
+    >>>     fs=1000,
+    >>>     output_dir='./hht_results',
+    >>>     base_filename='activity_segment'
+    >>> )
+    >>> 
+    >>> print(f"Exported {len(export_info)} Hilbert spectra")
+    """
+    import os
+    import matplotlib.pyplot as plt
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if max_freq is None:
+        max_freq = fs / 2
+    
+    export_info = []
+    
+    print(f"Exporting Hilbert spectra for {len(segments)} segments...")
+    
+    for idx, segment in enumerate(segments):
+        segment_num = idx + 1
+        
+        # Compute Hilbert spectrum
+        spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
+            segment,
+            fs,
+            n_freq_bins=n_freq_bins,
+            max_freq=max_freq,
+            normalize_length=normalize_length,
+            normalize_time=True,
+            normalize_amplitude=False,
+            use_ceemdan=use_ceemdan,
+            log_scale=True
+        )
+        
+        # Generate filenames with zero-padded numbering
+        npz_filename = f"{base_filename}_{segment_num:03d}.npz"
+        npz_path = os.path.join(output_dir, npz_filename)
+        
+        # Save NPZ file
+        np.savez_compressed(
+            npz_path,
+            spectrum=spectrum,
+            time=time_axis,
+            frequency=freq_axis,
+            sampling_rate=fs,
+            segment_index=idx
+        )
+        
+        info_dict = {
+            'segment_index': idx,
+            'segment_number': segment_num,
+            'npz_path': npz_path
+        }
+        
+        # Save visualization if requested
+        if save_visualization:
+            png_filename = f"{base_filename}_{segment_num:03d}.png"
+            png_path = os.path.join(output_dir, png_filename)
+            
+            # Create visualization
+            fig, ax = plt.subplots(figsize=(10, 6), dpi=dpi)
+            
+            # Plot Hilbert spectrum
+            im = ax.pcolormesh(
+                time_axis, 
+                freq_axis, 
+                spectrum,
+                shading='auto',
+                cmap='jet'
+            )
+            
+            ax.set_xlabel('Normalized Time', fontsize=12)
+            ax.set_ylabel('Frequency (Hz)', fontsize=12)
+            ax.set_title(f'Hilbert Spectrum - Segment {segment_num:03d}', fontsize=14, fontweight='bold')
+            
+            # Add colorbar
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label('Amplitude (Log Scale)', fontsize=11)
+            
+            # Grid for better readability
+            ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            
+            # Tight layout
+            plt.tight_layout()
+            
+            # Save figure
+            plt.savefig(png_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            
+            info_dict['png_path'] = png_path
+        
+        export_info.append(info_dict)
+        
+        # Progress update
+        if (segment_num % 10 == 0) or (segment_num == len(segments)):
+            print(f"  Processed {segment_num}/{len(segments)} segments")
+    
+    print(f"\nExport complete!")
+    print(f"  NPZ files saved to: {output_dir}")
+    if save_visualization:
+        print(f"  PNG visualizations saved to: {output_dir}")
+    
+    return export_info
+
+
+def export_activity_segments_hht(
+    signal: np.ndarray,
+    activity_segments: List[Tuple[int, int]],
+    fs: float,
+    output_dir: str,
+    base_filename: str = "activity_segment",
+    **hht_kwargs
+) -> List[Dict[str, str]]:
+    """
+    Convenience function to export HHT analysis for all detected activity segments.
+    
+    This function combines segment extraction and HHT export in one step.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Full preprocessed sEMG signal
+    activity_segments : List[Tuple[int, int]]
+        List of (start_index, end_index) tuples from detect_muscle_activity()
+    fs : float
+        Sampling frequency in Hz
+    output_dir : str
+        Directory to save output files
+    base_filename : str, optional
+        Base name for output files
+    **hht_kwargs : dict
+        Additional keyword arguments for export_hilbert_spectra_batch()
+        (e.g., n_freq_bins, normalize_length, use_ceemdan, save_visualization)
+    
+    Returns:
+    --------
+    List[Dict[str, str]]
+        Export information for each segment (see export_hilbert_spectra_batch)
+    
+    Examples:
+    ---------
+    >>> from semg_preprocessing import detect_muscle_activity
+    >>> from semg_preprocessing.hht import export_activity_segments_hht
+    >>> 
+    >>> # Detect activity
+    >>> segments = detect_muscle_activity(filtered_signal, fs=1000, min_duration=0.5)
+    >>> 
+    >>> # Export HHT for all segments
+    >>> export_info = export_activity_segments_hht(
+    >>>     filtered_signal,
+    >>>     segments,
+    >>>     fs=1000,
+    >>>     output_dir='./hht_output',
+    >>>     base_filename='bicep_curl'
+    >>> )
+    """
+    # Extract segment data
+    segment_arrays = [signal[start:end] for start, end in activity_segments]
+    
+    # Export Hilbert spectra
+    return export_hilbert_spectra_batch(
+        segment_arrays,
+        fs,
+        output_dir,
+        base_filename,
+        **hht_kwargs
+    )

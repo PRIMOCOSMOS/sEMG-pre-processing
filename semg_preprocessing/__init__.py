@@ -19,6 +19,7 @@ from .filters import (
 from .detection import (
     detect_muscle_activity,
     segment_signal,
+    apply_tkeo,
 )
 
 from .utils import (
@@ -42,6 +43,8 @@ from .hht import (
     extract_semg_features,
     export_features_to_csv,
     save_hilbert_spectrum,
+    export_hilbert_spectra_batch,
+    export_activity_segments_hht,
 )
 
 from .augmentation import (
@@ -66,6 +69,7 @@ __all__ = [
     # Detection
     "detect_muscle_activity",
     "segment_signal",
+    "apply_tkeo",
     # I/O
     "load_csv_data",
     "load_mat_data",
@@ -85,6 +89,8 @@ __all__ = [
     "extract_semg_features",
     "export_features_to_csv",
     "save_hilbert_spectrum",
+    "export_hilbert_spectra_batch",
+    "export_activity_segments_hht",
     # Augmentation
     "augment_by_imf_mixing",
     "augment_by_imf_recombination",
