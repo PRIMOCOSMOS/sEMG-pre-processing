@@ -18,6 +18,55 @@ from sklearn.cluster import KMeans
 from scipy.stats import entropy
 
 
+def apply_tkeo(signal: np.ndarray) -> np.ndarray:
+    """
+    Apply Teager-Kaiser Energy Operator (TKEO) to enhance signal for changepoint detection.
+    
+    The TKEO is a nonlinear operator that emphasizes high-frequency, high-amplitude components
+    of the signal, making it particularly effective for detecting muscle activity transitions.
+    
+    Formula: TKEO(x[n]) = x[n]² - x[n-1] × x[n+1]
+    
+    This operator is highly sensitive to instantaneous changes in both amplitude and frequency,
+    making it superior to simple amplitude-based methods for detecting muscle activity onsets.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input sEMG signal (1D array)
+    
+    Returns:
+    --------
+    np.ndarray
+        TKEO-transformed signal with enhanced transitions
+    
+    References:
+    -----------
+    - Li et al. (2007) "Teager–Kaiser energy operation of surface EMG improves 
+      muscle activity onset detection" Ann Biomed Eng 35(9):1532–1538
+    - Solnik et al. (2010) "Teager-Kaiser energy operator signal conditioning 
+      improves EMG onset detection" Eur J Appl Physiol 110(3):489-498
+    """
+    n = len(signal)
+    tkeo_signal = np.zeros(n)
+    
+    # Apply TKEO formula: x[n]² - x[n-1] × x[n+1]
+    # Handle boundaries by using edge values
+    for i in range(1, n - 1):
+        tkeo_signal[i] = signal[i] ** 2 - signal[i - 1] * signal[i + 1]
+    
+    # Handle boundary conditions
+    # For first sample, use forward difference approximation
+    tkeo_signal[0] = signal[0] ** 2 - signal[0] * signal[1]
+    # For last sample, use backward difference approximation
+    tkeo_signal[-1] = signal[-1] ** 2 - signal[-2] * signal[-1]
+    
+    # Take absolute value to ensure positive energy values
+    tkeo_signal = np.abs(tkeo_signal)
+    
+    return tkeo_signal
+
+
 def detect_muscle_activity(
     data: np.ndarray,
     fs: float,
@@ -73,6 +122,11 @@ def detect_muscle_activity(
           Positive values = more strict (fewer segments)
           Range: -2.0 to 2.0, where 0.5 is balanced
           Can be negative to handle cases where high-amplitude bursts skew the mean
+        - use_tkeo: bool - Apply TKEO preprocessing for improved changepoint detection (default: True)
+        - merge_threshold: float - Energy ratio threshold for segment merging (default: 0.7)
+          Range: 0.3-0.9, where lower = more aggressive merging (extended range for robustness)
+        - max_merge_count: int - Maximum number of PELT segments to merge into one event (default: 3)
+          Prevents merging of truly independent actions
         - return_changepoints: bool - If True, return dict with segments and changepoints (default: False)
     
     Returns:
@@ -96,6 +150,7 @@ def detect_muscle_activity(
     - After PELT segmentation, segments are classified as active/inactive
     - classification_threshold allows control over classification strictness
     - Dense events with gaps < 50ms are automatically merged
+    - TKEO (Teager-Kaiser Energy Operator) is applied by default for better changepoint detection
     """
     if method != "combined":
         raise ValueError(f"Only 'combined' method is supported. Other methods have been deprecated.")
@@ -110,11 +165,14 @@ def detect_muscle_activity(
     use_clustering = kwargs.get('use_clustering', False)
     classification_threshold = kwargs.get('classification_threshold', 0.5)
     return_changepoints = kwargs.get('return_changepoints', False)
+    use_tkeo = kwargs.get('use_tkeo', True)
+    merge_threshold = kwargs.get('merge_threshold', 0.7)
+    max_merge_count = kwargs.get('max_merge_count', 3)
     
     # Use new advanced PELT detection
     segments, changepoints = _detect_pelt_advanced(
         data, fs, window_size, min_duration, 
-        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector
+        sensitivity, n_detectors, detector_sensitivities, fusion_method, use_multi_detector, use_tkeo, merge_threshold, max_merge_count
     )
     
     # Apply max_duration splitting if specified
@@ -146,23 +204,28 @@ def _detect_pelt_advanced(
     n_detectors: int,
     detector_sensitivities: Optional[List[float]],
     fusion_method: str,
-    use_multi_detector: bool
+    use_multi_detector: bool,
+    use_tkeo: bool = True,
+    merge_threshold: float = 0.7,
+    max_merge_count: int = 3
 ) -> Tuple[List[Tuple[int, int]], List[int]]:
     """
     Advanced PELT-based muscle activity detection with multi-detector ensemble.
     
     This implements the new detection algorithm with:
-    1. Energy-based adaptive penalty zones
-    2. Multi-dimensional feature vectors
-    3. Multiple PELT detectors with individual sensitivities
-    4. Voting/confidence-weighted fusion
-    5. Intelligent event merging for dense events (gaps < 50ms)
-    6. Strict min/max duration enforcement
+    1. Optional TKEO preprocessing for enhanced changepoint detection
+    2. Energy-based adaptive penalty zones
+    3. Multi-dimensional feature vectors
+    4. Multiple PELT detectors with individual sensitivities
+    5. Voting/confidence-weighted fusion
+    6. Intelligent event merging with energy-aware boundary evaluation
+    7. Limit on number of merged segments to prevent merging independent actions
+    8. Strict min/max duration enforcement
     
     Parameters:
     -----------
     data : np.ndarray
-        Input preprocessed sEMG signal
+        Input preprocessed sEMG signal (original signal for display)
     fs : float
         Sampling frequency
     window_size : int, optional
@@ -180,6 +243,12 @@ def _detect_pelt_advanced(
         Method to combine detectors: 'voting', 'confidence', 'union'
     use_multi_detector : bool
         Whether to use multi-detector ensemble
+    use_tkeo : bool
+        Whether to apply TKEO preprocessing for changepoint detection
+    merge_threshold : float
+        Energy ratio threshold for segment merging (default: 0.7)
+    max_merge_count : int
+        Maximum number of PELT segments to merge into one event (default: 3)
     
     Returns:
     --------
@@ -192,10 +261,26 @@ def _detect_pelt_advanced(
     
     min_samples = int(min_duration * fs)
     
+    # Apply TKEO preprocessing if enabled (for changepoint detection only)
+    if use_tkeo:
+        # Apply TKEO to enhance transitions for better changepoint detection
+        tkeo_data = apply_tkeo(data)
+        # Smooth TKEO output to reduce noise
+        kernel_size = max(3, int(fs / 200))  # 5ms smoothing window
+        kernel = np.ones(kernel_size) / kernel_size
+        tkeo_data = np.convolve(tkeo_data, kernel, mode='same')
+        # Use TKEO-enhanced signal for feature extraction
+        detection_signal = tkeo_data
+    else:
+        # Use original signal for detection
+        detection_signal = data
+    
     # Step 1: Extract multi-dimensional features (optimized)
-    features = _extract_multidimensional_features_fast(data, fs, window_size)
+    # Note: We use TKEO-enhanced signal for feature extraction if enabled
+    features = _extract_multidimensional_features_fast(detection_signal, fs, window_size)
     
     # Step 2: Compute energy zones for adaptive penalty
+    # Use original signal for energy zones to maintain energy-based context
     energy_zones = _compute_energy_zones(data, window_size)
     
     all_changepoints = []
@@ -251,8 +336,8 @@ def _detect_pelt_advanced(
     # Remove duplicate changepoints and sort
     all_changepoints = sorted(list(set(all_changepoints)))
     
-    # Step 5: Merge dense events (gaps < 50ms)
-    segments = _merge_dense_events(data, segments, fs, min_samples)
+    # Step 5: Merge dense events (gaps < 50ms) with adaptive threshold and merge limit
+    segments = _merge_dense_events(data, segments, fs, min_samples, merge_threshold, max_merge_count)
     
     # Step 6: Final strict enforcement of duration constraints
     segments = [(s, e) for s, e in segments if (e - s) >= min_samples]
@@ -1062,54 +1147,181 @@ def _merge_dense_events(
     data: np.ndarray,
     segments: List[Tuple[int, int]],
     fs: float,
-    min_samples: int
+    min_samples: int,
+    adaptive_threshold: float = 0.7,
+    max_merge_count: int = 3
 ) -> List[Tuple[int, int]]:
     """
-    Intelligently merge events with gaps < 50ms (dense events).
+    Intelligently merge adjacent events based on boundary energy state.
     
-    This prevents over-segmentation in rhythmic or rapid muscle activity.
+    New merging strategy for dumbbell exercise recognition:
+    1. For non-adjacent segments (separated by inactive periods): Keep separate
+    2. For adjacent segments (directly touching): Evaluate boundary energy state
+       - If boundary is in HIGH energy state → MERGE (part of same action)
+       - If boundary is in LOW energy state → KEEP SEPARATE (different actions)
+    3. Limit merging to max_merge_count segments to prevent merging independent actions
+    
+    This addresses the issue where arm lift/lower transitions can create strong
+    changepoints that split a single dumbbell action into multiple segments.
+    
+    The threshold is adaptive based on signal characteristics:
+    - Base threshold can be adjusted via adaptive_threshold parameter
+    - Automatically adjusts for signals with high variance (multiple energy levels)
+    - For uniform signals, uses the base threshold directly
+    - More aggressive merging in high-amplitude regions to keep peaks within events
     
     Parameters:
     -----------
     data : np.ndarray
-        Original signal
+        Original signal (not TKEO)
     segments : List[Tuple[int, int]]
         Detected segments
     fs : float
         Sampling frequency
     min_samples : int
         Minimum segment size
+    adaptive_threshold : float, optional
+        Base energy ratio threshold for merging (default: 0.7)
+        Lower values = more aggressive merging
+        Higher values = more conservative merging
+        Range: 0.3 - 0.9 recommended (extended for more aggressive merging)
+    max_merge_count : int, optional
+        Maximum number of original PELT segments to merge into one event (default: 3)
+        Prevents merging of truly independent actions
     
     Returns:
     --------
     List[Tuple[int, int]]
-        Merged segments
+        Merged segments with energy-aware logic
     """
     if len(segments) <= 1:
         return segments
     
-    # 50ms in samples
-    merge_threshold = int(0.05 * fs)
+    # Calculate RMS envelope for energy evaluation
+    window_size = int(fs / 10)  # 100ms window
+    kernel = np.ones(window_size) / window_size
+    rms_envelope = np.sqrt(np.convolve(data ** 2, kernel, mode='same'))
+    
+    # Compute global energy statistics for adaptive thresholding
+    signal_rms_mean = np.mean(rms_envelope)
+    signal_rms_std = np.std(rms_envelope)
+    
+    # Calculate coefficient of variation (CV) to assess signal variability
+    # CV = std / mean, measures relative variability
+    if signal_rms_mean > 1e-10:
+        energy_cv = signal_rms_std / signal_rms_mean
+    else:
+        energy_cv = 0.0
+    
+    # Adaptive threshold adjustment based on signal characteristics
+    # More aggressive strategy for high-amplitude regions:
+    # - For signals with high variability (CV > 0.5), be MORE aggressive (lower threshold)
+    # - This helps keep envelope peaks within detected events
+    # - For signals with low variability (CV < 0.3), use base threshold
+    if energy_cv > 0.5:
+        # High variability signal - be significantly more aggressive in merging
+        # Use 0.8× threshold to capture more transitions within same action
+        adjusted_threshold = adaptive_threshold * 0.8
+    elif energy_cv < 0.3:
+        # Low variability signal - use base threshold
+        adjusted_threshold = adaptive_threshold
+    else:
+        # Medium variability - interpolate
+        # Linear interpolation between 0.8× and 1.0× based on CV in [0.3, 0.5]
+        interpolation_factor = 0.8 + 0.2 * (0.5 - energy_cv) / 0.2
+        adjusted_threshold = adaptive_threshold * interpolation_factor
     
     merged = []
     i = 0
     
     while i < len(segments):
         current_start, current_end = segments[i]
+        merge_count = 1  # Track how many segments have been merged
         
-        # Try to merge with next segments
-        while i + 1 < len(segments):
+        # Try to merge with next segments (only if adjacent or nearly adjacent)
+        while i + 1 < len(segments) and merge_count < max_merge_count:
             next_start, next_end = segments[i + 1]
             gap = next_start - current_end
             
-            if gap < merge_threshold:
+            # Define adjacency threshold (segments separated by < 50ms gap)
+            adjacency_threshold = int(0.05 * fs)
+            
+            should_merge = False
+            
+            if gap <= adjacency_threshold:
+                # Segments are adjacent or nearly adjacent
+                # Evaluate energy state at boundary
+                
+                # Define boundary evaluation window (around the changepoint)
+                boundary_window = min(int(fs * 0.05), min_samples // 4)  # 50ms or quarter of min duration
+                
+                # Get boundary region energy (from both sides of the gap)
+                boundary_start = max(0, current_end - boundary_window)
+                boundary_end = min(len(rms_envelope), next_start + boundary_window)
+                
+                # If gap exists, include gap region
+                if gap > 0:
+                    boundary_region_energy = rms_envelope[boundary_start:boundary_end]
+                else:
+                    # Directly adjacent, evaluate at the junction
+                    boundary_region_energy = rms_envelope[boundary_start:boundary_end]
+                
+                # Calculate local energy metrics
+                boundary_mean_energy = np.mean(boundary_region_energy)
+                
+                # Get surrounding energy context for comparison
+                # Before boundary
+                before_window_start = max(0, boundary_start - boundary_window * 2)
+                before_region = rms_envelope[before_window_start:boundary_start]
+                before_energy = np.mean(before_region) if len(before_region) > 0 else 0
+                
+                # After boundary
+                after_window_end = min(len(rms_envelope), boundary_end + boundary_window * 2)
+                after_region = rms_envelope[boundary_end:after_window_end]
+                after_energy = np.mean(after_region) if len(after_region) > 0 else 0
+                
+                # Average energy in the two segments
+                segment_avg_energy = (before_energy + after_energy) / 2
+                
+                # Determine if boundary is HIGH or LOW energy state
+                # HIGH energy: boundary energy is close to or higher than surrounding segment energy
+                # LOW energy: boundary energy is significantly lower than surrounding energy
+                
+                # Calculate energy ratio: boundary_energy / segment_avg_energy
+                if segment_avg_energy > 1e-10:
+                    energy_ratio = boundary_mean_energy / segment_avg_energy
+                else:
+                    energy_ratio = 1.0
+                
+                # Adaptive threshold based on signal characteristics
+                # Use the adjusted threshold calculated from global signal statistics
+                high_energy_threshold = adjusted_threshold
+                
+                if energy_ratio >= high_energy_threshold:
+                    # Boundary is in HIGH energy state
+                    # This suggests it's a transition within the same activity (e.g., lift-to-lower transition)
+                    # MERGE these segments
+                    should_merge = True
+                else:
+                    # Boundary is in LOW energy state
+                    # This suggests it's a true rest period or end of activity
+                    # DON'T MERGE - keep as separate events
+                    should_merge = False
+            else:
+                # Segments are NOT adjacent (gap > 50ms)
+                # According to requirement: keep them separate regardless of their activity status
+                should_merge = False
+            
+            if should_merge:
                 # Merge: extend current segment to include next
                 current_end = next_end
+                merge_count += 1  # Increment merge counter
                 i += 1
             else:
+                # Don't merge: stop trying to merge with subsequent segments
                 break
         
-        # Add merged segment if it meets minimum duration
+        # Add the (potentially merged) segment if it meets minimum duration
         if current_end - current_start >= min_samples:
             merged.append((current_start, current_end))
         
