@@ -374,12 +374,18 @@ def _average_pool_1d(signal: np.ndarray, target_length: int) -> np.ndarray:
     Note:
     -----
     If the signal is shorter than target_length, it will be zero-padded.
+    **Important**: Zero-padding short signals may introduce artifacts in HHT analysis.
+    For best results, ensure input signal length >= target_length, or use a smaller
+    target_length. Typical use case: downsampling from 1000-2000 samples to 256 samples.
+    
     If signal length is not evenly divisible by target_length, the last
     pooling window may be smaller than others.
     """
     current_length = len(signal)
     
     # If signal is shorter, pad with zeros
+    # Note: This is a fallback for edge cases. For HHT analysis, it's better
+    # to ensure the original signal is long enough for meaningful decomposition.
     if current_length <= target_length:
         result = np.zeros(target_length)
         result[:current_length] = signal
@@ -422,10 +428,19 @@ def _average_pool_2d_time(spectrum: np.ndarray, target_time_length: int) -> np.n
     --------
     np.ndarray
         Downsampled spectrum (freq_bins x target_time_length)
+        
+    Note:
+    -----
+    If spectrum time dimension is shorter than target_time_length, it will be zero-padded.
+    **Important**: Zero-padding may introduce artifacts. For best results, ensure 
+    spectrum time dimension >= target_time_length. Typical use case: downsampling 
+    from 1000-2000 time samples to 256 samples after HHT computation.
     """
     n_freq_bins, current_time_length = spectrum.shape
     
     # If spectrum is shorter in time, pad with zeros
+    # Note: This is a fallback for edge cases. Ideally, HHT should be computed
+    # on signals long enough that the spectrum doesn't need padding.
     if current_time_length <= target_time_length:
         result = np.zeros((n_freq_bins, target_time_length))
         result[:, :current_time_length] = spectrum

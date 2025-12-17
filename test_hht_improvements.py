@@ -10,7 +10,10 @@ Tests:
 
 import numpy as np
 import sys
-sys.path.insert(0, '/home/runner/work/sEMG-pre-processing/sEMG-pre-processing')
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from semg_preprocessing.hht import (
     compute_hilbert_spectrum_production,
