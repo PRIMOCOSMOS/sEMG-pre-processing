@@ -121,13 +121,13 @@ with tempfile.TemporaryDirectory() as tmpdir:
     print(f"     Export with recalculation: {slow_time:.3f}s")
 
 # Calculate speedup
-speedup_factor = 1.0  # Default
+speedup_factor = 1.0  # Default (no speedup)
 time_saved = 0.0
-if slow_time > 0:
-    speedup_factor = slow_time / fast_export_time if fast_export_time > 0 else 1.0
+if slow_time > 0 and fast_export_time > 0:
+    speedup_factor = slow_time / fast_export_time
     time_saved = slow_time - fast_export_time
-    print(f"\n   ✓ Optimization speedup: {speedup_factor:.2f}x faster")
-    print(f"   ✓ Time saved: {time_saved:.3f}s for {len(segments)} segments")
+    print(f"\n   ✓ Optimization speedup: {speedup_factor:.2f}x")
+    print(f"   ✓ Time comparison: {time_saved:.3f}s difference for {len(segments)} segments")
 else:
     print(f"\n   ✓ Optimization works (both methods completed)")
 
@@ -143,5 +143,7 @@ print("\nSummary:")
 print("  1. Choi-Williams Distribution (CWD) implementation works correctly")
 print("  2. IMNF calculation uses true CWD (not STFT approximation)")
 print("  3. Export optimization reuses precomputed HHT results")
-if speedup_factor > 0:
+if speedup_factor > 1.0:
+    print(f"  4. Export optimization provides {speedup_factor:.2f}x speedup in this test")
+else:
     print(f"  4. Export with caching: speedup depends on segment count and complexity")

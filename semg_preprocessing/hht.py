@@ -37,12 +37,16 @@ def _compute_choi_williams_distribution(
     The Choi-Williams Distribution is a time-frequency representation that provides
     better concentration and reduced cross-term interference compared to other methods.
     
-    CWD Formula:
-    CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
+    CWD Formula (simplified version for instantaneous analysis):
+    CWD(t,f) = ∫∫ A(τ) · x(t+τ/2) · x*(t-τ/2) · e^(-j2πfτ) dτ
     
-    where A(θ,τ) = exp(-τ²/(4σ)) is the Choi-Williams exponential kernel,
-    σ is the scaling parameter (typically σ = 1),
-    and θ = t - u is the time shift.
+    where A(τ) = exp(-τ²/(4σ)) is the Choi-Williams exponential kernel (simplified),
+    and σ is the scaling parameter (typically σ = 1).
+    
+    Note: This is the simplified CWD kernel that doesn't include the θ (time-lag)
+    dependency, suitable for instantaneous time-frequency analysis. The full kernel
+    would be A(θ,τ) = exp(-τ²θ²/σ), but for our application (instantaneous 
+    autocorrelation at fixed t), the simplified form is appropriate.
     
     Parameters:
     -----------
@@ -103,9 +107,9 @@ def _compute_choi_williams_distribution(
             
             for tau_idx, tau in enumerate(range(-max_tau, max_tau + 1)):
                 if 0 <= t + tau < n_samples and 0 <= t - tau < n_samples:
-                    # Apply Choi-Williams kernel: exp(-tau²/(4σ))
-                    # Note: θ = 0 for instantaneous autocorrelation
-                    kernel_weight = np.exp(-tau**2 / (4.0 * sigma + EPSILON))
+                    # Apply Choi-Williams kernel: exp(-τ²/(4σ))
+                    # For instantaneous autocorrelation (θ = 0)
+                    kernel_weight = np.exp(-tau**2 / (4.0 * sigma))
                     autocorr[tau_idx] = (analytic[t + tau] * 
                                         np.conj(analytic[t - tau]) * 
                                         kernel_weight)
