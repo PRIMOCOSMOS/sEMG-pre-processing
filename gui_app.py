@@ -1556,6 +1556,18 @@ The CSV contains all extracted features for each segment.
                     segment_tuples = [(int(seg['start_index']), int(seg['end_index'])) 
                                      for seg in self.segment_data]
                     
+                    # Check if we have precomputed HHT results from batch analysis
+                    precomputed_hht = None
+                    if hasattr(self, 'batch_hht_results') and self.batch_hht_results is not None:
+                        # Verify the batch results match current segments
+                        if (len(self.batch_hht_results.get('spectra', [])) == len(segment_tuples)):
+                            precomputed_hht = self.batch_hht_results
+                            print("  ✓ Using precomputed HHT results (fast export)")
+                        else:
+                            print("  ⚠ Batch HHT results don't match segments, will recompute")
+                    else:
+                        print("  ℹ No precomputed HHT results, computing now...")
+                    
                     # Export matrices to hht_matrices directory
                     export_info_matrices = export_activity_segments_hht(
                         self.filtered_signal,
@@ -1566,7 +1578,8 @@ The CSV contains all extracted features for each segment.
                         n_freq_bins=256,
                         normalize_length=256,
                         use_ceemdan=True,
-                        save_visualization=False  # We'll save images separately
+                        save_visualization=False,  # We'll save images separately
+                        precomputed_spectra=precomputed_hht
                     )
                     
                     # Save visualizations to hht_images directory

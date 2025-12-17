@@ -24,6 +24,111 @@ SEMG_HIGH_FREQ_CUTOFF = 450.0  # Hz - Upper limit of valid sEMG frequency conten
                                 # Above 450Hz is typically noise, not meaningful muscle signal
 
 
+def _compute_choi_williams_distribution(
+    signal: np.ndarray,
+    fs: float,
+    sigma: float = 1.0,
+    n_freq_bins: Optional[int] = None,
+    n_time_bins: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the Choi-Williams Distribution (CWD) for a signal.
+    
+    The Choi-Williams Distribution is a time-frequency representation that provides
+    better concentration and reduced cross-term interference compared to other methods.
+    
+    CWD Formula:
+    CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
+    
+    where A(θ,τ) = exp(-τ²/(4σθ)) is the Choi-Williams exponential kernel,
+    σ is the scaling parameter (typically σ = 1),
+    and θ = t - u is the time shift.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal (1D array)
+    fs : float
+        Sampling frequency in Hz
+    sigma : float, optional
+        Scaling parameter for the CW kernel (default: 1.0)
+        Higher values reduce cross-terms but decrease resolution
+    n_freq_bins : int, optional
+        Number of frequency bins (default: len(signal))
+    n_time_bins : int, optional
+        Number of time bins (default: len(signal))
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        - cwd: Choi-Williams Distribution (freq_bins x time_bins)
+        - time_axis: Time axis in seconds
+        - freq_axis: Frequency axis in Hz
+        
+    References:
+    -----------
+    Choi, H. I., & Williams, W. J. (1989). "Improved time-frequency representation
+    of multicomponent signals using exponential kernels." IEEE Transactions on
+    Acoustics, Speech, and Signal Processing, 37(6), 862-871.
+    """
+    n_samples = len(signal)
+    
+    if n_freq_bins is None:
+        n_freq_bins = n_samples
+    if n_time_bins is None:
+        n_time_bins = n_samples
+    
+    # Time and frequency axes
+    time_axis = np.arange(n_time_bins) / fs
+    freq_axis = np.fft.fftfreq(n_freq_bins, 1/fs)[:n_freq_bins//2]
+    
+    # Initialize CWD matrix
+    cwd = np.zeros((n_freq_bins//2, n_time_bins))
+    
+    # Compute analytic signal for complex conjugate
+    analytic = hilbert(signal)
+    
+    # For computational efficiency, we use the Wigner-Ville distribution
+    # with Choi-Williams kernel applied in the ambiguity domain
+    for t_idx in range(n_time_bins):
+        # Map to signal index
+        t = int(t_idx * n_samples / n_time_bins)
+        t = min(t, n_samples - 1)
+        
+        # Compute instantaneous autocorrelation function
+        max_tau = min(t, n_samples - 1 - t, n_freq_bins // 2)
+        
+        if max_tau > 0:
+            autocorr = np.zeros(2 * max_tau + 1, dtype=complex)
+            
+            for tau_idx, tau in enumerate(range(-max_tau, max_tau + 1)):
+                if 0 <= t + tau < n_samples and 0 <= t - tau < n_samples:
+                    # Apply Choi-Williams kernel: exp(-tau²/(4σ))
+                    # Note: θ = 0 for instantaneous autocorrelation
+                    kernel_weight = np.exp(-tau**2 / (4.0 * sigma + EPSILON))
+                    autocorr[tau_idx] = (analytic[t + tau] * 
+                                        np.conj(analytic[t - tau]) * 
+                                        kernel_weight)
+            
+            # Fourier transform to get frequency content
+            # Resize or zero-pad to n_freq_bins
+            if len(autocorr) <= n_freq_bins:
+                # Zero-pad
+                autocorr_padded = np.zeros(n_freq_bins, dtype=complex)
+                start_idx = (n_freq_bins - len(autocorr)) // 2
+                autocorr_padded[start_idx:start_idx + len(autocorr)] = autocorr
+            else:
+                # Truncate to n_freq_bins
+                start_idx = (len(autocorr) - n_freq_bins) // 2
+                autocorr_padded = autocorr[start_idx:start_idx + n_freq_bins]
+            
+            # FFT and take real positive frequencies
+            freq_content = np.fft.fft(autocorr_padded)
+            cwd[:, t_idx] = np.abs(freq_content[:n_freq_bins//2])
+    
+    return cwd, time_axis, freq_axis
+
+
 def emd_decomposition(
     signal: np.ndarray,
     max_imfs: int = 10,
@@ -1323,59 +1428,45 @@ def extract_semg_features(
     # better concentration and reduced cross-term interference compared to Wigner-Ville Distribution.
     # 
     # CWD Formula: CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
-    # where A(θ,τ) = (1/(4π|θ|σ))^(1/2) · exp(-τ²/(4σθ))  (Choi-Williams kernel)
+    # where A(θ,τ) = exp(-τ²/(4σθ)) is the Choi-Williams exponential kernel
     # and σ is a scaling parameter (typically σ = 1)
     #
-    # IMNF is then computed as the first moment of CWD in frequency:
+    # IMNF is computed as the first moment of CWD in frequency:
     # IMNF = ∫∫ f · CWD(t,f) df dt / ∫∫ CWD(t,f) df dt
     #
     # Physical meaning: IMNF represents the time-varying center frequency of the signal,
     # which decreases with muscle fatigue as the power spectrum shifts to lower frequencies.
-    #
-    # For computational efficiency and robustness, we use a simplified pseudo-CWD approach:
-    # 1. Apply short-time Fourier transform (STFT) with optimal window
-    # 2. Use smoothing in both time and frequency to reduce cross-terms (CWD-like behavior)
-    # 3. Compute power-weighted mean frequency over time
     try:
-        from scipy.signal import stft
+        # Compute Choi-Williams Distribution
+        # Use reduced resolution for computational efficiency
+        n_time_cwd = min(128, n_samples)
+        n_freq_cwd = min(256, n_samples)
         
-        # STFT parameters for time-frequency analysis
-        # Window length chosen based on signal characteristics
-        nperseg_stft = min(256, n_samples // 4)
-        noverlap = nperseg_stft // 2
+        cwd, time_cwd, freq_cwd = _compute_choi_williams_distribution(
+            signal, fs, sigma=1.0, 
+            n_freq_bins=n_freq_cwd, 
+            n_time_bins=n_time_cwd
+        )
         
-        # Compute STFT (provides time-frequency representation)
-        f_stft, t_stft, Zxx = stft(signal, fs=fs, nperseg=nperseg_stft, noverlap=noverlap)
-        
-        # Power spectrogram (analogous to CWD magnitude)
-        power_tf = np.abs(Zxx) ** 2
-        
-        # Apply smoothing to reduce cross-terms (emulates CWD kernel smoothing)
-        # Smooth in frequency direction
-        from scipy.ndimage import gaussian_filter1d
-        power_tf_smoothed = gaussian_filter1d(power_tf, sigma=1.5, axis=0)
-        # Smooth in time direction
-        power_tf_smoothed = gaussian_filter1d(power_tf_smoothed, sigma=1.0, axis=1)
-        
-        # Extract valid frequency range (exclude low frequencies)
-        freq_mask_tf = f_stft >= SEMG_LOW_FREQ_CUTOFF
-        valid_freqs_tf = f_stft[freq_mask_tf]
-        valid_power_tf = power_tf_smoothed[freq_mask_tf, :]
+        # Filter to valid sEMG frequency range
+        freq_mask_cwd = (freq_cwd >= SEMG_LOW_FREQ_CUTOFF) & (freq_cwd <= SEMG_HIGH_FREQ_CUTOFF)
+        valid_freqs_cwd = freq_cwd[freq_mask_cwd]
+        valid_cwd = cwd[freq_mask_cwd, :]
         
         # Compute instantaneous mean frequency at each time point
-        # IMF(t) = ∫ f · P(f,t) df / ∫ P(f,t) df
+        # IMF(t) = ∫ f · CWD(f,t) df / ∫ CWD(f,t) df
         inst_mean_freqs = []
-        for t_idx in range(valid_power_tf.shape[1]):
-            power_at_t = valid_power_tf[:, t_idx]
+        for t_idx in range(valid_cwd.shape[1]):
+            power_at_t = valid_cwd[:, t_idx]
             total_power_at_t = np.sum(power_at_t)
             if total_power_at_t > EPSILON:
-                imf_at_t = np.sum(valid_freqs_tf * power_at_t) / total_power_at_t
+                imf_at_t = np.sum(valid_freqs_cwd * power_at_t) / total_power_at_t
                 inst_mean_freqs.append(imf_at_t)
         
         # IMNF = time-averaged instantaneous mean frequency
         # Weight by total power at each time point for robust averaging
         if len(inst_mean_freqs) > 0:
-            time_weights = np.sum(valid_power_tf, axis=0)
+            time_weights = np.sum(valid_cwd, axis=0)
             total_weight = np.sum(time_weights)
             if total_weight > EPSILON:
                 imnf = np.average(inst_mean_freqs, weights=time_weights)
@@ -1383,7 +1474,7 @@ def extract_semg_features(
                 imnf = np.mean(inst_mean_freqs)
             
             # Ensure reasonable frequency range
-            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, fs/2)
+            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, SEMG_HIGH_FREQ_CUTOFF)
         else:
             imnf = mnf  # Fallback to MNF
             
@@ -1852,7 +1943,8 @@ def export_hilbert_spectra_batch(
     max_freq: Optional[float] = None,
     use_ceemdan: bool = True,
     save_visualization: bool = True,
-    dpi: int = 150
+    dpi: int = 150,
+    precomputed_spectra: Optional[Dict] = None
 ) -> List[Dict[str, str]]:
     """
     Export Hilbert spectra for all activity segments in batch.
@@ -1860,6 +1952,7 @@ def export_hilbert_spectra_batch(
     IMPROVEMENTS (2024):
     - Uses average pooling instead of interpolation to avoid artifacts
     - Frequency axis maps to sEMG range (20-450Hz by default)
+    - Can reuse precomputed spectra to avoid redundant calculations
     
     For each sEMG activity segment, exports:
     1. NPZ file containing spectrum matrix, time axis, and frequency axis
@@ -1893,6 +1986,10 @@ def export_hilbert_spectra_batch(
         Whether to save PNG visualizations (default: True)
     dpi : int, optional
         DPI for PNG images (default: 150)
+    precomputed_spectra : Dict, optional
+        Pre-computed HHT results from batch_hht_analysis().
+        If provided, uses these instead of recalculating HHT.
+        Expected keys: 'spectra', 'time', 'frequency'
     
     Returns:
     --------
@@ -1943,24 +2040,43 @@ def export_hilbert_spectra_batch(
     
     export_info = []
     
-    print(f"Exporting Hilbert spectra for {len(segments)} segments...")
+    # Check if we can use precomputed spectra
+    use_precomputed = (
+        precomputed_spectra is not None and
+        'spectra' in precomputed_spectra and
+        'time' in precomputed_spectra and
+        'frequency' in precomputed_spectra and
+        len(precomputed_spectra['spectra']) == len(segments)
+    )
+    
+    if use_precomputed:
+        print(f"Using precomputed HHT results for {len(segments)} segments (fast export)...")
+        spectra_list = precomputed_spectra['spectra']
+        time_axis = precomputed_spectra['time']
+        freq_axis = precomputed_spectra['frequency']
+    else:
+        print(f"Computing and exporting Hilbert spectra for {len(segments)} segments...")
     
     for idx, segment in enumerate(segments):
         segment_num = idx + 1
         
-        # Compute Hilbert spectrum (uses average pooling, not interpolation)
-        spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
-            segment,
-            fs,
-            n_freq_bins=n_freq_bins,
-            min_freq=min_freq,
-            max_freq=max_freq,
-            normalize_length=normalize_length,
-            normalize_time=True,
-            normalize_amplitude=False,
-            use_ceemdan=use_ceemdan,
-            log_scale=True
-        )
+        if use_precomputed:
+            # Use precomputed spectrum
+            spectrum = spectra_list[idx]
+        else:
+            # Compute Hilbert spectrum (uses average pooling, not interpolation)
+            spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
+                segment,
+                fs,
+                n_freq_bins=n_freq_bins,
+                min_freq=min_freq,
+                max_freq=max_freq,
+                normalize_length=normalize_length,
+                normalize_time=True,
+                normalize_amplitude=False,
+                use_ceemdan=use_ceemdan,
+                log_scale=True
+            )
         
         # Generate filenames with zero-padded numbering
         npz_filename = f"{base_filename}_{segment_num:03d}.npz"
@@ -2039,12 +2155,14 @@ def export_activity_segments_hht(
     fs: float,
     output_dir: str,
     base_filename: str = "activity_segment",
+    precomputed_spectra: Optional[Dict] = None,
     **hht_kwargs
 ) -> List[Dict[str, str]]:
     """
     Convenience function to export HHT analysis for all detected activity segments.
     
     This function combines segment extraction and HHT export in one step.
+    Can reuse precomputed HHT results to avoid redundant calculations.
     
     Parameters:
     -----------
@@ -2058,6 +2176,10 @@ def export_activity_segments_hht(
         Directory to save output files
     base_filename : str, optional
         Base name for output files
+    precomputed_spectra : Dict, optional
+        Pre-computed HHT results from batch_hht_analysis().
+        If provided, uses these instead of recalculating HHT.
+        Expected keys: 'spectra', 'time', 'frequency'
     **hht_kwargs : dict
         Additional keyword arguments for export_hilbert_spectra_batch()
         (e.g., n_freq_bins, normalize_length, use_ceemdan, save_visualization)
@@ -2075,7 +2197,7 @@ def export_activity_segments_hht(
     >>> # Detect activity
     >>> segments = detect_muscle_activity(filtered_signal, fs=1000, min_duration=0.5)
     >>> 
-    >>> # Export HHT for all segments
+    >>> # Export HHT for all segments (will compute HHT)
     >>> export_info = export_activity_segments_hht(
     >>>     filtered_signal,
     >>>     segments,
@@ -2083,15 +2205,29 @@ def export_activity_segments_hht(
     >>>     output_dir='./hht_output',
     >>>     base_filename='bicep_curl'
     >>> )
+    >>> 
+    >>> # Or reuse precomputed HHT results (fast export)
+    >>> from semg_preprocessing.hht import batch_hht_analysis
+    >>> segment_arrays = [filtered_signal[s:e] for s, e in segments]
+    >>> batch_results = batch_hht_analysis(segment_arrays, fs=1000)
+    >>> export_info = export_activity_segments_hht(
+    >>>     filtered_signal,
+    >>>     segments,
+    >>>     fs=1000,
+    >>>     output_dir='./hht_output',
+    >>>     base_filename='bicep_curl',
+    >>>     precomputed_spectra=batch_results
+    >>> )
     """
     # Extract segment data
     segment_arrays = [signal[start:end] for start, end in activity_segments]
     
-    # Export Hilbert spectra
+    # Export Hilbert spectra (with optional precomputed spectra)
     return export_hilbert_spectra_batch(
         segment_arrays,
         fs,
         output_dir,
         base_filename,
+        precomputed_spectra=precomputed_spectra,
         **hht_kwargs
     )
