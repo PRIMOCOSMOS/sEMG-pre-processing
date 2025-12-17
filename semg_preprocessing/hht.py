@@ -1940,67 +1940,6 @@ def export_hilbert_spectra_batch(
             n_freq_bins=n_freq_bins,
             min_freq=min_freq,
             max_freq=max_freq,
-        Whether to save PNG visualizations (default: True)
-    dpi : int, optional
-        DPI for PNG images (default: 150)
-    
-    Returns:
-    --------
-    List[Dict[str, str]]
-        List of dictionaries containing file paths for each segment:
-        [
-            {
-                'segment_index': 0,
-                'npz_path': '/path/to/segment_001.npz',
-                'png_path': '/path/to/segment_001.png'  # if save_visualization=True
-            },
-            ...
-        ]
-    
-    Examples:
-    ---------
-    >>> from semg_preprocessing import detect_muscle_activity, segment_signal
-    >>> from semg_preprocessing.hht import export_hilbert_spectra_batch
-    >>> 
-    >>> # Detect activity segments
-    >>> activity_periods = detect_muscle_activity(filtered_signal, fs=1000)
-    >>> segments = segment_signal(filtered_signal, activity_periods, fs=1000)
-    >>> 
-    >>> # Extract just the data arrays
-    >>> segment_arrays = [seg['data'] for seg in segments]
-    >>> 
-    >>> # Export all Hilbert spectra
-    >>> export_info = export_hilbert_spectra_batch(
-    >>>     segment_arrays, 
-    >>>     fs=1000,
-    >>>     output_dir='./hht_results',
-    >>>     base_filename='activity_segment'
-    >>> )
-    >>> 
-    >>> print(f"Exported {len(export_info)} Hilbert spectra")
-    """
-    import os
-    import matplotlib.pyplot as plt
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    if max_freq is None:
-        max_freq = fs / 2
-    
-    export_info = []
-    
-    print(f"Exporting Hilbert spectra for {len(segments)} segments...")
-    
-    for idx, segment in enumerate(segments):
-        segment_num = idx + 1
-        
-        # Compute Hilbert spectrum
-        spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
-            segment,
-            fs,
-            n_freq_bins=n_freq_bins,
-            max_freq=max_freq,
             normalize_length=normalize_length,
             normalize_time=True,
             normalize_amplitude=False,
