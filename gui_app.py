@@ -1136,6 +1136,13 @@ class EMGProcessorGUI:
                 extract_features=True
             )
             
+            # Store parameters for later validation during export
+            self._batch_hht_params = {
+                'n_freq_bins': int(n_freq_bins),
+                'normalize_length': int(normalize_length),
+                'use_ceemdan': use_ceemdan
+            }
+            
             progress(0.7, desc="Creating visualization...")
             
             # Create visualization showing first 4 spectra
@@ -1560,11 +1567,16 @@ The CSV contains all extracted features for each segment.
                     precomputed_hht = None
                     if hasattr(self, 'batch_hht_results') and self.batch_hht_results is not None:
                         # Verify the batch results match current segments
-                        if (len(self.batch_hht_results.get('spectra', [])) == len(segment_tuples)):
+                        # Check both count and that segments have compatible parameters
+                        batch_spectra = self.batch_hht_results.get('spectra', [])
+                        if (len(batch_spectra) == len(segment_tuples) and
+                            hasattr(self, '_batch_hht_params') and
+                            self._batch_hht_params.get('n_freq_bins') == 256 and
+                            self._batch_hht_params.get('normalize_length') == 256):
                             precomputed_hht = self.batch_hht_results
                             print("  ✓ Using precomputed HHT results (fast export)")
                         else:
-                            print("  ⚠ Batch HHT results don't match segments, will recompute")
+                            print("  ⚠ Batch HHT results don't match current export parameters, will recompute")
                     else:
                         print("  ℹ No precomputed HHT results, computing now...")
                     

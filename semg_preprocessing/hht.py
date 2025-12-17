@@ -40,7 +40,7 @@ def _compute_choi_williams_distribution(
     CWD Formula:
     CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
     
-    where A(θ,τ) = exp(-τ²/(4σθ)) is the Choi-Williams exponential kernel,
+    where A(θ,τ) = exp(-τ²/(4σ)) is the Choi-Williams exponential kernel,
     σ is the scaling parameter (typically σ = 1),
     and θ = t - u is the time shift.
     
