@@ -20,6 +20,117 @@ EPSILON = 1e-10  # Small value for numerical stability (avoiding division by zer
 # sEMG frequency filtering constants
 SEMG_LOW_FREQ_CUTOFF = 20.0  # Hz - Exclude DC and low-freq artifacts (motion, baseline drift)
                               # sEMG content is typically in 20-450 Hz range
+SEMG_HIGH_FREQ_CUTOFF = 450.0  # Hz - Upper limit of valid sEMG frequency content
+                                # Above 450Hz is typically noise, not meaningful muscle signal
+
+
+def _compute_choi_williams_distribution(
+    signal: np.ndarray,
+    fs: float,
+    sigma: float = 1.0,
+    n_freq_bins: Optional[int] = None,
+    n_time_bins: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the Choi-Williams Distribution (CWD) for a signal.
+    
+    The Choi-Williams Distribution is a time-frequency representation that provides
+    better concentration and reduced cross-term interference compared to other methods.
+    
+    CWD Formula (simplified version for instantaneous analysis):
+    CWD(t,f) = ∫∫ A(τ) · x(t+τ/2) · x*(t-τ/2) · e^(-j2πfτ) dτ
+    
+    where A(τ) = exp(-τ²/(4σ)) is the Choi-Williams exponential kernel (simplified),
+    and σ is the scaling parameter (typically σ = 1).
+    
+    Note: This is the simplified CWD kernel that doesn't include the θ (time-lag)
+    dependency, suitable for instantaneous time-frequency analysis. The full kernel
+    would be A(θ,τ) = exp(-τ²θ²/σ), but for our application (instantaneous 
+    autocorrelation at fixed t), the simplified form is appropriate.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal (1D array)
+    fs : float
+        Sampling frequency in Hz
+    sigma : float, optional
+        Scaling parameter for the CW kernel (default: 1.0)
+        Higher values reduce cross-terms but decrease resolution
+    n_freq_bins : int, optional
+        Number of frequency bins (default: len(signal))
+    n_time_bins : int, optional
+        Number of time bins (default: len(signal))
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+        - cwd: Choi-Williams Distribution (freq_bins x time_bins)
+        - time_axis: Time axis in seconds
+        - freq_axis: Frequency axis in Hz
+        
+    References:
+    -----------
+    Choi, H. I., & Williams, W. J. (1989). "Improved time-frequency representation
+    of multicomponent signals using exponential kernels." IEEE Transactions on
+    Acoustics, Speech, and Signal Processing, 37(6), 862-871.
+    """
+    n_samples = len(signal)
+    
+    if n_freq_bins is None:
+        n_freq_bins = n_samples
+    if n_time_bins is None:
+        n_time_bins = n_samples
+    
+    # Time and frequency axes
+    time_axis = np.arange(n_time_bins) / fs
+    freq_axis = np.fft.fftfreq(n_freq_bins, 1/fs)[:n_freq_bins//2]
+    
+    # Initialize CWD matrix
+    cwd = np.zeros((n_freq_bins//2, n_time_bins))
+    
+    # Compute analytic signal for complex conjugate
+    analytic = hilbert(signal)
+    
+    # For computational efficiency, we use the Wigner-Ville distribution
+    # with Choi-Williams kernel applied in the ambiguity domain
+    for t_idx in range(n_time_bins):
+        # Map to signal index
+        t = int(t_idx * n_samples / n_time_bins)
+        t = min(t, n_samples - 1)
+        
+        # Compute instantaneous autocorrelation function
+        max_tau = min(t, n_samples - 1 - t, n_freq_bins // 2)
+        
+        if max_tau > 0:
+            autocorr = np.zeros(2 * max_tau + 1, dtype=complex)
+            
+            for tau_idx, tau in enumerate(range(-max_tau, max_tau + 1)):
+                if 0 <= t + tau < n_samples and 0 <= t - tau < n_samples:
+                    # Apply Choi-Williams kernel: exp(-τ²/(4σ))
+                    # For instantaneous autocorrelation (θ = 0)
+                    kernel_weight = np.exp(-tau**2 / (4.0 * sigma))
+                    autocorr[tau_idx] = (analytic[t + tau] * 
+                                        np.conj(analytic[t - tau]) * 
+                                        kernel_weight)
+            
+            # Fourier transform to get frequency content
+            # Resize or zero-pad to n_freq_bins
+            if len(autocorr) <= n_freq_bins:
+                # Zero-pad
+                autocorr_padded = np.zeros(n_freq_bins, dtype=complex)
+                start_idx = (n_freq_bins - len(autocorr)) // 2
+                autocorr_padded[start_idx:start_idx + len(autocorr)] = autocorr
+            else:
+                # Truncate to n_freq_bins
+                start_idx = (len(autocorr) - n_freq_bins) // 2
+                autocorr_padded = autocorr[start_idx:start_idx + n_freq_bins]
+            
+            # FFT and take real positive frequencies
+            freq_content = np.fft.fft(autocorr_padded)
+            cwd[:, t_idx] = np.abs(freq_content[:n_freq_bins//2])
+    
+    return cwd, time_axis, freq_axis
 
 
 def emd_decomposition(
@@ -350,15 +461,130 @@ def compute_instantaneous_frequency(
     return inst_freq
 
 
+def _average_pool_1d(signal: np.ndarray, target_length: int) -> np.ndarray:
+    """
+    Downsample 1D signal using average pooling to avoid interpolation artifacts.
+    
+    This function uses average pooling to reduce signal length, which avoids
+    introducing high-frequency artifacts that can occur with interpolation methods.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal (1D array)
+    target_length : int
+        Target length after downsampling
+    
+    Returns:
+    --------
+    np.ndarray
+        Downsampled signal using average pooling
+        
+    Note:
+    -----
+    If the signal is shorter than target_length, it will be zero-padded.
+    **Important**: Zero-padding short signals may introduce artifacts in HHT analysis.
+    For best results, ensure input signal length >= target_length, or use a smaller
+    target_length. Typical use case: downsampling from 1000-2000 samples to 256 samples.
+    
+    If signal length is not evenly divisible by target_length, the last
+    pooling window may be smaller than others.
+    """
+    current_length = len(signal)
+    
+    # If signal is shorter, pad with zeros
+    # Note: This is a fallback for edge cases. For HHT analysis, it's better
+    # to ensure the original signal is long enough for meaningful decomposition.
+    if current_length <= target_length:
+        result = np.zeros(target_length)
+        result[:current_length] = signal
+        return result
+    
+    # Calculate pool size
+    pool_size = current_length / target_length
+    pooled = np.zeros(target_length)
+    
+    for i in range(target_length):
+        # Calculate window boundaries
+        start = int(i * pool_size)
+        end = int((i + 1) * pool_size)
+        
+        # Average over the window
+        if end > start:
+            pooled[i] = np.mean(signal[start:end])
+        else:
+            pooled[i] = signal[start]
+    
+    return pooled
+
+
+def _average_pool_2d_time(spectrum: np.ndarray, target_time_length: int) -> np.ndarray:
+    """
+    Downsample spectrum in time dimension using average pooling.
+    
+    This function applies average pooling along the time axis (axis=1) of a
+    2D spectrum matrix to reduce its time dimension while preserving energy
+    and avoiding interpolation artifacts.
+    
+    Parameters:
+    -----------
+    spectrum : np.ndarray
+        Input spectrum matrix (freq_bins x time_samples)
+    target_time_length : int
+        Target number of time samples
+    
+    Returns:
+    --------
+    np.ndarray
+        Downsampled spectrum (freq_bins x target_time_length)
+        
+    Note:
+    -----
+    If spectrum time dimension is shorter than target_time_length, it will be zero-padded.
+    **Important**: Zero-padding may introduce artifacts. For best results, ensure 
+    spectrum time dimension >= target_time_length. Typical use case: downsampling 
+    from 1000-2000 time samples to 256 samples after HHT computation.
+    """
+    n_freq_bins, current_time_length = spectrum.shape
+    
+    # If spectrum is shorter in time, pad with zeros
+    # Note: This is a fallback for edge cases. Ideally, HHT should be computed
+    # on signals long enough that the spectrum doesn't need padding.
+    if current_time_length <= target_time_length:
+        result = np.zeros((n_freq_bins, target_time_length))
+        result[:, :current_time_length] = spectrum
+        return result
+    
+    # Apply average pooling along time axis
+    pooled_spectrum = np.zeros((n_freq_bins, target_time_length))
+    pool_size = current_time_length / target_time_length
+    
+    for i in range(target_time_length):
+        start = int(i * pool_size)
+        end = int((i + 1) * pool_size)
+        
+        if end > start:
+            pooled_spectrum[:, i] = np.mean(spectrum[:, start:end], axis=1)
+        else:
+            pooled_spectrum[:, i] = spectrum[:, start]
+    
+    return pooled_spectrum
+
+
 def compute_hilbert_spectrum(
     signal: np.ndarray,
     fs: float,
     n_freq_bins: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     normalize_length: Optional[int] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute Hilbert Spectrum (time-frequency representation) using HHT.
+    
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid high-frequency artifacts
+    - Frequency axis maps to meaningful sEMG range (20-450Hz by default)
     
     This function performs:
     1. EMD decomposition to get IMFs
@@ -373,10 +599,12 @@ def compute_hilbert_spectrum(
         Sampling frequency in Hz
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
+    min_freq : float, optional
+        Minimum frequency to display (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency to display (default: fs/2)
+        Maximum frequency to display (default: 450Hz for sEMG)
     normalize_length : int, optional
-        If provided, resample signal to this length before HHT
+        If provided, use average pooling to adjust spectrum to this length
         (useful for creating uniform-sized spectra from variable-length segments)
     
     Returns:
@@ -394,22 +622,19 @@ def compute_hilbert_spectrum(
     >>> plt.xlabel('Time (s)')
     >>> plt.ylabel('Frequency (Hz)')
     """
-    from scipy.signal import resample
+    # Set default frequency range for sEMG
+    if min_freq is None:
+        min_freq = SEMG_LOW_FREQ_CUTOFF  # 20 Hz
+    if max_freq is None:
+        max_freq = SEMG_HIGH_FREQ_CUTOFF  # 450 Hz
     
-    # Optionally normalize length
-    if normalize_length is not None and len(signal) != normalize_length:
-        signal = resample(signal, normalize_length)
-    
+    # Compute HHT on ORIGINAL signal (no interpolation pre-processing)
     n_samples = len(signal)
     
-    if max_freq is None:
-        max_freq = fs / 2
+    # Create frequency axis mapped to sEMG range
+    freq_axis = np.linspace(min_freq, max_freq, n_freq_bins)
     
-    # Create time and frequency axes
-    time_axis = np.arange(n_samples) / fs
-    freq_axis = np.linspace(0, max_freq, n_freq_bins)
-    
-    # Initialize spectrum
+    # Initialize spectrum at original time resolution
     spectrum = np.zeros((n_freq_bins, n_samples))
     
     # Perform EMD
@@ -423,16 +648,27 @@ def compute_hilbert_spectrum(
         # Compute instantaneous frequency
         inst_freq = compute_instantaneous_frequency(phase, fs)
         
+        # Clip to valid sEMG frequency range
+        inst_freq = np.clip(inst_freq, min_freq, max_freq)
+        
         # Map to spectrum
         for t in range(n_samples):
             freq = inst_freq[t]
             amp = amplitude[t]
             
-            # Find nearest frequency bin
-            if 0 <= freq <= max_freq:
-                freq_bin = int(freq / max_freq * (n_freq_bins - 1))
-                freq_bin = min(freq_bin, n_freq_bins - 1)
-                spectrum[freq_bin, t] += amp
+            # Map frequency to bin index in [min_freq, max_freq] range
+            freq_normalized = (freq - min_freq) / (max_freq - min_freq)
+            freq_bin = int(freq_normalized * (n_freq_bins - 1))
+            freq_bin = np.clip(freq_bin, 0, n_freq_bins - 1)
+            spectrum[freq_bin, t] += amp
+    
+    # Apply average pooling to adjust time dimension (if requested)
+    if normalize_length is not None and n_samples != normalize_length:
+        spectrum = _average_pool_2d_time(spectrum, normalize_length)
+        n_samples = normalize_length
+    
+    # Create time axis
+    time_axis = np.arange(n_samples) / fs
     
     return spectrum, time_axis, freq_axis
 
@@ -441,12 +677,17 @@ def hht_analysis(
     signal: np.ndarray,
     fs: float,
     n_freq_bins: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     normalize_length: Optional[int] = None,
     return_imfs: bool = False
 ) -> Dict:
     """
     Complete Hilbert-Huang Transform analysis.
+    
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid artifacts
+    - Frequency axis maps to sEMG range (20-450Hz by default)
     
     This is a convenience function that performs full HHT analysis
     and returns comprehensive results.
@@ -459,10 +700,12 @@ def hht_analysis(
         Sampling frequency in Hz
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
+    min_freq : float, optional
+        Minimum frequency (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency (default: fs/2)
+        Maximum frequency (default: 450Hz for sEMG)
     normalize_length : int, optional
-        Target length for normalization
+        Target length for normalization (uses average pooling)
     return_imfs : bool, optional
         Whether to return individual IMFs (default: False)
     
@@ -478,16 +721,12 @@ def hht_analysis(
         - 'mean_frequency': Mean instantaneous frequency
         - 'dominant_frequency': Dominant frequency at each time point
     """
-    from scipy.signal import resample
-    
-    # Normalize length if requested
+    # Store original length (no interpolation)
     original_length = len(signal)
-    if normalize_length is not None and len(signal) != normalize_length:
-        signal = resample(signal, normalize_length)
     
-    # Compute spectrum
+    # Compute spectrum (uses average pooling if normalize_length is provided)
     spectrum, time_axis, freq_axis = compute_hilbert_spectrum(
-        signal, fs, n_freq_bins, max_freq, normalize_length=None
+        signal, fs, n_freq_bins, min_freq, max_freq, normalize_length
     )
     
     # Compute marginal spectrum (integrate over time)
@@ -675,6 +914,7 @@ def compute_hilbert_spectrum_production(
     signal: np.ndarray,
     fs: float,
     n_freq_bins: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     target_length: int = 256,
     fixed_imf_count: int = 8,
@@ -684,13 +924,20 @@ def compute_hilbert_spectrum_production(
     """
     Production-ready Hilbert spectrum computation with unified parameters and validation.
     
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid high-frequency artifacts
+    - Frequency axis maps to meaningful sEMG range (20-450Hz) instead of 0-Nyquist
+    - Computes HHT on original signal length, then pools to target size
+    - Preserves energy conservation validation
+    
     This function implements comprehensive improvements for real-world sEMG analysis:
     1. Fixed IMF count with zero-padding for consistency
-    2. Unified time and frequency axes for all signals
+    2. Unified time and frequency axes for all signals (via average pooling, not interpolation)
     3. Signal normalization before HHT
     4. Energy conservation validation
     5. Amplitude thresholding for noise reduction
     6. Proper amplitude normalization for muscle activity representation
+    7. Frequency axis maps to valid sEMG range (20-450Hz by default)
     
     Parameters:
     -----------
@@ -700,8 +947,10 @@ def compute_hilbert_spectrum_production(
         Sampling frequency in Hz
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
+    min_freq : float, optional
+        Minimum frequency in Hz (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency in Hz (default: fs/2)
+        Maximum frequency in Hz (default: 450Hz for sEMG)
     target_length : int, optional
         Unified time axis length for all spectra (default: 256)
     fixed_imf_count : int, optional
@@ -716,7 +965,7 @@ def compute_hilbert_spectrum_production(
     Tuple containing:
         - spectrum: Hilbert spectrum matrix (n_freq_bins × target_length)
         - time_axis: Normalized time axis [0, 1]
-        - freq_axis: Frequency axis [0, max_freq]
+        - freq_axis: Frequency axis [min_freq, max_freq] (typically 20-450Hz)
         - validation_info: Dict with 'energy_error', 'imf_count', 'signal_energy', 'reconstructed_energy'
     
     Mathematical Details:
@@ -730,23 +979,40 @@ def compute_hilbert_spectrum_production(
        If n_imfs > fixed_imf_count: use first fixed_imf_count IMFs
        Ensures uniform decomposition structure
     
-    3. Energy Conservation:
+    3. HHT on Original Signal:
+       HHT is computed on the signal at its original sampling rate and length
+       This avoids introducing artifacts from pre-processing interpolation
+    
+    4. Average Pooling for Time Normalization:
+       After HHT computation, the spectrum is downsampled to target_length
+       using average pooling instead of interpolation
+       This preserves energy and avoids high-frequency artifacts
+    
+    5. Energy Conservation:
        E_original = ||x||²
        E_reconstructed = ||∑IMFs||²
        error = |E_original - E_reconstructed| / E_original
        Typical acceptable error: < 5%
     
-    4. Amplitude Thresholding:
+    6. Amplitude Thresholding:
        Remove amplitude values below Pth percentile
        Reduces noise, enhances signal features
     
-    5. Amplitude Normalization:
+    7. Amplitude Normalization:
        spectrum_norm = spectrum / max(spectrum)
        Represents relative muscle activity level
-    """
-    from scipy.signal import resample
     
-    # Step 1: Signal Normalization (time normalization)
+    8. Frequency Range:
+       By default, maps to 20-450Hz (valid sEMG range)
+       Frequencies outside this range are not considered meaningful
+    """
+    # Set default frequency range for sEMG
+    if min_freq is None:
+        min_freq = SEMG_LOW_FREQ_CUTOFF  # 20 Hz
+    if max_freq is None:
+        max_freq = SEMG_HIGH_FREQ_CUTOFF  # 450 Hz
+    
+    # Step 1: Signal Normalization
     # Normalize to zero mean and unit variance for consistent processing
     signal_mean = np.mean(signal)
     signal_std = np.std(signal)
@@ -755,26 +1021,19 @@ def compute_hilbert_spectrum_production(
     else:
         signal_normalized = signal - signal_mean
     
-    # Store original signal for energy validation (before resampling)
+    # Store original signal for energy validation (before any resampling)
     original_signal_for_energy = signal_normalized.copy()
     original_energy = np.sum(original_signal_for_energy ** 2)
-    
-    # Resample to target length for unified time axis
     original_length = len(signal_normalized)
-    if original_length != target_length:
-        signal_normalized = resample(signal_normalized, target_length)
+    
+    # NOTE: We NO LONGER resample the signal before HHT
+    # HHT is computed on the signal at its actual duration
+    # This avoids interpolation artifacts
     
     n_samples = len(signal_normalized)
     
-    if max_freq is None:
-        max_freq = fs / 2
-    
-    # Create unified axes
-    time_axis = np.linspace(0, 1, n_samples)  # Normalized time [0, 1]
-    freq_axis = np.linspace(0, max_freq, n_freq_bins)
-    
     # Step 2: CEEMDAN Decomposition with fixed IMF count
-    # Use CEEMDAN for robust decomposition
+    # Use CEEMDAN for robust decomposition on ORIGINAL signal
     try:
         imfs = ceemdan_decomposition(
             signal_normalized,
@@ -797,19 +1056,21 @@ def compute_hilbert_spectrum_production(
         imfs = imfs[:fixed_imf_count] + [imfs[-1]]
     
     # Step 3: Energy Conservation Validation
-    # Validate against the resampled signal (not original)
+    # Validate against the original signal (not resampled)
     if validate_energy:
         reconstructed_signal = np.sum(imfs, axis=0)
         reconstructed_energy = np.sum(reconstructed_signal ** 2)
-        signal_energy_resampled = np.sum(signal_normalized ** 2)
-        energy_error = abs(signal_energy_resampled - reconstructed_energy) / (signal_energy_resampled + EPSILON)
+        signal_energy = np.sum(signal_normalized ** 2)
+        energy_error = abs(signal_energy - reconstructed_energy) / (signal_energy + EPSILON)
     else:
         reconstructed_signal = None
         reconstructed_energy = np.sum(signal_normalized ** 2)
         energy_error = 0.0
     
-    # Step 4: Compute Hilbert Spectrum
+    # Step 4: Compute Hilbert Spectrum at ORIGINAL time resolution
+    # Frequency axis now maps to [min_freq, max_freq] (typically 20-450Hz for sEMG)
     spectrum = np.zeros((n_freq_bins, n_samples))
+    freq_axis = np.linspace(min_freq, max_freq, n_freq_bins)
     
     # Process each IMF (exclude residue which is last element)
     for imf in imfs[:-1]:
@@ -823,16 +1084,17 @@ def compute_hilbert_spectrum_production(
         # Compute instantaneous frequency with careful unwrapping
         inst_freq = compute_instantaneous_frequency(phase, fs)
         
-        # Clip to valid range [0, max_freq]
-        inst_freq = np.clip(inst_freq, 0, max_freq)
+        # Clip to valid sEMG frequency range [min_freq, max_freq]
+        inst_freq = np.clip(inst_freq, min_freq, max_freq)
         
         # Map to spectrum with conservative spreading to avoid artifacts
         for t in range(n_samples):
             freq = inst_freq[t]
             amp = amplitude[t]
             
-            # Find nearest frequency bin
-            freq_bin = int((freq / max_freq) * (n_freq_bins - 1))
+            # Find nearest frequency bin in the [min_freq, max_freq] range
+            freq_normalized = (freq - min_freq) / (max_freq - min_freq)
+            freq_bin = int(freq_normalized * (n_freq_bins - 1))
             freq_bin = np.clip(freq_bin, 0, n_freq_bins - 1)
             
             # Add amplitude to spectrum with minimal spreading
@@ -844,14 +1106,22 @@ def compute_hilbert_spectrum_production(
                     weight = np.exp(-0.5 * (df / 0.5) ** 2)
                     spectrum[fb, t] += amp * weight
     
-    # Step 5: Amplitude Thresholding for Noise Reduction
+    # Step 5: Apply Average Pooling to adjust time dimension to target_length
+    # This avoids interpolation artifacts while achieving uniform matrix size
+    if n_samples != target_length:
+        spectrum = _average_pool_2d_time(spectrum, target_length)
+    
+    # Create unified time axis (normalized to [0, 1])
+    time_axis = np.linspace(0, 1, target_length)
+    
+    # Step 6: Amplitude Thresholding for Noise Reduction
     # Remove amplitudes below threshold percentile
     threshold_value = 0.0  # Initialize to prevent NameError
     if amplitude_threshold_percentile > 0 and np.max(spectrum) > 0:
         threshold_value = np.percentile(spectrum[spectrum > 0], amplitude_threshold_percentile)
         spectrum[spectrum < threshold_value] = 0
     
-    # Step 6: Amplitude Normalization for Muscle Activity Representation
+    # Step 7: Amplitude Normalization for Muscle Activity Representation
     # Normalize to [0, 1] range to represent relative muscle activity
     max_amplitude = np.max(spectrum)
     if max_amplitude > EPSILON:
@@ -865,7 +1135,10 @@ def compute_hilbert_spectrum_production(
         'reconstructed_energy': float(reconstructed_energy),
         'energy_conservation_ok': energy_error < 0.05,  # < 5% error is acceptable
         'max_amplitude': float(max_amplitude),
-        'threshold_value': float(threshold_value)
+        'threshold_value': float(threshold_value),
+        'original_length': original_length,
+        'pooled_length': target_length,
+        'freq_range': (min_freq, max_freq)
     }
     
     return spectrum, time_axis, freq_axis, validation_info
@@ -875,6 +1148,7 @@ def compute_hilbert_spectrum_enhanced(
     signal: np.ndarray,
     fs: float,
     n_freq_bins: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     normalize_length: Optional[int] = None,
     normalize_time: bool = True,
@@ -886,10 +1160,16 @@ def compute_hilbert_spectrum_enhanced(
     """
     Compute enhanced Hilbert Spectrum with improved visualization for sEMG.
     
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid high-frequency artifacts
+    - Frequency axis maps to meaningful sEMG range (20-450Hz by default) instead of 0-Nyquist
+    - Computes HHT on original signal length, then pools to target size
+    
     This function addresses the issue of mostly black spectrograms by:
     1. Using log-scale amplitude representation
     2. Applying adaptive thresholding
-    3. Normalizing time axis for uniform matrix sizes
+    3. Normalizing time axis for uniform matrix sizes (via average pooling, not interpolation)
+    4. Mapping frequency to valid sEMG range (20-450Hz by default)
     
     Parameters:
     -----------
@@ -899,10 +1179,12 @@ def compute_hilbert_spectrum_enhanced(
         Sampling frequency in Hz
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
+    min_freq : float, optional
+        Minimum frequency to display (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency to display (default: fs/2)
+        Maximum frequency to display (default: 450Hz for sEMG)
     normalize_length : int, optional
-        If provided, resample signal to this length before HHT
+        If provided, use average pooling to adjust spectrum to this length
     normalize_time : bool, optional
         If True, normalize time axis to [0, 1] (default: True)
     normalize_amplitude : bool, optional
@@ -919,32 +1201,25 @@ def compute_hilbert_spectrum_enhanced(
     Tuple[np.ndarray, np.ndarray, np.ndarray]
         - Hilbert spectrum matrix (shape: n_freq_bins x normalize_length or n_samples)
         - Time axis (normalized to [0, 1] if normalize_time=True)
-        - Frequency axis
+        - Frequency axis (typically 20-450Hz for sEMG)
     """
-    from scipy.signal import resample
+    # Set default frequency range for sEMG
+    if min_freq is None:
+        min_freq = SEMG_LOW_FREQ_CUTOFF  # 20 Hz
+    if max_freq is None:
+        max_freq = SEMG_HIGH_FREQ_CUTOFF  # 450 Hz
     
-    # Optionally normalize length
+    # Store original length (NO interpolation pre-processing)
     original_length = len(signal)
-    if normalize_length is not None and len(signal) != normalize_length:
-        signal = resample(signal, normalize_length)
-    
     n_samples = len(signal)
     
-    if max_freq is None:
-        max_freq = fs / 2
+    # Create frequency axis mapped to sEMG range [min_freq, max_freq]
+    freq_axis = np.linspace(min_freq, max_freq, n_freq_bins)
     
-    # Create time axis (normalized or absolute)
-    if normalize_time:
-        time_axis = np.linspace(0, 1, n_samples)
-    else:
-        time_axis = np.arange(n_samples) / fs
-    
-    freq_axis = np.linspace(0, max_freq, n_freq_bins)
-    
-    # Initialize spectrum
+    # Initialize spectrum at original time resolution
     spectrum = np.zeros((n_freq_bins, n_samples))
     
-    # Perform decomposition
+    # Perform decomposition on ORIGINAL signal (no resampling)
     if use_ceemdan:
         imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
     else:
@@ -958,23 +1233,37 @@ def compute_hilbert_spectrum_enhanced(
         # Compute instantaneous frequency
         inst_freq = compute_instantaneous_frequency(phase, fs)
         
+        # Clip to valid sEMG frequency range [min_freq, max_freq]
+        inst_freq = np.clip(inst_freq, min_freq, max_freq)
+        
         # Map to spectrum with Gaussian smoothing
         for t in range(n_samples):
             freq = inst_freq[t]
             amp = amplitude[t]
             
-            if 0 <= freq <= max_freq:
-                # Find nearest frequency bin
-                freq_bin = int(freq / max_freq * (n_freq_bins - 1))
-                freq_bin = min(freq_bin, n_freq_bins - 1)
-                
-                # Add to spectrum with slight frequency spreading for smoother display
-                spread = 2  # Frequency bins to spread
-                for df in range(-spread, spread + 1):
-                    fb = freq_bin + df
-                    if 0 <= fb < n_freq_bins:
-                        weight = np.exp(-0.5 * (df / 1.0) ** 2)  # Gaussian weight
-                        spectrum[fb, t] += amp * weight
+            # Map frequency to bin index in [min_freq, max_freq] range
+            freq_normalized = (freq - min_freq) / (max_freq - min_freq)
+            freq_bin = int(freq_normalized * (n_freq_bins - 1))
+            freq_bin = np.clip(freq_bin, 0, n_freq_bins - 1)
+            
+            # Add to spectrum with slight frequency spreading for smoother display
+            spread = 2  # Frequency bins to spread
+            for df in range(-spread, spread + 1):
+                fb = freq_bin + df
+                if 0 <= fb < n_freq_bins:
+                    weight = np.exp(-0.5 * (df / 1.0) ** 2)  # Gaussian weight
+                    spectrum[fb, t] += amp * weight
+    
+    # Apply average pooling to adjust time dimension (if requested)
+    if normalize_length is not None and n_samples != normalize_length:
+        spectrum = _average_pool_2d_time(spectrum, normalize_length)
+        n_samples = normalize_length
+    
+    # Create time axis (normalized or absolute)
+    if normalize_time:
+        time_axis = np.linspace(0, 1, n_samples)
+    else:
+        time_axis = np.arange(n_samples) / fs
     
     # Apply amplitude processing for better visualization
     if spectrum.max() > 0:
@@ -1143,59 +1432,45 @@ def extract_semg_features(
     # better concentration and reduced cross-term interference compared to Wigner-Ville Distribution.
     # 
     # CWD Formula: CWD(t,f) = ∫∫ A(θ,τ) · x(u+τ/2) · x*(u-τ/2) · e^(-j2πfτ) dτ du
-    # where A(θ,τ) = (1/(4π|θ|σ))^(1/2) · exp(-τ²/(4σθ))  (Choi-Williams kernel)
+    # where A(θ,τ) = exp(-τ²/(4σθ)) is the Choi-Williams exponential kernel
     # and σ is a scaling parameter (typically σ = 1)
     #
-    # IMNF is then computed as the first moment of CWD in frequency:
+    # IMNF is computed as the first moment of CWD in frequency:
     # IMNF = ∫∫ f · CWD(t,f) df dt / ∫∫ CWD(t,f) df dt
     #
     # Physical meaning: IMNF represents the time-varying center frequency of the signal,
     # which decreases with muscle fatigue as the power spectrum shifts to lower frequencies.
-    #
-    # For computational efficiency and robustness, we use a simplified pseudo-CWD approach:
-    # 1. Apply short-time Fourier transform (STFT) with optimal window
-    # 2. Use smoothing in both time and frequency to reduce cross-terms (CWD-like behavior)
-    # 3. Compute power-weighted mean frequency over time
     try:
-        from scipy.signal import stft
+        # Compute Choi-Williams Distribution
+        # Use reduced resolution for computational efficiency
+        n_time_cwd = min(128, n_samples)
+        n_freq_cwd = min(256, n_samples)
         
-        # STFT parameters for time-frequency analysis
-        # Window length chosen based on signal characteristics
-        nperseg_stft = min(256, n_samples // 4)
-        noverlap = nperseg_stft // 2
+        cwd, time_cwd, freq_cwd = _compute_choi_williams_distribution(
+            signal, fs, sigma=1.0, 
+            n_freq_bins=n_freq_cwd, 
+            n_time_bins=n_time_cwd
+        )
         
-        # Compute STFT (provides time-frequency representation)
-        f_stft, t_stft, Zxx = stft(signal, fs=fs, nperseg=nperseg_stft, noverlap=noverlap)
-        
-        # Power spectrogram (analogous to CWD magnitude)
-        power_tf = np.abs(Zxx) ** 2
-        
-        # Apply smoothing to reduce cross-terms (emulates CWD kernel smoothing)
-        # Smooth in frequency direction
-        from scipy.ndimage import gaussian_filter1d
-        power_tf_smoothed = gaussian_filter1d(power_tf, sigma=1.5, axis=0)
-        # Smooth in time direction
-        power_tf_smoothed = gaussian_filter1d(power_tf_smoothed, sigma=1.0, axis=1)
-        
-        # Extract valid frequency range (exclude low frequencies)
-        freq_mask_tf = f_stft >= SEMG_LOW_FREQ_CUTOFF
-        valid_freqs_tf = f_stft[freq_mask_tf]
-        valid_power_tf = power_tf_smoothed[freq_mask_tf, :]
+        # Filter to valid sEMG frequency range
+        freq_mask_cwd = (freq_cwd >= SEMG_LOW_FREQ_CUTOFF) & (freq_cwd <= SEMG_HIGH_FREQ_CUTOFF)
+        valid_freqs_cwd = freq_cwd[freq_mask_cwd]
+        valid_cwd = cwd[freq_mask_cwd, :]
         
         # Compute instantaneous mean frequency at each time point
-        # IMF(t) = ∫ f · P(f,t) df / ∫ P(f,t) df
+        # IMF(t) = ∫ f · CWD(f,t) df / ∫ CWD(f,t) df
         inst_mean_freqs = []
-        for t_idx in range(valid_power_tf.shape[1]):
-            power_at_t = valid_power_tf[:, t_idx]
+        for t_idx in range(valid_cwd.shape[1]):
+            power_at_t = valid_cwd[:, t_idx]
             total_power_at_t = np.sum(power_at_t)
             if total_power_at_t > EPSILON:
-                imf_at_t = np.sum(valid_freqs_tf * power_at_t) / total_power_at_t
+                imf_at_t = np.sum(valid_freqs_cwd * power_at_t) / total_power_at_t
                 inst_mean_freqs.append(imf_at_t)
         
         # IMNF = time-averaged instantaneous mean frequency
         # Weight by total power at each time point for robust averaging
         if len(inst_mean_freqs) > 0:
-            time_weights = np.sum(valid_power_tf, axis=0)
+            time_weights = np.sum(valid_cwd, axis=0)
             total_weight = np.sum(time_weights)
             if total_weight > EPSILON:
                 imnf = np.average(inst_mean_freqs, weights=time_weights)
@@ -1203,7 +1478,7 @@ def extract_semg_features(
                 imnf = np.mean(inst_mean_freqs)
             
             # Ensure reasonable frequency range
-            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, fs/2)
+            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, SEMG_HIGH_FREQ_CUTOFF)
         else:
             imnf = mnf  # Fallback to MNF
             
@@ -1387,12 +1662,17 @@ def batch_hht_analysis(
     fs: float,
     n_freq_bins: int = 256,
     normalize_length: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     use_ceemdan: bool = True,
     extract_features: bool = True
 ) -> Dict[str, Union[List[np.ndarray], np.ndarray, List[Dict]]]:
     """
     Perform batch HHT analysis on multiple segments.
+    
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid artifacts
+    - Frequency axis maps to sEMG range (20-450Hz by default)
     
     This function processes all segments at once, producing uniform-sized
     Hilbert spectra suitable for CNN input.
@@ -1406,9 +1686,11 @@ def batch_hht_analysis(
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
     normalize_length : int, optional
-        Target length for all spectra (default: 256)
+        Target length for all spectra (default: 256, uses average pooling)
+    min_freq : float, optional
+        Minimum frequency (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency (default: fs/2)
+        Maximum frequency (default: 450Hz for sEMG)
     use_ceemdan : bool, optional
         Use CEEMDAN instead of EMD (default: True)
     extract_features : bool, optional
@@ -1420,20 +1702,24 @@ def batch_hht_analysis(
         - 'spectra': List of Hilbert spectrum matrices
         - 'spectra_array': 3D numpy array (n_segments, n_freq_bins, normalize_length)
         - 'time': Normalized time axis [0, 1]
-        - 'frequency': Frequency axis
+        - 'frequency': Frequency axis (typically 20-450Hz)
         - 'features': List of feature dictionaries (if extract_features=True)
     """
     spectra = []
     features_list = []
     
+    # Set default frequency range for sEMG
+    if min_freq is None:
+        min_freq = SEMG_LOW_FREQ_CUTOFF  # 20 Hz
     if max_freq is None:
-        max_freq = fs / 2
+        max_freq = SEMG_HIGH_FREQ_CUTOFF  # 450 Hz
     
     for segment in segments:
-        # Compute enhanced spectrum
+        # Compute enhanced spectrum (uses average pooling, not interpolation)
         spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
             segment, fs,
             n_freq_bins=n_freq_bins,
+            min_freq=min_freq,
             max_freq=max_freq,
             normalize_length=normalize_length,
             normalize_time=True,
@@ -1468,6 +1754,7 @@ def hht_analysis_enhanced(
     signal: np.ndarray,
     fs: float,
     n_freq_bins: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     normalize_length: Optional[int] = None,
     normalize_time: bool = True,
@@ -1478,6 +1765,10 @@ def hht_analysis_enhanced(
 ) -> Dict:
     """
     Enhanced Hilbert-Huang Transform analysis with CEEMDAN and feature extraction.
+    
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid artifacts
+    - Frequency axis maps to sEMG range (20-450Hz by default)
     
     This is an improved version of hht_analysis that uses CEEMDAN for more
     robust decomposition and includes comprehensive feature extraction.
@@ -1490,10 +1781,12 @@ def hht_analysis_enhanced(
         Sampling frequency in Hz
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
+    min_freq : float, optional
+        Minimum frequency (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency (default: fs/2)
+        Maximum frequency (default: 450Hz for sEMG)
     normalize_length : int, optional
-        Target length for normalization (for uniform CNN input)
+        Target length for normalization (for uniform CNN input, uses average pooling)
     normalize_time : bool, optional
         Normalize time axis to [0, 1] (default: True)
     normalize_amplitude : bool, optional
@@ -1518,21 +1811,16 @@ def hht_analysis_enhanced(
         - 'dominant_frequency': Dominant frequency at each time point
         - 'features': sEMG features dictionary (if extract_features=True)
     """
-    from scipy.signal import resample
-    
-    # Store original length
+    # Store original length (no interpolation pre-processing)
     original_length = len(signal)
     
-    # Normalize length if requested
-    if normalize_length is not None and len(signal) != normalize_length:
-        signal = resample(signal, normalize_length)
-    
-    # Compute enhanced spectrum
+    # Compute enhanced spectrum (uses average pooling if normalize_length is provided)
     spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
         signal, fs,
         n_freq_bins=n_freq_bins,
+        min_freq=min_freq,
         max_freq=max_freq,
-        normalize_length=None,  # Already resampled above
+        normalize_length=normalize_length,
         normalize_time=normalize_time,
         normalize_amplitude=normalize_amplitude,
         use_ceemdan=use_ceemdan,
@@ -1561,7 +1849,7 @@ def hht_analysis_enhanced(
         'mean_frequency': mean_frequency,
         'dominant_frequency': dominant_frequency,
         'original_length': original_length,
-        'normalized_length': len(signal),
+        'normalized_length': len(time_axis),
         'use_ceemdan': use_ceemdan,
     }
     
@@ -1655,13 +1943,20 @@ def export_hilbert_spectra_batch(
     base_filename: str = "segment",
     n_freq_bins: int = 256,
     normalize_length: int = 256,
+    min_freq: Optional[float] = None,
     max_freq: Optional[float] = None,
     use_ceemdan: bool = True,
     save_visualization: bool = True,
-    dpi: int = 150
+    dpi: int = 150,
+    precomputed_spectra: Optional[Dict] = None
 ) -> List[Dict[str, str]]:
     """
     Export Hilbert spectra for all activity segments in batch.
+    
+    IMPROVEMENTS (2024):
+    - Uses average pooling instead of interpolation to avoid artifacts
+    - Frequency axis maps to sEMG range (20-450Hz by default)
+    - Can reuse precomputed spectra to avoid redundant calculations
     
     For each sEMG activity segment, exports:
     1. NPZ file containing spectrum matrix, time axis, and frequency axis
@@ -1684,15 +1979,21 @@ def export_hilbert_spectra_batch(
     n_freq_bins : int, optional
         Number of frequency bins (default: 256)
     normalize_length : int, optional
-        Target time axis length (default: 256)
+        Target time axis length (default: 256, uses average pooling)
+    min_freq : float, optional
+        Minimum frequency in Hz (default: 20Hz for sEMG)
     max_freq : float, optional
-        Maximum frequency in Hz (default: fs/2)
+        Maximum frequency in Hz (default: 450Hz for sEMG)
     use_ceemdan : bool, optional
         Use CEEMDAN decomposition (default: True)
     save_visualization : bool, optional
         Whether to save PNG visualizations (default: True)
     dpi : int, optional
         DPI for PNG images (default: 150)
+    precomputed_spectra : Dict, optional
+        Pre-computed HHT results from batch_hht_analysis().
+        If provided, uses these instead of recalculating HHT.
+        Expected keys: 'spectra', 'time', 'frequency'
     
     Returns:
     --------
@@ -1735,28 +2036,51 @@ def export_hilbert_spectra_batch(
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
+    # Set default frequency range for sEMG
+    if min_freq is None:
+        min_freq = SEMG_LOW_FREQ_CUTOFF  # 20 Hz
     if max_freq is None:
-        max_freq = fs / 2
+        max_freq = SEMG_HIGH_FREQ_CUTOFF  # 450 Hz
     
     export_info = []
     
-    print(f"Exporting Hilbert spectra for {len(segments)} segments...")
+    # Check if we can use precomputed spectra
+    use_precomputed = (
+        precomputed_spectra is not None and
+        'spectra' in precomputed_spectra and
+        'time' in precomputed_spectra and
+        'frequency' in precomputed_spectra and
+        len(precomputed_spectra['spectra']) == len(segments)
+    )
+    
+    if use_precomputed:
+        print(f"Using precomputed HHT results for {len(segments)} segments (fast export)...")
+        spectra_list = precomputed_spectra['spectra']
+        time_axis = precomputed_spectra['time']
+        freq_axis = precomputed_spectra['frequency']
+    else:
+        print(f"Computing and exporting Hilbert spectra for {len(segments)} segments...")
     
     for idx, segment in enumerate(segments):
         segment_num = idx + 1
         
-        # Compute Hilbert spectrum
-        spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
-            segment,
-            fs,
-            n_freq_bins=n_freq_bins,
-            max_freq=max_freq,
-            normalize_length=normalize_length,
-            normalize_time=True,
-            normalize_amplitude=False,
-            use_ceemdan=use_ceemdan,
-            log_scale=True
-        )
+        if use_precomputed:
+            # Use precomputed spectrum
+            spectrum = spectra_list[idx]
+        else:
+            # Compute Hilbert spectrum (uses average pooling, not interpolation)
+            spectrum, time_axis, freq_axis = compute_hilbert_spectrum_enhanced(
+                segment,
+                fs,
+                n_freq_bins=n_freq_bins,
+                min_freq=min_freq,
+                max_freq=max_freq,
+                normalize_length=normalize_length,
+                normalize_time=True,
+                normalize_amplitude=False,
+                use_ceemdan=use_ceemdan,
+                log_scale=True
+            )
         
         # Generate filenames with zero-padded numbering
         npz_filename = f"{base_filename}_{segment_num:03d}.npz"
@@ -1835,12 +2159,14 @@ def export_activity_segments_hht(
     fs: float,
     output_dir: str,
     base_filename: str = "activity_segment",
+    precomputed_spectra: Optional[Dict] = None,
     **hht_kwargs
 ) -> List[Dict[str, str]]:
     """
     Convenience function to export HHT analysis for all detected activity segments.
     
     This function combines segment extraction and HHT export in one step.
+    Can reuse precomputed HHT results to avoid redundant calculations.
     
     Parameters:
     -----------
@@ -1854,6 +2180,10 @@ def export_activity_segments_hht(
         Directory to save output files
     base_filename : str, optional
         Base name for output files
+    precomputed_spectra : Dict, optional
+        Pre-computed HHT results from batch_hht_analysis().
+        If provided, uses these instead of recalculating HHT.
+        Expected keys: 'spectra', 'time', 'frequency'
     **hht_kwargs : dict
         Additional keyword arguments for export_hilbert_spectra_batch()
         (e.g., n_freq_bins, normalize_length, use_ceemdan, save_visualization)
@@ -1871,7 +2201,7 @@ def export_activity_segments_hht(
     >>> # Detect activity
     >>> segments = detect_muscle_activity(filtered_signal, fs=1000, min_duration=0.5)
     >>> 
-    >>> # Export HHT for all segments
+    >>> # Export HHT for all segments (will compute HHT)
     >>> export_info = export_activity_segments_hht(
     >>>     filtered_signal,
     >>>     segments,
@@ -1879,15 +2209,29 @@ def export_activity_segments_hht(
     >>>     output_dir='./hht_output',
     >>>     base_filename='bicep_curl'
     >>> )
+    >>> 
+    >>> # Or reuse precomputed HHT results (fast export)
+    >>> from semg_preprocessing.hht import batch_hht_analysis
+    >>> segment_arrays = [filtered_signal[s:e] for s, e in segments]
+    >>> batch_results = batch_hht_analysis(segment_arrays, fs=1000)
+    >>> export_info = export_activity_segments_hht(
+    >>>     filtered_signal,
+    >>>     segments,
+    >>>     fs=1000,
+    >>>     output_dir='./hht_output',
+    >>>     base_filename='bicep_curl',
+    >>>     precomputed_spectra=batch_results
+    >>> )
     """
     # Extract segment data
     segment_arrays = [signal[start:end] for start, end in activity_segments]
     
-    # Export Hilbert spectra
+    # Export Hilbert spectra (with optional precomputed spectra)
     return export_hilbert_spectra_batch(
         segment_arrays,
         fs,
         output_dir,
         base_filename,
+        precomputed_spectra=precomputed_spectra,
         **hht_kwargs
     )

@@ -85,6 +85,15 @@ class EMGProcessorGUI:
         # Augmentation results
         self.augmented_signals = None
     
+    def _get_default_feature_filename(self):
+        """Generate default filename for feature export based on current signal filename."""
+        if hasattr(self, 'current_filename') and self.current_filename:
+            # Remove extension and add _features.csv
+            base_name = os.path.splitext(self.current_filename)[0]
+            return f"{base_name}_features.csv"
+        else:
+            return "segment_features.csv"
+    
     def _create_batch_subplot_axes(self, n_items, max_show=8, figsize_per_row=2.5, n_cols=2):
         """
         Create subplot axes for batch visualization.
@@ -668,7 +677,7 @@ class EMGProcessorGUI:
 - RMS: {np.mean(all_rms):.4f} ± {np.std(all_rms):.4f}
 - MDF: {np.mean(all_mdf):.2f} ± {np.std(all_mdf):.2f} Hz
 - MNF: {np.mean(all_mnf):.2f} ± {np.std(all_mnf):.2f} Hz
-- DI: {np.mean(all_di):.2f} ± {np.std(all_di):.2f}
+- DI: {np.mean(all_di):.6e} ± {np.std(all_di):.6e}
 
 **Per-file breakdown:**
 """
@@ -677,7 +686,7 @@ class EMGProcessorGUI:
                     avg_rms = np.mean([f['RMS'] for f in data['features']])
                     avg_mdf = np.mean([f['MDF'] for f in data['features']])
                     avg_di = np.mean([f['DI'] for f in data['features']])
-                    info += f"\n- {data['filename']}: {len(data['features'])} segs, RMS={avg_rms:.4f}, MDF={avg_mdf:.1f}Hz, DI={avg_di:.2f}"
+                    info += f"\n- {data['filename']}: {len(data['features'])} segs, RMS={avg_rms:.4f}, MDF={avg_mdf:.1f}Hz, DI={avg_di:.6e}"
             
             return info.strip(), fig
         except Exception as e:
@@ -1136,6 +1145,13 @@ class EMGProcessorGUI:
                 extract_features=True
             )
             
+            # Store parameters for later validation during export
+            self._batch_hht_params = {
+                'n_freq_bins': int(n_freq_bins),
+                'normalize_length': int(normalize_length),
+                'use_ceemdan': use_ceemdan
+            }
+            
             progress(0.7, desc="Creating visualization...")
             
             # Create visualization showing first 4 spectra
@@ -1176,7 +1192,7 @@ class EMGProcessorGUI:
                 features_summary += f"\n*Segment {i+1}:*\n"
                 features_summary += f"  WL={features['WL']:.2f}, ZC={features['ZC']}, SSC={features['SSC']}\n"
                 features_summary += f"  MDF={features['MDF']:.1f}Hz, MNF={features['MNF']:.1f}Hz, IMNF={features['IMNF']:.1f}Hz\n"
-                features_summary += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}, DI={features.get('DI', 0):.4f}\n"
+                features_summary += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}, DI={features.get('DI', 0):.6e}\n"
             
             info = f"""
 ✅ Batch HHT Analysis Complete!
@@ -1222,6 +1238,12 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
                 annotations['Subject'] = subject_id
             if fatigue_level:
                 annotations['Fatigue_Level'] = fatigue_level
+            
+            # Handle output path - if it's a directory, append default filename
+            if os.path.isdir(output_path) or (not output_path.endswith('.csv') and not os.path.exists(output_path)):
+                # It's a directory path, add default filename
+                default_filename = self._get_default_feature_filename()
+                output_path = os.path.join(output_path, default_filename)
             
             # Export
             export_features_to_csv(features_list, output_path, segment_names, annotations)
@@ -1341,10 +1363,10 @@ All spectra have uniform size {n_freq_bins}x{normalize_length}, ready for CNN in
         # Use dual y-axes for different scales
         ax2 = ax.twinx()
         
-        # Plot DI on left axis (very small values)
-        di_values = [f['DI'] for f in features_list]
-        line1 = ax.plot(segment_indices, di_values, 'ro-', label='DI (Dimitrov Index)', linewidth=2, markersize=6)
-        ax.set_ylabel('DI Value (×1e-14)', fontsize=11, color='r')
+        # Plot DI on left axis (very small values - scale to 1e14 for better display)
+        di_values = [f['DI'] * 1e14 for f in features_list]  # Scale for display
+        line1 = ax.plot(segment_indices, di_values, 'ro-', label='DI (×10⁻¹⁴)', linewidth=2, markersize=6)
+        ax.set_ylabel('DI Value (×10⁻¹⁴)', fontsize=11, color='r')
         ax.tick_params(axis='y', labelcolor='r')
         
         # Plot WIRE51 on right axis
@@ -1556,6 +1578,23 @@ The CSV contains all extracted features for each segment.
                     segment_tuples = [(int(seg['start_index']), int(seg['end_index'])) 
                                      for seg in self.segment_data]
                     
+                    # Check if we have precomputed HHT results from batch analysis
+                    precomputed_hht = None
+                    if hasattr(self, 'batch_hht_results') and self.batch_hht_results is not None:
+                        # Verify the batch results match current segments
+                        # Check both count and that segments have compatible parameters
+                        batch_spectra = self.batch_hht_results.get('spectra', [])
+                        if (len(batch_spectra) == len(segment_tuples) and
+                            hasattr(self, '_batch_hht_params') and
+                            self._batch_hht_params.get('n_freq_bins') == 256 and
+                            self._batch_hht_params.get('normalize_length') == 256):
+                            precomputed_hht = self.batch_hht_results
+                            print("  ✓ Using precomputed HHT results (fast export)")
+                        else:
+                            print("  ⚠ Batch HHT results don't match current export parameters, will recompute")
+                    else:
+                        print("  ℹ No precomputed HHT results, computing now...")
+                    
                     # Export matrices to hht_matrices directory
                     export_info_matrices = export_activity_segments_hht(
                         self.filtered_signal,
@@ -1566,7 +1605,8 @@ The CSV contains all extracted features for each segment.
                         n_freq_bins=256,
                         normalize_length=256,
                         use_ceemdan=True,
-                        save_visualization=False  # We'll save images separately
+                        save_visualization=False,  # We'll save images separately
+                        precomputed_spectra=precomputed_hht
                     )
                     
                     # Save visualizations to hht_images directory
@@ -2223,8 +2263,9 @@ def create_gui():
                                 
                                 gr.Markdown("---")
                                 gr.Markdown("**Feature Export / 特征导出**")
-                                features_output_path = gr.Textbox(value="./output/segment_features.csv", 
-                                                                 label="Features CSV Path")
+                                features_output_path = gr.Textbox(value="./output", 
+                                                                 label="Output Directory (输出目录)",
+                                                                 placeholder="Enter directory path (e.g., ./output). Filename will be auto-generated from signal file.")
                                 features_subject = gr.Textbox(value="", label="Subject ID for features")
                                 features_fatigue = gr.Dropdown(
                                     choices=["", "fresh", "mild_fatigue", "moderate_fatigue", "severe_fatigue"],

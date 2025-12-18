@@ -39,6 +39,13 @@ A comprehensive Python toolkit for surface electromyography (sEMG) signal prepro
    - Publication-ready visualizations with proper labels
    - Simple API: `export_activity_segments_hht(signal, segments, fs, output_dir)`
 
+4. **HHT Algorithm Optimization** 🆕 **(December 2024)**
+   - ✅ **No interpolation artifacts**: Replaced scipy.signal.resample with average pooling
+   - ✅ **Valid sEMG frequency range**: 20-450Hz mapped to 256 frequency bins (not 0-Nyquist)
+   - ✅ **Energy preservation**: HHT computed on original signal duration, then pooled to uniform size
+   - ✅ **Better accuracy**: Avoids high-frequency artifacts introduced by interpolation
+   - ✅ **Improved visualizations**: Hilbert spectrum images show meaningful sEMG frequency range
+
 **📖 See [ENHANCED_FEATURES.md](ENHANCED_FEATURES.md) for detailed documentation and examples.**
 
 ### 1. EMG Data Preprocessing / EMG数据预处理
@@ -221,13 +228,25 @@ assert all(d >= 0.5 for d in durations), "Duration constraint violated!"
 
 ### 4. Hilbert-Huang Transform (HHT) / 希尔伯特-黄变换
 
-- CEEMDAN decomposition for robust IMF extraction
-- Production-ready HHT with:
+**IMPROVED (2024):** HHT algorithm optimized to avoid interpolation artifacts and focus on valid sEMG frequency range.
+
+- **CEEMDAN decomposition** for robust IMF extraction
+- **Average pooling-based normalization** (no interpolation, no high-frequency artifacts)
+- **Frequency mapping to 20-450Hz** (valid sEMG range, not 0-Nyquist)
+- Production-ready HHT features:
   - Fixed IMF count (8) with zero-padding
-  - Unified time-frequency axes
-  - Energy conservation validation (<5% error)
+  - Compute HHT on original signal duration, then pool to uniform size (256×256)
+  - Unified time-frequency axes for CNN input
+  - Energy conservation validation (<5% error typically)
   - Signal normalization and amplitude thresholding
   - Noise reduction and muscle activity representation
+  - Batch export of Hilbert spectra for all activity segments
+
+**Key Improvements:**
+1. ✅ **No interpolation artifacts**: Uses average pooling instead of scipy.signal.resample
+2. ✅ **Meaningful frequency range**: 20-450Hz maps to the 256 frequency bins (sEMG valid range)
+3. ✅ **Energy preserved**: HHT computed on original signal, then downsampled
+4. ✅ **Better visualization**: Hilbert spectrum PNG visualizations show 20-450Hz range
 
 ### 5. Data Augmentation / 数据增强
 
