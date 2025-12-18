@@ -1690,10 +1690,12 @@ The CSV contains all extracted features for each segment.
             progress(0.8, desc="Creating visualization...")
             
             # Create visualization with a subset of spectra
-            spectra = self.segment_features_hht['spectra']
+            spectra_list = self.segment_features_hht['spectra']
             features_list = self.segment_features_hht['features']
+            time_axis = self.segment_features_hht['time']
+            freq_axis = self.segment_features_hht['frequency']
             
-            n_show = min(6, len(spectra))
+            n_show = min(6, len(spectra_list))
             n_cols = 2
             n_rows = (n_show + 1) // 2
             
@@ -1705,11 +1707,9 @@ The CSV contains all extracted features for each segment.
                 row, col = i // n_cols, i % n_cols
                 ax = axes[row, col]
                 
-                spectrum = spectra[i]['spectrum']
-                time = spectra[i]['time']
-                freq = spectra[i]['frequency']
+                spectrum = spectra_list[i]
                 
-                im = ax.pcolormesh(time, freq, spectrum, shading='auto', cmap='jet')
+                im = ax.pcolormesh(time_axis, freq_axis, spectrum, shading='auto', cmap='jet')
                 ax.set_xlabel('Time (normalized)')
                 ax.set_ylabel('Frequency (Hz)')
                 ax.set_title(f'{filenames[i]} (Seg {i+1})', fontsize=10)
