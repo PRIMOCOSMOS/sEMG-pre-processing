@@ -3011,3 +3011,241 @@ def _remove_overlaps(
                 non_overlapping.append((current_start, current_end))
     
     return non_overlapping
+
+
+def detect_activity_hht(
+    data: np.ndarray,
+    fs: float,
+    min_duration: float = 0.1,
+    max_duration: Optional[float] = None,
+    energy_threshold: float = 0.65,
+    temporal_compactness: float = 0.3,
+    min_freq: float = 20.0,
+    max_freq: float = 450.0,
+    resolution_per_second: int = 128,
+    return_spectrum: bool = False,
+    **kwargs
+) -> Union[List[Tuple[int, int]], Dict[str, Union[List[Tuple[int, int]], np.ndarray]]]:
+    """
+    Detect muscle activity events using Hilbert-Huang Transform (HHT) analysis.
+    
+    This method computes the full-signal HHT, analyzes the Hilbert spectrum for
+    high-energy stripes (characteristic of muscle activity), and maps detected
+    time segments back to the original signal.
+    
+    Algorithm:
+    1. Compute HHT of the entire signal with dynamic resolution
+    2. Identify high-energy regions in the Hilbert spectrum
+    3. Detect temporally compact energy patterns (muscle events)
+    4. Map detected patterns back to time domain
+    5. Extract segments from original signal
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        Input sEMG signal data (1D array), should be preprocessed (filtered)
+    fs : float
+        Sampling frequency in Hz
+    min_duration : float, optional
+        Minimum duration of muscle activity in seconds (default: 0.1)
+    max_duration : float, optional
+        Maximum duration of muscle activity in seconds (default: None = no limit)
+    energy_threshold : float, optional
+        Percentile threshold for high-energy detection (0-1, default: 0.65)
+        Higher = more selective, lower = more sensitive
+    temporal_compactness : float, optional
+        Minimum ratio of time bins that must have high energy (0-1, default: 0.3)
+        This ensures detected regions are temporally compact (not scattered noise)
+    min_freq : float, optional
+        Minimum frequency for HHT analysis (default: 20.0 Hz for sEMG)
+    max_freq : float, optional
+        Maximum frequency for HHT analysis (default: 450.0 Hz for sEMG)
+    resolution_per_second : int, optional
+        Time resolution per second (default: 128, i.e., 128 time bins per second)
+        Total resolution scales with signal duration
+    return_spectrum : bool, optional
+        If True, return dict with segments and spectrum data for visualization
+    **kwargs : dict
+        Additional arguments (for compatibility)
+    
+    Returns:
+    --------
+    List[Tuple[int, int]] or Dict
+        If return_spectrum=False (default):
+            List of (start_index, end_index) tuples for detected muscle activity segments
+        If return_spectrum=True:
+            Dict with keys:
+                'segments': List of (start_index, end_index) tuples
+                'spectrum': Full Hilbert spectrum matrix (freq_bins x time_bins)
+                'time': Time axis array
+                'frequency': Frequency axis array
+                'detection_mask': Boolean mask of detected regions on spectrum
+    
+    Notes:
+    ------
+    - Signal should be preprocessed (filtered) before detection
+    - Resolution dynamically scales: for 2-4s signal → 256-512 time bins
+    - Uses average pooling logic, no interpolation (consistent with existing HHT)
+    - Frequency range limited to sEMG effective range (20-450 Hz)
+    - High-energy stripes in spectrum indicate muscle activity
+    """
+    # Import HHT functions from hht module
+    from . import hht as hht_module
+    
+    signal_length = len(data)
+    signal_duration = signal_length / fs
+    
+    # Dynamic resolution: scale based on signal duration
+    # For 2-4s signals → 256-512 time bins (as per requirement)
+    target_time_bins = int(signal_duration * resolution_per_second)
+    target_time_bins = max(128, min(target_time_bins, 2048))  # Reasonable bounds
+    
+    # Frequency bins: use same number as time bins for square matrix (common for CNN input)
+    n_freq_bins = target_time_bins
+    
+    # Compute full-signal HHT
+    # Use compute_hilbert_spectrum which handles the decomposition and spectrum generation
+    spectrum, time_axis, freq_axis = hht_module.compute_hilbert_spectrum(
+        data, 
+        fs=fs,
+        n_freq_bins=n_freq_bins,
+        min_freq=min_freq,
+        max_freq=max_freq,
+        normalize_length=target_time_bins
+    )
+    
+    # Detect high-energy regions in spectrum
+    # Strategy: look for temporally compact high-energy patterns
+    
+    # 1. Threshold spectrum at percentile
+    threshold = np.percentile(spectrum, energy_threshold * 100)
+    high_energy_mask = spectrum > threshold
+    
+    # 2. Compute time-integrated energy (sum over frequency at each time bin)
+    time_energy = np.sum(spectrum, axis=0)
+    
+    # 3. Detect active time regions using energy profile
+    # Normalize energy
+    if np.max(time_energy) > 0:
+        time_energy_norm = time_energy / np.max(time_energy)
+    else:
+        time_energy_norm = time_energy
+    
+    # Find regions where energy exceeds a threshold
+    # Use adaptive threshold based on signal characteristics
+    energy_mean = np.mean(time_energy_norm)
+    energy_std = np.std(time_energy_norm)
+    adaptive_threshold = energy_mean + 0.5 * energy_std  # Moderate sensitivity
+    
+    active_time_bins = time_energy_norm > adaptive_threshold
+    
+    # 4. Find contiguous active regions using connected component analysis
+    # Convert boolean mask to segments
+    segments_in_bins = []
+    in_segment = False
+    start_bin = 0
+    
+    for i, is_active in enumerate(active_time_bins):
+        if is_active and not in_segment:
+            # Start of new segment
+            start_bin = i
+            in_segment = True
+        elif not is_active and in_segment:
+            # End of segment
+            segments_in_bins.append((start_bin, i))
+            in_segment = False
+    
+    # Handle case where segment extends to end
+    if in_segment:
+        segments_in_bins.append((start_bin, len(active_time_bins)))
+    
+    # 5. Filter segments by temporal compactness
+    # Check if high-energy patterns are compact within detected regions
+    filtered_segments = []
+    for start_bin, end_bin in segments_in_bins:
+        segment_length = end_bin - start_bin
+        if segment_length == 0:
+            continue
+            
+        # Check compactness: ratio of high-energy bins within segment
+        segment_mask = high_energy_mask[:, start_bin:end_bin]
+        has_high_energy = np.any(segment_mask, axis=0)  # Time bins with any high energy
+        compactness = np.sum(has_high_energy) / segment_length
+        
+        if compactness >= temporal_compactness:
+            filtered_segments.append((start_bin, end_bin))
+    
+    # 6. Map time bins back to original signal indices
+    # Time bins correspond to normalized time axis
+    bin_to_sample_ratio = signal_length / target_time_bins
+    
+    segments_in_samples = []
+    for start_bin, end_bin in filtered_segments:
+        start_sample = int(start_bin * bin_to_sample_ratio)
+        end_sample = int(end_bin * bin_to_sample_ratio)
+        
+        # Ensure within bounds
+        start_sample = max(0, start_sample)
+        end_sample = min(signal_length, end_sample)
+        
+        segments_in_samples.append((start_sample, end_sample))
+    
+    # 7. Apply duration constraints
+    min_samples = int(min_duration * fs)
+    segments_filtered = []
+    
+    for start, end in segments_in_samples:
+        duration_samples = end - start
+        
+        # Check minimum duration
+        if duration_samples < min_samples:
+            continue
+        
+        # Apply max_duration splitting if specified
+        if max_duration is not None and max_duration > min_duration:
+            max_samples = int(max_duration * fs)
+            if duration_samples > max_samples:
+                # Split into multiple segments
+                for split_start in range(start, end, max_samples):
+                    split_end = min(split_start + max_samples, end)
+                    if split_end - split_start >= min_samples:
+                        segments_filtered.append((split_start, split_end))
+            else:
+                segments_filtered.append((start, end))
+        else:
+            segments_filtered.append((start, end))
+    
+    # 8. Merge nearby segments (optional, similar to PELT merging)
+    # Merge segments with gaps < 50ms
+    merge_gap_samples = int(0.05 * fs)  # 50ms
+    if len(segments_filtered) > 1:
+        merged_segments = [segments_filtered[0]]
+        for start, end in segments_filtered[1:]:
+            last_start, last_end = merged_segments[-1]
+            gap = start - last_end
+            
+            if gap <= merge_gap_samples:
+                # Merge with previous
+                merged_segments[-1] = (last_start, end)
+            else:
+                merged_segments.append((start, end))
+        segments_filtered = merged_segments
+    
+    # Return results
+    if return_spectrum:
+        # Create detection mask for visualization
+        detection_mask = np.zeros(spectrum.shape, dtype=bool)
+        for start_bin, end_bin in filtered_segments:
+            detection_mask[:, start_bin:end_bin] = True
+        
+        return {
+            'segments': segments_filtered,
+            'spectrum': spectrum,
+            'time': time_axis,
+            'frequency': freq_axis,
+            'detection_mask': detection_mask,
+            'time_energy': time_energy,
+            'active_time_bins': active_time_bins
+        }
+    else:
+        return segments_filtered

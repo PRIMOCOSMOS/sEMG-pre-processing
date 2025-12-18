@@ -18,6 +18,7 @@ from .filters import (
 
 from .detection import (
     detect_muscle_activity,
+    detect_activity_hht,
     segment_signal,
     apply_tkeo,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "remove_powerline_dft",
     # Detection
     "detect_muscle_activity",
+    "detect_activity_hht",
     "segment_signal",
     "apply_tkeo",
     # I/O
