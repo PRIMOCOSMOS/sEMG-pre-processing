@@ -6,6 +6,7 @@ This module implements muscle activity event detection using:
 - Multi-dimensional feature vectors (time-domain, frequency-domain, complexity)
 - Energy-based penalty zones for improved detection
 - Multi-detector ensemble with voting/fusion mechanisms
+- HHT-based detection using Hilbert spectrum analysis
 """
 
 import numpy as np
@@ -16,6 +17,13 @@ from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from scipy.stats import entropy
+from . import hht as hht_module
+
+# HHT detection constants
+HHT_MIN_TIME_BINS = 128  # Minimum time bins for HHT resolution
+HHT_MAX_TIME_BINS = 2048  # Maximum time bins for HHT resolution
+HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.5  # Factor for adaptive energy threshold
+HHT_MERGE_GAP_MS = 50  # Gap in milliseconds for merging nearby segments
 
 
 def apply_tkeo(signal: np.ndarray) -> np.ndarray:
@@ -3023,6 +3031,8 @@ def detect_activity_hht(
     min_freq: float = 20.0,
     max_freq: float = 450.0,
     resolution_per_second: int = 128,
+    adaptive_threshold_factor: float = HHT_ADAPTIVE_THRESHOLD_FACTOR,
+    merge_gap_ms: float = HHT_MERGE_GAP_MS,
     return_spectrum: bool = False,
     **kwargs
 ) -> Union[List[Tuple[int, int]], Dict[str, Union[List[Tuple[int, int]], np.ndarray]]]:
@@ -3063,6 +3073,11 @@ def detect_activity_hht(
     resolution_per_second : int, optional
         Time resolution per second (default: 128, i.e., 128 time bins per second)
         Total resolution scales with signal duration
+    adaptive_threshold_factor : float, optional
+        Factor for adaptive energy threshold calculation (default: 0.5)
+        Higher = more strict, lower = more sensitive
+    merge_gap_ms : float, optional
+        Gap in milliseconds for merging nearby segments (default: 50ms)
     return_spectrum : bool, optional
         If True, return dict with segments and spectrum data for visualization
     **kwargs : dict
@@ -3088,9 +3103,8 @@ def detect_activity_hht(
     - Uses average pooling logic, no interpolation (consistent with existing HHT)
     - Frequency range limited to sEMG effective range (20-450 Hz)
     - High-energy stripes in spectrum indicate muscle activity
+    - adaptive_threshold_factor and merge_gap_ms are configurable for different signals
     """
-    # Import HHT functions from hht module
-    from . import hht as hht_module
     
     signal_length = len(data)
     signal_duration = signal_length / fs
@@ -3098,7 +3112,7 @@ def detect_activity_hht(
     # Dynamic resolution: scale based on signal duration
     # For 2-4s signals → 256-512 time bins (as per requirement)
     target_time_bins = int(signal_duration * resolution_per_second)
-    target_time_bins = max(128, min(target_time_bins, 2048))  # Reasonable bounds
+    target_time_bins = max(HHT_MIN_TIME_BINS, min(target_time_bins, HHT_MAX_TIME_BINS))  # Reasonable bounds
     
     # Frequency bins: use same number as time bins for square matrix (common for CNN input)
     n_freq_bins = target_time_bins
@@ -3135,7 +3149,7 @@ def detect_activity_hht(
     # Use adaptive threshold based on signal characteristics
     energy_mean = np.mean(time_energy_norm)
     energy_std = np.std(time_energy_norm)
-    adaptive_threshold = energy_mean + 0.5 * energy_std  # Moderate sensitivity
+    adaptive_threshold = energy_mean + adaptive_threshold_factor * energy_std  # Configurable sensitivity
     
     active_time_bins = time_energy_norm > adaptive_threshold
     
@@ -3216,8 +3230,8 @@ def detect_activity_hht(
             segments_filtered.append((start, end))
     
     # 8. Merge nearby segments (optional, similar to PELT merging)
-    # Merge segments with gaps < 50ms
-    merge_gap_samples = int(0.05 * fs)  # 50ms
+    # Merge segments with configurable gap
+    merge_gap_samples = int(merge_gap_ms / 1000.0 * fs)
     if len(segments_filtered) > 1:
         merged_segments = [segments_filtered[0]]
         for start, end in segments_filtered[1:]:
