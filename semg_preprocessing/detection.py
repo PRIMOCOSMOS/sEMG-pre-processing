@@ -3037,8 +3037,8 @@ def detect_activity_hht(
     fs: float,
     min_duration: float = 0.1,
     max_duration: Optional[float] = None,
-    energy_threshold: float = 0.65,
-    temporal_compactness: float = 0.3,
+    energy_threshold: float = 0.5,
+    temporal_compactness: float = 0.2,
     min_freq: float = 20.0,
     max_freq: float = 450.0,
     resolution_per_second: int = 128,
@@ -3076,11 +3076,13 @@ def detect_activity_hht(
         Maximum duration of muscle activity in seconds (default: None = no limit)
         Typical dumbbell lift actions are usually 1-10 seconds
     energy_threshold : float, optional
-        Percentile threshold for high-energy detection (0-1, default: 0.65)
+        Percentile threshold for high-energy detection (0-1, default: 0.5)
         Higher = more selective (fewer events), lower = more sensitive (more events)
+        Lowered from 0.65 to 0.5 to be less strict and detect more events
     temporal_compactness : float, optional
-        Minimum ratio of time bins that must have high energy (0-1, default: 0.3)
+        Minimum ratio of time bins that must have high energy (0-1, default: 0.2)
         This ensures detected regions are temporally compact (not scattered noise)
+        Lowered from 0.3 to 0.2 to include segments with peaks, not just peaks themselves
     min_freq : float, optional
         Minimum frequency for HHT analysis (default: 20.0 Hz for sEMG)
     max_freq : float, optional
