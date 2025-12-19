@@ -3101,7 +3101,10 @@ def detect_activity_hht(
         Time resolution per second (default: 128, i.e., 128 time bins per second)
         Total resolution scales with signal duration
     adaptive_threshold_factor : float, optional
-        Legacy parameter, not used in baseline approach (kept for API compatibility)
+        **DEPRECATED - Not used in baseline approach (kept for API compatibility)**
+        This parameter is not used in the new baseline resting state detection.
+        Will be removed in a future version.
+        For controlling sensitivity, use the 'sensitivity' parameter instead.
     merge_gap_ms : float, optional
         Gap in milliseconds for merging nearby segments (default: 50ms)
     return_spectrum : bool, optional
@@ -3392,7 +3395,7 @@ def detect_activity_hht(
         
         # Threshold information for debugging/display
         threshold_info = {
-            'global_threshold': threshold,
+            'spectrum_percentile_threshold': threshold,  # Percentile threshold used for spectrum high-energy mask
             'adaptive_threshold': adaptive_threshold,
             'sensitivity': sensitivity,
             'adjusted_energy_threshold': adjusted_energy_threshold,
