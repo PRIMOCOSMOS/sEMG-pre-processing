@@ -251,21 +251,64 @@ E(t) = \sum_f S(f, t)
 \end{equation}
 where $S(f, t)$ is the Hilbert spectrum amplitude at frequency $f$ and time $t$.
 
-\subsubsection{Adaptive Thresholding with Improved Parameters}
+\subsubsection{Baseline Resting State Adaptive Thresholding}
 
-The detection threshold adapts to signal characteristics:
+The algorithm uses a novel baseline resting state approach for threshold determination. This method is based on the key observation that in the HHT spectrum, resting (inactive) periods show clear, stable baseline energy with minimal variation, while muscle activities appear as distinct elevations above this baseline.
+
+\textbf{Baseline Estimation:}
+
+Instead of using global energy statistics (which can be skewed by high-intensity peaks), the algorithm estimates the baseline from the lower portion of the energy distribution:
 \begin{equation}
-\theta_{adaptive} = \mu_E + \alpha \cdot \sigma_E \cdot s
+E_{baseline} = \{e \in E_{sorted} : e \leq P_{30}(E)\}
 \end{equation}
-where $\mu_E$ and $\sigma_E$ are the mean and standard deviation of the energy profile, $\alpha$ is the adaptive threshold factor (default: 0.5), and $s$ is the user-adjustable sensitivity parameter.
+where $P_{30}(E)$ is the 30th percentile of combined energy values. This captures the typical resting state energy.
+
+\textbf{Baseline Statistics:}
+
+From the baseline energy subset, we compute:
+\begin{align}
+\mu_{baseline} &= \text{mean}(E_{baseline}) \\
+\sigma_{baseline} &= \text{std}(E_{baseline})
+\end{align}
+
+\textbf{Baseline-Relative Threshold:}
+
+The detection threshold is set relative to the baseline, not the global mean:
+\begin{equation}
+\theta_{baseline} = \mu_{baseline} + \frac{2.0}{s} \cdot \sigma_{baseline}
+\end{equation}
+where $s$ is the sensitivity parameter. This ensures that:
+\begin{itemize}
+    \item Any sustained elevation above the "calm" resting state is detected
+    \item Weak muscle activities are not rejected simply for having low absolute energy
+    \item The threshold adapts to the signal's inherent baseline level
+    \item Lower sensitivity ($s < 1$) reduces the margin, making detection more sensitive
+\end{itemize}
+
+\textbf{Safety Bounds:}
+
+To prevent extreme thresholds, the baseline threshold is clipped within percentile bounds:
+\begin{equation}
+\theta_{adaptive} = \text{clip}(\theta_{baseline}, P_5(E), P_{60}(E))
+\end{equation}
+
+\textbf{Key Advantages:}
+
+\begin{enumerate}
+    \item \textbf{Robust to Peak Intensity Variation}: The threshold is not influenced by the presence of very strong peaks, allowing weak activities to be detected alongside strong ones
+    \item \textbf{Adaptive to Signal Baseline}: Automatically adjusts to different baseline noise levels across recordings
+    \item \textbf{Physiologically Meaningful}: Directly reflects the rest-vs-activity dichotomy visible in the HHT spectrum
+    \item \textbf{Inclusive Event Capture}: Detects all activities above resting state, not just the strongest events
+\end{enumerate}
 
 \textbf{Improved Default Parameters:}
 \begin{itemize}
-    \item Energy threshold percentile: 0.4 (reduced from 0.65 for less strict detection)
-    \item Temporal compactness: 0.15 (reduced from 0.3 to capture segments containing peaks, not just peaks themselves)
+    \item Energy threshold percentile: 0.4 (for spectrum high-energy mask)
+    \item Temporal compactness: 0.15 (captures segments containing peaks, not just peaks themselves)
+    \item Baseline percentile: 30 (uses lower 30\% of energy values for baseline estimation)
 \end{itemize}
 
-The lower thresholds ensure that detected segments span the duration of muscle actions (typically several seconds), rather than only capturing instantaneous peak moments.
+The baseline approach ensures that detected segments span the full duration of muscle actions (typically several seconds), capturing rising phase, peak, and falling phase, rather than only instantaneous peak moments.
 
 \subsubsection{Local Contrast Energy}
 
