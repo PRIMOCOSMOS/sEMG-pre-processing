@@ -25,6 +25,17 @@ HHT_MAX_TIME_BINS = 2048  # Maximum time bins for HHT resolution
 HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.5  # Factor for adaptive energy threshold
 HHT_MERGE_GAP_MS = 50  # Gap in milliseconds for merging nearby segments
 
+# HHT algorithm parameters - thresholds and bounds
+HHT_MIN_ENERGY_THRESHOLD = 0.3  # Minimum allowed adjusted energy threshold (percentile)
+HHT_MAX_ENERGY_THRESHOLD = 0.95  # Maximum allowed adjusted energy threshold (percentile)
+HHT_NOISE_FLOOR_PERCENTILE = 10  # Percentile for minimum adaptive threshold (noise floor)
+HHT_MAX_THRESHOLD_PERCENTILE = 70  # Percentile for maximum adaptive threshold
+HHT_MIN_COMPACTNESS = 0.1  # Minimum allowed temporal compactness
+HHT_MAX_COMPACTNESS = 0.8  # Maximum allowed temporal compactness
+HHT_LOCAL_WINDOW_MIN_SIZE = 5  # Minimum size for local contrast window
+HHT_LOCAL_WINDOW_FRACTION = 20  # Fraction of signal for local context (1/20 = 5%)
+HHT_RMS_WINDOW_DIVISOR = 10  # Divisor for RMS window calculation (fs/10 = 100ms window)
+
 
 def apply_tkeo(signal: np.ndarray) -> np.ndarray:
     """
@@ -3159,7 +3170,7 @@ def detect_activity_hht(
     # 1. Threshold spectrum at percentile (adjusted by sensitivity)
     # Lower sensitivity = lower percentile threshold = more sensitive detection
     adjusted_energy_threshold = energy_threshold * sensitivity
-    adjusted_energy_threshold = np.clip(adjusted_energy_threshold, 0.3, 0.95)  # Keep in reasonable range
+    adjusted_energy_threshold = np.clip(adjusted_energy_threshold, HHT_MIN_ENERGY_THRESHOLD, HHT_MAX_ENERGY_THRESHOLD)
     threshold = np.percentile(spectrum, adjusted_energy_threshold * 100)
     high_energy_mask = spectrum > threshold
     
@@ -3168,7 +3179,7 @@ def detect_activity_hht(
     
     # 3. Compute local contrast energy for improved detection
     # This helps detect events that stand out locally even if not highest globally
-    local_window_size = max(5, target_time_bins // 20)  # About 5% of signal for local context
+    local_window_size = max(HHT_LOCAL_WINDOW_MIN_SIZE, target_time_bins // HHT_LOCAL_WINDOW_FRACTION)
     local_contrast = _compute_local_energy_contrast(time_energy, local_window_size)
     
     # 4. Detect active time regions using combined global and local criteria
@@ -3200,10 +3211,10 @@ def detect_activity_hht(
     adaptive_threshold = energy_mean + adjusted_threshold_factor * energy_std
     
     # Ensure threshold is reasonable (not too low or too high)
-    # At minimum, threshold should be above noise floor (e.g., 10th percentile)
-    # At maximum, should not exceed median to allow some detections
-    min_threshold = np.percentile(combined_energy, 10)
-    max_threshold = np.percentile(combined_energy, 70)
+    # At minimum, threshold should be above noise floor
+    # At maximum, should not exceed a reasonable level to allow some detections
+    min_threshold = np.percentile(combined_energy, HHT_NOISE_FLOOR_PERCENTILE)
+    max_threshold = np.percentile(combined_energy, HHT_MAX_THRESHOLD_PERCENTILE)
     adaptive_threshold = np.clip(adaptive_threshold, min_threshold, max_threshold)
     
     active_time_bins = combined_energy > adaptive_threshold
@@ -3232,7 +3243,7 @@ def detect_activity_hht(
     # Check if high-energy patterns are compact within detected regions
     # Adjust compactness threshold based on sensitivity
     adjusted_compactness = temporal_compactness / sensitivity
-    adjusted_compactness = np.clip(adjusted_compactness, 0.1, 0.8)  # Keep reasonable
+    adjusted_compactness = np.clip(adjusted_compactness, HHT_MIN_COMPACTNESS, HHT_MAX_COMPACTNESS)
     
     filtered_segments = []
     for start_bin, end_bin in segments_in_bins:
@@ -3429,8 +3440,8 @@ def _find_energy_split_points(
     List[int]
         List of split point indices within the segment
     """
-    # Compute RMS envelope
-    window_size = int(fs / 10)  # 100ms window
+    # Compute RMS envelope using a 100ms window
+    window_size = int(fs / HHT_RMS_WINDOW_DIVISOR)
     if window_size < 1:
         window_size = 1
     kernel = np.ones(window_size) / window_size
