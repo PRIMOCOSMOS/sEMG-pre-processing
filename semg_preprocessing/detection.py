@@ -22,14 +22,14 @@ from . import hht as hht_module
 # HHT detection constants
 HHT_MIN_TIME_BINS = 128  # Minimum time bins for HHT resolution
 HHT_MAX_TIME_BINS = 2048  # Maximum time bins for HHT resolution
-HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.5  # Factor for adaptive energy threshold
+HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.3  # Factor for adaptive energy threshold (lowered from 0.5 for better detection)
 HHT_MERGE_GAP_MS = 50  # Gap in milliseconds for merging nearby segments
 
 # HHT algorithm parameters - thresholds and bounds
 HHT_MIN_ENERGY_THRESHOLD = 0.3  # Minimum allowed adjusted energy threshold (percentile)
 HHT_MAX_ENERGY_THRESHOLD = 0.95  # Maximum allowed adjusted energy threshold (percentile)
-HHT_NOISE_FLOOR_PERCENTILE = 10  # Percentile for minimum adaptive threshold (noise floor)
-HHT_MAX_THRESHOLD_PERCENTILE = 70  # Percentile for maximum adaptive threshold
+HHT_NOISE_FLOOR_PERCENTILE = 5  # Percentile for minimum adaptive threshold (noise floor, lowered from 10)
+HHT_MAX_THRESHOLD_PERCENTILE = 60  # Percentile for maximum adaptive threshold (lowered from 70)
 HHT_MIN_COMPACTNESS = 0.1  # Minimum allowed temporal compactness
 HHT_MAX_COMPACTNESS = 0.8  # Maximum allowed temporal compactness
 HHT_LOCAL_WINDOW_MIN_SIZE = 5  # Minimum size for local contrast window
@@ -3037,8 +3037,8 @@ def detect_activity_hht(
     fs: float,
     min_duration: float = 0.1,
     max_duration: Optional[float] = None,
-    energy_threshold: float = 0.5,
-    temporal_compactness: float = 0.2,
+    energy_threshold: float = 0.4,
+    temporal_compactness: float = 0.15,
     min_freq: float = 20.0,
     max_freq: float = 450.0,
     resolution_per_second: int = 128,
@@ -3076,13 +3076,13 @@ def detect_activity_hht(
         Maximum duration of muscle activity in seconds (default: None = no limit)
         Typical dumbbell lift actions are usually 1-10 seconds
     energy_threshold : float, optional
-        Percentile threshold for high-energy detection (0-1, default: 0.5)
+        Percentile threshold for high-energy detection (0-1, default: 0.4)
         Higher = more selective (fewer events), lower = more sensitive (more events)
-        Lowered from 0.65 to 0.5 to be less strict and detect more events
+        Lowered from 0.65 to 0.4 to be less strict and detect more events
     temporal_compactness : float, optional
-        Minimum ratio of time bins that must have high energy (0-1, default: 0.2)
+        Minimum ratio of time bins that must have high energy (0-1, default: 0.15)
         This ensures detected regions are temporally compact (not scattered noise)
-        Lowered from 0.3 to 0.2 to include segments with peaks, not just peaks themselves
+        Lowered from 0.3 to 0.15 to include segments with peaks, not just peaks themselves
     min_freq : float, optional
         Minimum frequency for HHT analysis (default: 20.0 Hz for sEMG)
     max_freq : float, optional
