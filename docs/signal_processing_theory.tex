@@ -1,0 +1,674 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{subcaption}
+
+\geometry{margin=1in}
+
+% Code listing style
+\lstdefinestyle{python}{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{red},
+    commentstyle=\color{green!60!black},
+    morecomment=[s]{"""}{"""},
+    morecomment=[s]{'''}{'''},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    frame=single,
+    breaklines=true,
+    breakatwhitespace=false,
+    showstringspaces=false,
+    tabsize=4,
+    captionpos=b
+}
+
+\title{\textbf{sEMG Signal Processing: Mathematical Foundations and Implementation}\\
+\large A Comprehensive Technical Documentation}
+\author{sEMG-preprocessing Library}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive mathematical foundation and implementation details for surface electromyography (sEMG) signal processing. It covers signal filtering, muscle activity event detection using both PELT (Pruned Exact Linear Time) algorithm and Hilbert-Huang Transform (HHT), time-frequency analysis, feature extraction, and data augmentation techniques. The document serves as both a theoretical reference and a practical guide for understanding the signal processing pipeline implemented in this codebase.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%========================================
+\section{Introduction}
+%========================================
+
+Surface electromyography (sEMG) is a non-invasive technique for measuring electrical activity produced by skeletal muscles. The sEMG signal is characterized by:
+\begin{itemize}
+    \item Frequency content typically in the range of 20--450 Hz
+    \item Amplitude variations corresponding to muscle activation intensity
+    \item Non-stationary behavior during dynamic muscle contractions
+    \item Contamination by various noise sources (motion artifacts, power line interference)
+\end{itemize}
+
+This document describes the mathematical principles and algorithms used in the sEMG preprocessing library, covering:
+\begin{enumerate}
+    \item Signal filtering and conditioning
+    \item Muscle activity event detection (PELT and HHT methods)
+    \item Hilbert-Huang Transform for time-frequency analysis
+    \item Feature extraction for pattern recognition
+    \item EMD-based data augmentation
+\end{enumerate}
+
+%========================================
+\section{Signal Filtering}
+%========================================
+
+\subsection{Bandpass Filtering}
+
+The sEMG signal is filtered using a Butterworth bandpass filter to remove both low-frequency artifacts (motion, baseline drift) and high-frequency noise while preserving the muscle activity content.
+
+\subsubsection{Butterworth Filter Design}
+
+The Butterworth filter provides maximally flat frequency response in the passband. The transfer function magnitude is:
+\begin{equation}
+|H(j\omega)|^2 = \frac{1}{1 + \left(\frac{\omega}{\omega_c}\right)^{2n}}
+\end{equation}
+where $n$ is the filter order and $\omega_c$ is the cutoff frequency.
+
+For a bandpass filter with cutoff frequencies $f_L$ (low) and $f_H$ (high), the normalized frequencies are:
+\begin{equation}
+W_L = \frac{2f_L}{f_s}, \quad W_H = \frac{2f_H}{f_s}
+\end{equation}
+where $f_s$ is the sampling frequency.
+
+\subsubsection{Zero-Phase Filtering}
+
+To avoid phase distortion, the library applies the filter in both forward and reverse directions (using \texttt{scipy.signal.filtfilt}):
+\begin{equation}
+y[n] = \mathcal{F}^{-1}\{\mathcal{F}^{-1}\{x[n]\} \cdot H(z)\} \cdot H(z)
+\end{equation}
+
+This results in zero phase shift but doubles the filter order effect.
+
+\subsubsection{Implementation}
+
+\begin{lstlisting}[style=python, caption=Bandpass filter implementation]
+def apply_bandpass_filter(data, fs, lowcut, highcut, order=4):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = signal.butter(order, [low, high], btype='band')
+    filtered_data = signal.filtfilt(b, a, data)
+    return filtered_data
+\end{lstlisting}
+
+\subsection{Notch Filtering (Power Line Interference Removal)}
+
+Power line interference at 50/60 Hz and its harmonics is removed using IIR notch filters.
+
+\subsubsection{Notch Filter Design}
+
+A notch filter rejects a narrow frequency band around the center frequency $f_0$:
+\begin{equation}
+H(z) = \frac{1 - 2\cos(\omega_0)z^{-1} + z^{-2}}{1 - 2r\cos(\omega_0)z^{-1} + r^2 z^{-2}}
+\end{equation}
+where $\omega_0 = 2\pi f_0 / f_s$ and $r$ controls the notch bandwidth (quality factor).
+
+The quality factor $Q$ determines the bandwidth:
+\begin{equation}
+Q = \frac{f_0}{\Delta f}
+\end{equation}
+
+\subsubsection{Harmonic Removal}
+
+Multiple harmonics are removed by cascading notch filters:
+\begin{equation}
+H_{total}(z) = \prod_{k=1}^{N} H_k(z), \quad f_k = k \cdot f_0
+\end{equation}
+
+%========================================
+\section{Muscle Activity Event Detection}
+%========================================
+
+The library implements two complementary approaches for detecting muscle activity events: the PELT algorithm and the HHT-based method.
+
+\subsection{PELT Algorithm (Pruned Exact Linear Time)}
+
+The PELT algorithm detects changepoints in the signal where statistical properties change significantly.
+
+\subsubsection{Cost Function}
+
+For a segment $y_{s:e} = \{y_s, y_{s+1}, \ldots, y_e\}$, the cost function under the $L_2$ model is:
+\begin{equation}
+C(y_{s:e}) = \sum_{i=s}^{e} (y_i - \bar{y}_{s:e})^2
+\end{equation}
+where $\bar{y}_{s:e}$ is the segment mean.
+
+\subsubsection{Optimization Problem}
+
+The optimal segmentation minimizes:
+\begin{equation}
+\min_{\tau_1, \ldots, \tau_m} \left\{ \sum_{i=0}^{m} C(y_{\tau_i:\tau_{i+1}}) + \beta \cdot m \right\}
+\end{equation}
+where $\beta$ is the penalty parameter controlling the number of changepoints.
+
+\subsubsection{Pruning Strategy}
+
+PELT achieves $O(n)$ complexity through dynamic programming with pruning:
+\begin{equation}
+F(s) + C(y_{s:t}) + \beta < F(t) \Rightarrow \text{prune } s
+\end{equation}
+
+\subsubsection{Multi-Detector Ensemble}
+
+The library uses multiple PELT detectors with varying sensitivities:
+\begin{equation}
+\beta_k = \beta_{base} \cdot \alpha_k, \quad k = 1, \ldots, K
+\end{equation}
+
+Detections are fused using:
+\begin{itemize}
+    \item \textbf{Voting}: $D_{final} = \{s : \sum_k \mathbf{1}_{s \in D_k} \geq K/2\}$
+    \item \textbf{Confidence}: Weighted by segment quality scores
+    \item \textbf{Union}: $D_{final} = \bigcup_k D_k$
+\end{itemize}
+
+\subsubsection{Teager-Kaiser Energy Operator (TKEO)}
+
+TKEO enhances signal transitions for better changepoint detection:
+\begin{equation}
+\Psi[x(n)] = x^2(n) - x(n-1) \cdot x(n+1)
+\end{equation}
+
+TKEO emphasizes instantaneous energy and is sensitive to both amplitude and frequency changes:
+\begin{equation}
+\Psi[A\cos(\omega n)] \approx A^2 \omega^2
+\end{equation}
+
+\subsubsection{Implementation Key Points}
+
+\begin{lstlisting}[style=python, caption=PELT detection with TKEO preprocessing]
+def apply_tkeo(signal):
+    n = len(signal)
+    tkeo_signal = np.zeros(n)
+    for i in range(1, n - 1):
+        tkeo_signal[i] = signal[i]**2 - signal[i-1] * signal[i+1]
+    return np.abs(tkeo_signal)
+\end{lstlisting}
+
+\subsection{HHT-Based Event Detection}
+
+The HHT method detects events by analyzing the Hilbert spectrum for high-energy time-frequency patterns.
+
+\subsubsection{Energy-Based Detection}
+
+Time-integrated energy is computed from the Hilbert spectrum:
+\begin{equation}
+E(t) = \sum_f S(f, t)
+\end{equation}
+where $S(f, t)$ is the Hilbert spectrum amplitude at frequency $f$ and time $t$.
+
+\subsubsection{Adaptive Thresholding}
+
+The detection threshold adapts to signal characteristics:
+\begin{equation}
+\theta_{adaptive} = \mu_E + \alpha \cdot \sigma_E
+\end{equation}
+where $\mu_E$ and $\sigma_E$ are the mean and standard deviation of the energy profile, and $\alpha$ is the adaptive threshold factor.
+
+\subsubsection{Local Contrast Energy}
+
+To detect locally prominent events, the algorithm computes local contrast:
+\begin{equation}
+C(t) = \max\left(0, \frac{E(t) - \mu_{local}(t)}{\sigma_{local}(t)}\right)
+\end{equation}
+where $\mu_{local}$ and $\sigma_{local}$ are local neighborhood statistics.
+
+\subsubsection{Combined Energy Criterion}
+
+The final detection criterion combines global and local energy:
+\begin{equation}
+E_{combined}(t) = (1 - w) \cdot \tilde{E}(t) + w \cdot \tilde{C}(t)
+\end{equation}
+where $w$ is the local contrast weight parameter and $\tilde{E}$, $\tilde{C}$ are normalized versions.
+
+\subsubsection{Sensitivity Parameter}
+
+The user-adjustable sensitivity parameter $s$ modifies the detection threshold:
+\begin{equation}
+\theta_{adjusted} = \mu_E + (s \cdot \alpha) \cdot \sigma_E
+\end{equation}
+\begin{itemize}
+    \item $s < 1$: More sensitive (lower threshold, detects weaker events)
+    \item $s = 1$: Default sensitivity
+    \item $s > 1$: Less sensitive (higher threshold, only strong events)
+\end{itemize}
+
+\subsubsection{Temporal Compactness Filtering}
+
+Detected regions are filtered by their temporal compactness:
+\begin{equation}
+\text{compactness} = \frac{\sum_t \mathbf{1}_{E(t) > \theta_{high}}}{T_{segment}}
+\end{equation}
+
+Only segments with compactness above a threshold are retained as true muscle activity events.
+
+%========================================
+\section{Hilbert-Huang Transform (HHT)}
+%========================================
+
+The Hilbert-Huang Transform provides adaptive time-frequency analysis for non-stationary, nonlinear signals like sEMG.
+
+\subsection{Empirical Mode Decomposition (EMD)}
+
+EMD decomposes a signal into Intrinsic Mode Functions (IMFs) through an iterative sifting process.
+
+\subsubsection{IMF Conditions}
+
+A function is an IMF if:
+\begin{enumerate}
+    \item The number of extrema and zero-crossings differ by at most one
+    \item The mean of upper and lower envelopes is approximately zero
+\end{enumerate}
+
+\subsubsection{Sifting Algorithm}
+
+\begin{algorithm}[H]
+\caption{EMD Sifting Process}
+\begin{algorithmic}[1]
+\State Initialize: $h_0 = x(t)$
+\Repeat
+    \State Identify local maxima and minima of $h_k$
+    \State Create upper envelope $e_{upper}$ using cubic spline interpolation
+    \State Create lower envelope $e_{lower}$ using cubic spline interpolation
+    \State Compute mean: $m_k = (e_{upper} + e_{lower})/2$
+    \State Update: $h_{k+1} = h_k - m_k$
+\Until{$h_k$ satisfies IMF conditions}
+\State $c_i = h_k$ (extracted IMF)
+\State $r_i = x - c_i$ (residue)
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Signal Decomposition}
+
+The original signal is expressed as:
+\begin{equation}
+x(t) = \sum_{i=1}^{N} c_i(t) + r_N(t)
+\end{equation}
+where $c_i(t)$ are IMFs and $r_N(t)$ is the residue.
+
+\subsection{CEEMDAN (Complete Ensemble EMD with Adaptive Noise)}
+
+CEEMDAN improves EMD robustness by adding noise-assisted analysis:
+\begin{equation}
+\tilde{c}_k = \frac{1}{M} \sum_{m=1}^{M} c_k^{(m)}
+\end{equation}
+where $c_k^{(m)}$ is the $k$-th IMF from the $m$-th ensemble with added noise.
+
+\subsubsection{Adaptive Noise}
+
+Noise amplitude decreases with IMF level:
+\begin{equation}
+\epsilon_k = \frac{\epsilon_0}{k+1}
+\end{equation}
+
+This provides mode mixing reduction while maintaining signal fidelity.
+
+\subsection{Hilbert Transform}
+
+For each IMF $c_i(t)$, the Hilbert Transform provides the analytic signal:
+\begin{equation}
+\tilde{c}_i(t) = c_i(t) + j \cdot \mathcal{H}\{c_i(t)\}
+\end{equation}
+
+where the Hilbert Transform is:
+\begin{equation}
+\mathcal{H}\{c_i(t)\} = \frac{1}{\pi} \text{P.V.} \int_{-\infty}^{\infty} \frac{c_i(\tau)}{t - \tau} d\tau
+\end{equation}
+
+\subsubsection{Instantaneous Amplitude and Phase}
+
+\begin{align}
+a_i(t) &= |\tilde{c}_i(t)| = \sqrt{c_i^2(t) + \mathcal{H}^2\{c_i(t)\}} \\
+\phi_i(t) &= \arctan\left(\frac{\mathcal{H}\{c_i(t)\}}{c_i(t)}\right)
+\end{align}
+
+\subsubsection{Instantaneous Frequency}
+
+\begin{equation}
+f_i(t) = \frac{1}{2\pi} \frac{d\phi_i(t)}{dt}
+\end{equation}
+
+In practice, unwrapping is applied to handle phase discontinuities:
+\begin{equation}
+f_i(t) = \frac{f_s}{2\pi} \cdot \text{unwrap}(\Delta\phi_i[n])
+\end{equation}
+
+\subsection{Hilbert Spectrum}
+
+The Hilbert spectrum represents time-frequency energy distribution:
+\begin{equation}
+H(f, t) = \sum_{i=1}^{N} a_i^2(t) \cdot \delta(f - f_i(t))
+\end{equation}
+
+In discrete implementation with frequency binning:
+\begin{equation}
+S[k, n] = \sum_{i=1}^{N} a_i[n] \cdot \mathbf{1}_{f_k \leq f_i[n] < f_{k+1}}
+\end{equation}
+
+\subsubsection{sEMG Frequency Mapping}
+
+The spectrum frequency axis is mapped to the valid sEMG range:
+\begin{equation}
+f_k = f_{min} + k \cdot \frac{f_{max} - f_{min}}{N_{freq} - 1}
+\end{equation}
+where $f_{min} = 20$ Hz and $f_{max} = 450$ Hz for typical sEMG.
+
+\subsubsection{Average Pooling for Time Normalization}
+
+To create uniform-sized spectra for CNN input, average pooling is applied:
+\begin{equation}
+S_{pooled}[k, j] = \frac{1}{|W_j|} \sum_{n \in W_j} S[k, n]
+\end{equation}
+where $W_j$ is the $j$-th pooling window.
+
+%========================================
+\section{Feature Extraction}
+%========================================
+
+\subsection{Time-Domain Features}
+
+\subsubsection{Waveform Length (WL)}
+\begin{equation}
+WL = \sum_{n=1}^{N-1} |x[n+1] - x[n]|
+\end{equation}
+
+\subsubsection{Root Mean Square (RMS)}
+\begin{equation}
+RMS = \sqrt{\frac{1}{N} \sum_{n=1}^{N} x^2[n]}
+\end{equation}
+
+\subsubsection{Mean Absolute Value (MAV)}
+\begin{equation}
+MAV = \frac{1}{N} \sum_{n=1}^{N} |x[n]|
+\end{equation}
+
+\subsubsection{Variance (VAR)}
+\begin{equation}
+VAR = \frac{1}{N-1} \sum_{n=1}^{N} (x[n] - \bar{x})^2
+\end{equation}
+
+\subsubsection{Zero Crossings (ZC)}
+\begin{equation}
+ZC = \sum_{n=1}^{N-1} \mathbf{1}_{x[n] \cdot x[n+1] < 0 \text{ and } |x[n] - x[n+1]| > \theta}
+\end{equation}
+
+\subsubsection{Slope Sign Changes (SSC)}
+\begin{equation}
+SSC = \sum_{n=2}^{N-1} \mathbf{1}_{(x[n] - x[n-1])(x[n] - x[n+1]) > \theta}
+\end{equation}
+
+\subsection{Frequency-Domain Features}
+
+Using Welch's method for power spectral density estimation:
+\begin{equation}
+P(f) = \frac{1}{K} \sum_{k=1}^{K} |X_k(f)|^2
+\end{equation}
+
+\subsubsection{Median Frequency (MDF)}
+The frequency dividing the power spectrum into two equal halves:
+\begin{equation}
+\int_{0}^{MDF} P(f) df = \int_{MDF}^{f_s/2} P(f) df = \frac{TTP}{2}
+\end{equation}
+
+\subsubsection{Mean Frequency (MNF)}
+\begin{equation}
+MNF = \frac{\int f \cdot P(f) df}{\int P(f) df} = \frac{\sum_k f_k \cdot P(f_k)}{\sum_k P(f_k)}
+\end{equation}
+
+\subsubsection{Peak Frequency (PKF)}
+\begin{equation}
+PKF = \arg\max_f P(f)
+\end{equation}
+
+\subsubsection{Total Power (TTP)}
+\begin{equation}
+TTP = \int_{f_{min}}^{f_{max}} P(f) df
+\end{equation}
+
+\subsection{Instantaneous Mean Frequency (IMNF)}
+
+IMNF is computed using the Choi-Williams Distribution (CWD):
+\begin{equation}
+IMNF = \frac{\iint f \cdot CWD(t, f) df dt}{\iint CWD(t, f) df dt}
+\end{equation}
+
+The CWD is a time-frequency representation with reduced cross-term interference:
+\begin{equation}
+CWD(t, f) = \iint A(\theta, \tau) \cdot x(u+\tau/2) \cdot x^*(u-\tau/2) \cdot e^{-j2\pi f\tau} d\tau du
+\end{equation}
+where $A(\theta, \tau) = \exp(-\tau^2/(4\sigma))$ is the Choi-Williams kernel.
+
+\subsection{Fatigue Indicators}
+
+\subsubsection{WIRE51 (Wavelet Index of Reliability Estimation)}
+
+Using 5th-order Symlet wavelet decomposition:
+\begin{equation}
+WIRE51 = \frac{E(D_5)}{E(D_1)} = \frac{\sum_n D_5^2[n]}{\sum_n D_1^2[n]}
+\end{equation}
+where $D_i$ is the detail coefficients at level $i$.
+
+Physical interpretation:
+\begin{itemize}
+    \item $D_1$: Highest frequency band ($[f_s/4, f_s/2]$)
+    \item $D_5$: Lower frequency band ($[f_s/64, f_s/32]$)
+    \item Increases with muscle fatigue as power shifts to lower frequencies
+\end{itemize}
+
+\subsubsection{Dimitrov Index (DI)}
+
+Based on spectral moments:
+\begin{equation}
+DI = \frac{M_{-1}}{M_5}
+\end{equation}
+where:
+\begin{equation}
+M_k = \frac{\sum_i f_i^k \cdot P(f_i)}{\sum_i P(f_i)}
+\end{equation}
+
+$M_{-1}$ emphasizes low frequencies (inverse weighting), $M_5$ emphasizes high frequencies (5th power weighting).
+
+%========================================
+\section{Data Augmentation}
+%========================================
+
+\subsection{IMF-Based Augmentation}
+
+\subsubsection{IMF Mixing}
+
+Given two signals decomposed into IMFs:
+\begin{equation}
+x_1 = \sum_i c_{1,i}, \quad x_2 = \sum_i c_{2,i}
+\end{equation}
+
+Augmented signals are created by mixing IMFs:
+\begin{equation}
+x_{aug} = \sum_i \alpha_i \cdot c_{1,i} + (1 - \alpha_i) \cdot c_{2,i}
+\end{equation}
+where $\alpha_i$ are random mixing weights.
+
+\subsubsection{IMF Scaling}
+
+Individual IMFs are scaled randomly:
+\begin{equation}
+x_{aug} = \sum_i \beta_i \cdot c_i
+\end{equation}
+where $\beta_i \sim \text{Uniform}(1-\epsilon, 1+\epsilon)$.
+
+\subsection{Noise Injection}
+
+Additive noise augmentation:
+\begin{equation}
+x_{aug} = x + \gamma \cdot \sigma_x \cdot n
+\end{equation}
+where $n \sim \mathcal{N}(0, 1)$ and $\gamma$ is the noise level parameter.
+
+\subsection{Time Warping}
+
+Non-linear time warping using smooth random curves:
+\begin{equation}
+x_{aug}[n] = x[\tau(n)]
+\end{equation}
+where $\tau(n)$ is a monotonically increasing warping function.
+
+%========================================
+\section{Implementation Details}
+%========================================
+
+\subsection{Key Data Structures}
+
+\begin{itemize}
+    \item \textbf{Signal}: 1D NumPy array
+    \item \textbf{Segments}: List of (start\_index, end\_index) tuples
+    \item \textbf{Hilbert Spectrum}: 2D NumPy array (n\_freq\_bins $\times$ n\_time\_bins)
+    \item \textbf{Features}: Dictionary mapping feature names to values
+\end{itemize}
+
+\subsection{Module Organization}
+
+\begin{itemize}
+    \item \texttt{filters.py}: Bandpass and notch filtering
+    \item \texttt{detection.py}: PELT and HHT event detection
+    \item \texttt{hht.py}: EMD, CEEMDAN, Hilbert Transform, feature extraction
+    \item \texttt{augmentation.py}: Data augmentation methods
+    \item \texttt{utils.py}: Data loading and utility functions
+\end{itemize}
+
+\subsection{Configuration Constants}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+Constant & Value & Description \\
+\midrule
+SEMG\_LOW\_FREQ\_CUTOFF & 20 Hz & Minimum valid sEMG frequency \\
+SEMG\_HIGH\_FREQ\_CUTOFF & 450 Hz & Maximum valid sEMG frequency \\
+DEFAULT\_CEEMDAN\_ENSEMBLES & 30 & Number of ensembles for CEEMDAN \\
+HHT\_MIN\_TIME\_BINS & 128 & Minimum spectrum time resolution \\
+HHT\_MAX\_TIME\_BINS & 2048 & Maximum spectrum time resolution \\
+HHT\_MERGE\_GAP\_MS & 50 & Gap threshold for segment merging \\
+\bottomrule
+\end{tabular}
+\caption{Key configuration constants}
+\end{table}
+
+%========================================
+\section{Usage Examples}
+%========================================
+
+\subsection{Basic Pipeline}
+
+\begin{lstlisting}[style=python, caption=Complete sEMG processing pipeline]
+from semg_preprocessing import (
+    load_csv_data,
+    apply_bandpass_filter,
+    apply_notch_filter,
+    detect_muscle_activity,
+    segment_signal,
+    hht_analysis_enhanced
+)
+
+# Load and preprocess signal
+signal, df = load_csv_data('emg_data.csv', value_column=1)
+fs = 1000  # Hz
+
+# Apply filters
+filtered = apply_bandpass_filter(signal, fs, lowcut=20, highcut=450)
+filtered = apply_notch_filter(filtered, fs, freq=50, harmonics=[1, 2, 3])
+
+# Detect activity events
+segments = detect_muscle_activity(
+    filtered, fs,
+    min_duration=0.5,
+    max_duration=10.0,
+    sensitivity=1.5
+)
+
+# Extract segments and analyze
+segment_data = segment_signal(filtered, segments, fs, include_metadata=True)
+
+# Perform HHT analysis on each segment
+for seg in segment_data:
+    result = hht_analysis_enhanced(seg['data'], fs, extract_features=True)
+    print(f"Features: {result['features']}")
+\end{lstlisting}
+
+\subsection{HHT Event Detection}
+
+\begin{lstlisting}[style=python, caption=HHT-based event detection]
+from semg_preprocessing import detect_activity_hht
+
+# Detect with custom sensitivity
+result = detect_activity_hht(
+    filtered_signal, fs,
+    min_duration=0.5,
+    max_duration=10.0,
+    sensitivity=0.8,  # More sensitive
+    local_contrast_weight=0.4,
+    return_spectrum=True
+)
+
+segments = result['segments']
+spectrum = result['spectrum_log']  # Log-scaled for visualization
+\end{lstlisting}
+
+%========================================
+\section{Conclusion}
+%========================================
+
+This document has presented the mathematical foundations and implementation details of the sEMG signal processing library. The key contributions include:
+
+\begin{enumerate}
+    \item Robust signal filtering for noise removal
+    \item Dual event detection methods (PELT and HHT) with user-adjustable parameters
+    \item Comprehensive time-frequency analysis using HHT
+    \item Rich feature extraction for pattern recognition applications
+    \item EMD-based data augmentation for machine learning
+\end{enumerate}
+
+The library provides a complete pipeline for sEMG signal preprocessing, suitable for applications in gesture recognition, muscle fatigue analysis, and neuromuscular research.
+
+%========================================
+\section*{References}
+%========================================
+
+\begin{enumerate}
+    \item Huang, N.E., et al. (1998). "The empirical mode decomposition and the Hilbert spectrum for nonlinear and non-stationary time series analysis." Proceedings of the Royal Society A.
+    
+    \item Killick, R., Fearnhead, P., \& Eckley, I.A. (2012). "Optimal detection of changepoints with a linear computational cost." Journal of the American Statistical Association.
+    
+    \item Li, X., et al. (2007). "Teager-Kaiser energy operation of surface EMG improves muscle activity onset detection." Annals of Biomedical Engineering.
+    
+    \item Torres, M.E., et al. (2011). "A complete ensemble empirical mode decomposition with adaptive noise." IEEE ICASSP.
+    
+    \item Dimitrov, G.V., et al. (2006). "Muscle fatigue during dynamic contractions assessed by new spectral indices." Medicine \& Science in Sports \& Exercise.
+    
+    \item Choi, H.I. \& Williams, W.J. (1989). "Improved time-frequency representation of multicomponent signals using exponential kernels." IEEE TASSP.
+\end{enumerate}
+
+\end{document}

@@ -376,7 +376,8 @@ class EMGProcessorGUI:
     def detect_activity(self, detection_method, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                        use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
                        use_tkeo, merge_threshold, max_merge_count,
-                       hht_energy_threshold, hht_temporal_compactness, hht_resolution, progress=gr.Progress()):
+                       hht_energy_threshold, hht_temporal_compactness, hht_resolution, 
+                       hht_sensitivity, hht_local_contrast_weight, progress=gr.Progress()):
         """Detect muscle activity segments using PELT or HHT algorithm."""
         try:
             if self.filtered_signal is None:
@@ -473,7 +474,7 @@ class EMGProcessorGUI:
             else:  # HHT method
                 progress(0.3, desc="Computing full-signal HHT...")
                 
-                # Detect muscle activity using HHT method
+                # Detect muscle activity using HHT method with enhanced parameters
                 result = detect_activity_hht(
                     self.filtered_signal,
                     fs=self.fs,
@@ -482,15 +483,20 @@ class EMGProcessorGUI:
                     energy_threshold=float(hht_energy_threshold),
                     temporal_compactness=float(hht_temporal_compactness),
                     resolution_per_second=int(hht_resolution),
+                    sensitivity=float(hht_sensitivity),
+                    local_contrast_weight=float(hht_local_contrast_weight),
                     return_spectrum=True
                 )
                 
                 self.segments = result['segments']
                 spectrum = result['spectrum']
+                spectrum_log = result.get('spectrum_log', np.log1p(spectrum))  # Use log-scaled spectrum for display
                 time_axis = result['time']
                 freq_axis = result['frequency']
                 detection_mask = result['detection_mask']
                 time_energy = result['time_energy']
+                combined_energy = result.get('combined_energy', time_energy)
+                threshold_info = result.get('threshold_info', {})
                 
                 # Get detailed segment information
                 progress(0.6, desc="Extracting segment information...")
@@ -501,31 +507,50 @@ class EMGProcessorGUI:
                     include_metadata=True
                 )
                 
-                # Create multi-panel visualization
+                # Create multi-panel visualization with improved colormap
                 progress(0.8, desc="Creating visualization...")
                 fig, axes = plt.subplots(3, 1, figsize=(12, 14))
                 
-                # Panel 1: Hilbert Spectrum with detection mask
+                # Panel 1: Hilbert Spectrum with colored logarithmic display
                 ax1 = axes[0]
-                im = ax1.pcolormesh(time_axis, freq_axis, spectrum, shading='auto', cmap='jet', alpha=0.8)
-                # Overlay detection mask
+                # Use log-scaled spectrum for better visualization
+                im = ax1.pcolormesh(time_axis, freq_axis, spectrum_log, shading='auto', cmap='jet', alpha=0.9)
+                # Overlay detection mask with white contour
                 ax1.contour(time_axis, freq_axis, detection_mask, levels=[0.5], colors='white', linewidths=2)
-                ax1.set_xlabel('Time (s)')
-                ax1.set_ylabel('Frequency (Hz)')
-                ax1.set_title('Hilbert Spectrum with Detected Regions (white contour)')
-                plt.colorbar(im, ax=ax1, label='Log Amplitude')
+                ax1.set_xlabel('Time (s)', fontsize=11)
+                ax1.set_ylabel('Frequency (Hz)', fontsize=11)
+                ax1.set_title('Hilbert Spectrum (Log Scale) with Detected Regions', fontsize=12, fontweight='bold')
+                cbar = plt.colorbar(im, ax=ax1)
+                cbar.set_label('Log Amplitude', fontsize=10)
                 
-                # Panel 2: Time energy profile with detection
+                # Panel 2: Time energy profile with detection and threshold visualization
                 ax2 = axes[1]
                 time_bins = np.arange(len(time_energy))
-                ax2.plot(time_axis, time_energy, 'b-', linewidth=1, label='Time Energy')
+                # Normalize for display
+                if np.max(time_energy) > 0:
+                    time_energy_norm = time_energy / np.max(time_energy)
+                else:
+                    time_energy_norm = time_energy
+                if np.max(combined_energy) > 0:
+                    combined_norm = combined_energy / np.max(combined_energy)
+                else:
+                    combined_norm = combined_energy
+                
+                ax2.plot(time_axis, time_energy_norm, 'b-', linewidth=1, alpha=0.6, label='Global Energy')
+                ax2.plot(time_axis, combined_norm, 'g-', linewidth=1.5, label='Combined (Global+Local)')
+                
+                # Show adaptive threshold line
+                adaptive_thresh = threshold_info.get('adaptive_threshold', np.mean(combined_norm))
+                ax2.axhline(y=adaptive_thresh, color='r', linestyle='--', linewidth=1.5, 
+                           label=f'Threshold ({adaptive_thresh:.2f})')
+                
                 # Mark detected regions
                 active_bins = result['active_time_bins']
-                ax2.fill_between(time_axis, 0, time_energy, where=active_bins, alpha=0.3, color='red', label='Detected')
-                ax2.set_xlabel('Time (s)')
-                ax2.set_ylabel('Energy')
-                ax2.set_title('Time-Integrated Energy Profile')
-                ax2.legend()
+                ax2.fill_between(time_axis, 0, combined_norm, where=active_bins, alpha=0.3, color='red', label='Detected')
+                ax2.set_xlabel('Time (s)', fontsize=11)
+                ax2.set_ylabel('Normalized Energy', fontsize=11)
+                ax2.set_title('Time-Integrated Energy Profile with Detection Threshold', fontsize=12, fontweight='bold')
+                ax2.legend(loc='upper right', fontsize=9)
                 ax2.grid(True, alpha=0.3)
                 
                 # Panel 3: Original signal with detected segments
@@ -539,24 +564,35 @@ class EMGProcessorGUI:
                     ax3.axvspan(start/self.fs, end/self.fs, alpha=0.3, color=colors[i % len(colors)],
                               label=f'Segment {i+1}' if i < 5 else '')
                 
-                ax3.set_xlabel('Time (s)')
-                ax3.set_ylabel('Amplitude')
-                ax3.set_title(f'Detected Muscle Activity Segments on Original Signal ({len(self.segments)} segments)')
+                ax3.set_xlabel('Time (s)', fontsize=11)
+                ax3.set_ylabel('Amplitude', fontsize=11)
+                ax3.set_title(f'Detected Muscle Activity Segments ({len(self.segments)} segments)', fontsize=12, fontweight='bold')
                 ax3.grid(True, alpha=0.3)
                 if self.segments:
-                    ax3.legend(loc='upper right', ncol=2)
+                    ax3.legend(loc='upper right', ncol=2, fontsize=9)
                 
                 plt.tight_layout()
                 
-                # Create info text
+                # Create info text with enhanced information
                 progress(0.9, desc="Formatting results...")
                 info = f"✅ **HHT Detection**: {len(self.segments)} muscle activity segments detected:\n\n"
-                info += f"**Spectrum parameters:**\n"
+                info += f"**Algorithm Parameters:**\n"
+                info += f"- Sensitivity: {hht_sensitivity:.2f} (lower = more events)\n"
+                info += f"- Energy threshold: {hht_energy_threshold*100:.0f}th percentile\n"
+                info += f"- Local contrast weight: {hht_local_contrast_weight:.2f}\n"
+                info += f"- Temporal compactness: {hht_temporal_compactness:.2f}\n"
+                info += f"- Duration constraints: {min_duration:.2f}s - {max_dur if max_dur else '∞'}s\n\n"
+                
+                info += f"**Spectrum Info:**\n"
                 info += f"- Resolution: {spectrum.shape[1]} time bins × {spectrum.shape[0]} freq bins\n"
                 info += f"- Frequency range: {freq_axis[0]:.1f} - {freq_axis[-1]:.1f} Hz\n"
-                info += f"- Energy threshold: {hht_energy_threshold*100:.0f}th percentile\n"
-                info += f"- Temporal compactness: {hht_temporal_compactness:.2f}\n\n"
                 
+                if threshold_info:
+                    info += f"- Effective threshold: {threshold_info.get('adaptive_threshold', 0):.3f}\n\n"
+                else:
+                    info += "\n"
+                
+                info += f"**Detected Segments:**\n"
                 for i, seg in enumerate(self.segment_data[:10], 1):
                     info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
                     info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
@@ -573,7 +609,8 @@ class EMGProcessorGUI:
     def detect_batch_activity(self, detection_method, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                              use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
                              use_tkeo, merge_threshold, max_merge_count,
-                             hht_energy_threshold, hht_temporal_compactness, hht_resolution, progress=gr.Progress()):
+                             hht_energy_threshold, hht_temporal_compactness, hht_resolution,
+                             hht_sensitivity, hht_local_contrast_weight, progress=gr.Progress()):
         """Detect muscle activity in all batch-filtered files using PELT or HHT algorithm."""
         try:
             if not self.batch_filtered:
@@ -641,7 +678,7 @@ class EMGProcessorGUI:
                 for i, data in enumerate(self.batch_filtered):
                     progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']} (HHT)...")
                     
-                    # Detect muscle activity using HHT method
+                    # Detect muscle activity using HHT method with enhanced parameters
                     segments = detect_activity_hht(
                         data['filtered'],
                         fs=self.fs,
@@ -650,6 +687,8 @@ class EMGProcessorGUI:
                         energy_threshold=float(hht_energy_threshold),
                         temporal_compactness=float(hht_temporal_compactness),
                         resolution_per_second=int(hht_resolution),
+                        sensitivity=float(hht_sensitivity),
+                        local_contrast_weight=float(hht_local_contrast_weight),
                         return_spectrum=False  # Don't return spectrum for batch processing
                     )
                     
@@ -2216,10 +2255,20 @@ def create_gui():
                                 
                                 # HHT-specific parameters
                                 gr.Markdown("**HHT Algorithm Parameters:**")
+                                hht_sensitivity_input = gr.Slider(
+                                    0.1, 3.0, value=1.0, step=0.1,
+                                    label="HHT Detection Sensitivity",
+                                    info="Lower = detect more events (0.5=sensitive), Higher = stricter (2.0=strict)"
+                                )
                                 hht_energy_threshold_input = gr.Slider(
                                     0.5, 0.9, value=0.65, step=0.05,
                                     label="Energy Threshold Percentile",
                                     info="Only for HHT. Higher = more selective detection (0.5-0.9)"
+                                )
+                                hht_local_contrast_weight_input = gr.Slider(
+                                    0.0, 0.7, value=0.3, step=0.1,
+                                    label="Local Contrast Weight",
+                                    info="Weight for local energy contrast (0=global only, 0.5=balanced)"
                                 )
                                 hht_temporal_compactness_input = gr.Slider(
                                     0.1, 0.7, value=0.3, step=0.05,
@@ -2244,7 +2293,8 @@ def create_gui():
                                    n_detectors_input, fusion_method_input, use_multi_detector_input,
                                    use_clustering_input, detector_sens_input, classification_threshold_input,
                                    use_tkeo_input, merge_threshold_input, max_merge_count_input,
-                                   hht_energy_threshold_input, hht_temporal_compactness_input, hht_resolution_input],
+                                   hht_energy_threshold_input, hht_temporal_compactness_input, hht_resolution_input,
+                                   hht_sensitivity_input, hht_local_contrast_weight_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
@@ -2313,10 +2363,20 @@ def create_gui():
                                 
                                 # HHT-specific parameters for batch
                                 gr.Markdown("**HHT Algorithm Parameters:**")
+                                batch_hht_sensitivity_input = gr.Slider(
+                                    0.1, 3.0, value=1.0, step=0.1,
+                                    label="HHT Detection Sensitivity",
+                                    info="Lower = detect more events, Higher = stricter"
+                                )
                                 batch_hht_energy_threshold_input = gr.Slider(
                                     0.5, 0.9, value=0.65, step=0.05,
                                     label="Energy Threshold Percentile",
                                     info="Only for HHT. Higher = more selective"
+                                )
+                                batch_hht_local_contrast_weight_input = gr.Slider(
+                                    0.0, 0.7, value=0.3, step=0.1,
+                                    label="Local Contrast Weight",
+                                    info="Weight for local energy contrast"
                                 )
                                 batch_hht_temporal_compactness_input = gr.Slider(
                                     0.1, 0.7, value=0.3, step=0.05,
@@ -2341,7 +2401,8 @@ def create_gui():
                                    batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
                                    batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input,
                                    batch_use_tkeo_input, batch_merge_threshold_input, batch_max_merge_count_input,
-                                   batch_hht_energy_threshold_input, batch_hht_temporal_compactness_input, batch_hht_resolution_input],
+                                   batch_hht_energy_threshold_input, batch_hht_temporal_compactness_input, batch_hht_resolution_input,
+                                   batch_hht_sensitivity_input, batch_hht_local_contrast_weight_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         
