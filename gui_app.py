@@ -34,6 +34,7 @@ from semg_preprocessing import (
     apply_bandpass_filter,
     apply_notch_filter,
     detect_muscle_activity,
+    detect_activity_hht,
     segment_signal,
     save_processed_data,
     export_segments_to_csv,
@@ -372,10 +373,11 @@ class EMGProcessorGUI:
             import traceback
             return f"❌ Error applying batch filters: {str(e)}\n{traceback.format_exc()}", None
     
-    def detect_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
+    def detect_activity(self, detection_method, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
                        use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
-                       use_tkeo, merge_threshold, max_merge_count, progress=gr.Progress()):
-        """Detect muscle activity segments using advanced PELT algorithm."""
+                       use_tkeo, merge_threshold, max_merge_count,
+                       hht_energy_threshold, hht_temporal_compactness, hht_resolution, progress=gr.Progress()):
+        """Detect muscle activity segments using PELT or HHT algorithm."""
         try:
             if self.filtered_signal is None:
                 return "❌ Please apply filters first", None
@@ -385,126 +387,22 @@ class EMGProcessorGUI:
             # Convert max_duration (None or float)
             max_dur = float(max_duration) if max_duration and max_duration > 0 else None
             
-            # Parse individual detector sensitivities if provided
-            detector_sensitivities = None
-            if use_multi_detector and detector_sens_str and detector_sens_str.strip():
-                try:
-                    # Parse comma-separated values
-                    detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
-                    if len(detector_sensitivities) != n_detectors:
-                        return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
-                except ValueError:
-                    return "❌ Invalid detector sensitivities format. Use comma-separated numbers (e.g., 1.0, 1.5, 2.0)", None
-            
-            # Detect muscle activity using combined method (only supported method now)
-            progress(0.3, desc="Detecting muscle activity with PELT...")
-            result = detect_muscle_activity(
-                self.filtered_signal,
-                fs=self.fs,
-                method="combined",
-                min_duration=float(min_duration),
-                max_duration=max_dur,
-                sensitivity=float(sensitivity),
-                n_detectors=int(n_detectors),
-                detector_sensitivities=detector_sensitivities,
-                fusion_method=fusion_method,
-                use_multi_detector=use_multi_detector,
-                classify_segments=True,
-                use_clustering=use_clustering,
-                classification_threshold=float(classification_threshold),
-                use_tkeo=use_tkeo,
-                merge_threshold=float(merge_threshold),
-                max_merge_count=int(max_merge_count),
-                return_changepoints=True
-            )
-            
-            # Extract segments and changepoints from result
-            self.segments = result['segments']
-            changepoints = result['changepoints']
-            
-            # Get detailed segment information
-            progress(0.6, desc="Extracting segment information...")
-            self.segment_data = segment_signal(
-                self.filtered_signal,
-                self.segments,
-                fs=self.fs,
-                include_metadata=True
-            )
-            
-            # Create visualization
-            progress(0.8, desc="Creating visualization...")
-            fig, ax = plt.subplots(figsize=(12, 6))
-            time = np.arange(len(self.filtered_signal)) / self.fs
-            
-            ax.plot(time, self.filtered_signal, 'k-', linewidth=0.5, alpha=0.5, label='Filtered Signal')
-            
-            # Mark all PELT changepoints with vertical lines
-            for cp in changepoints:
-                ax.axvline(cp/self.fs, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
-            
-            # Highlight detected segments
-            colors = plt.cm.Set1(np.linspace(0, 1, max(len(self.segments), 1)))
-            for i, (start, end) in enumerate(self.segments):
-                ax.axvspan(start/self.fs, end/self.fs, alpha=0.3, color=colors[i % len(colors)],
-                          label=f'Segment {i+1}' if i < 5 else '')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Amplitude')
-            ax.set_title(f'Muscle Activity Detection ({len(self.segments)} active segments, {len(changepoints)} changepoints)')
-            ax.grid(True, alpha=0.3)
-            if self.segments:
-                ax.legend(loc='upper right', ncol=2)
-            
-            plt.tight_layout()
-            
-            # Create info text
-            progress(0.9, desc="Formatting results...")
-            info = f"✅ Detected {len(self.segments)} muscle activity segments from {len(changepoints)} PELT changepoints:\n\n"
-            for i, seg in enumerate(self.segment_data[:10], 1):
-                info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
-                info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
-            
-            if len(self.segment_data) > 10:
-                info += f"\n... and {len(self.segment_data) - 10} more segments"
-            
-            progress(1.0, desc="Complete!")
-            return info.strip(), fig
-        except Exception as e:
-            import traceback
-            return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
-    
-    def detect_batch_activity(self, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
-                             use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
-                             use_tkeo, merge_threshold, max_merge_count, progress=gr.Progress()):
-        """Detect muscle activity in all batch-filtered files using advanced PELT algorithm."""
-        try:
-            if not self.batch_filtered:
-                return "❌ Please apply batch filters first", None
-            
-            self.batch_segments = []
-            total_segments = 0
-            
-            progress(0.1, desc="Starting batch detection...")
-            
-            # Convert max_duration
-            max_dur = float(max_duration) if max_duration and max_duration > 0 else None
-            
-            # Parse individual detector sensitivities if provided
-            detector_sensitivities = None
-            if use_multi_detector and detector_sens_str and detector_sens_str.strip():
-                try:
-                    detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
-                    if len(detector_sensitivities) != n_detectors:
-                        return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
-                except ValueError:
-                    return "❌ Invalid detector sensitivities format. Use comma-separated numbers", None
-            
-            for i, data in enumerate(self.batch_filtered):
-                progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']}...")
+            if detection_method == "PELT":
+                # Parse individual detector sensitivities if provided
+                detector_sensitivities = None
+                if use_multi_detector and detector_sens_str and detector_sens_str.strip():
+                    try:
+                        # Parse comma-separated values
+                        detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
+                        if len(detector_sensitivities) != n_detectors:
+                            return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
+                    except ValueError:
+                        return "❌ Invalid detector sensitivities format. Use comma-separated numbers (e.g., 1.0, 1.5, 2.0)", None
                 
-                # Detect muscle activity using combined method
-                segments = detect_muscle_activity(
-                    data['filtered'],
+                # Detect muscle activity using PELT method
+                progress(0.3, desc="Detecting muscle activity with PELT...")
+                result = detect_muscle_activity(
+                    self.filtered_signal,
                     fs=self.fs,
                     method="combined",
                     min_duration=float(min_duration),
@@ -519,24 +417,257 @@ class EMGProcessorGUI:
                     classification_threshold=float(classification_threshold),
                     use_tkeo=use_tkeo,
                     merge_threshold=float(merge_threshold),
-                    max_merge_count=int(max_merge_count)
+                    max_merge_count=int(max_merge_count),
+                    return_changepoints=True
                 )
                 
+                # Extract segments and changepoints from result
+                self.segments = result['segments']
+                changepoints = result['changepoints']
+                
                 # Get detailed segment information
-                segment_data = segment_signal(
-                    data['filtered'],
-                    segments,
+                progress(0.6, desc="Extracting segment information...")
+                self.segment_data = segment_signal(
+                    self.filtered_signal,
+                    self.segments,
                     fs=self.fs,
                     include_metadata=True
                 )
                 
-                self.batch_segments.append({
-                    'filename': data['filename'],
-                    'filtered': data['filtered'],
-                    'segments': segments,
-                    'segment_data': segment_data
-                })
-                total_segments += len(segments)
+                # Create visualization
+                progress(0.8, desc="Creating visualization...")
+                fig, ax = plt.subplots(figsize=(12, 6))
+                time = np.arange(len(self.filtered_signal)) / self.fs
+                
+                ax.plot(time, self.filtered_signal, 'k-', linewidth=0.5, alpha=0.5, label='Filtered Signal')
+                
+                # Mark all PELT changepoints with vertical lines
+                for cp in changepoints:
+                    ax.axvline(cp/self.fs, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+                
+                # Highlight detected segments
+                colors = plt.cm.Set1(np.linspace(0, 1, max(len(self.segments), 1)))
+                for i, (start, end) in enumerate(self.segments):
+                    ax.axvspan(start/self.fs, end/self.fs, alpha=0.3, color=colors[i % len(colors)],
+                              label=f'Segment {i+1}' if i < 5 else '')
+                
+                ax.set_xlabel('Time (s)')
+                ax.set_ylabel('Amplitude')
+                ax.set_title(f'PELT Detection: {len(self.segments)} active segments, {len(changepoints)} changepoints')
+                ax.grid(True, alpha=0.3)
+                if self.segments:
+                    ax.legend(loc='upper right', ncol=2)
+                
+                plt.tight_layout()
+                
+                # Create info text
+                progress(0.9, desc="Formatting results...")
+                info = f"✅ **PELT Detection**: {len(self.segments)} muscle activity segments from {len(changepoints)} changepoints:\n\n"
+                for i, seg in enumerate(self.segment_data[:10], 1):
+                    info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
+                    info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
+                
+                if len(self.segment_data) > 10:
+                    info += f"\n... and {len(self.segment_data) - 10} more segments"
+                
+            else:  # HHT method
+                progress(0.3, desc="Computing full-signal HHT...")
+                
+                # Detect muscle activity using HHT method
+                result = detect_activity_hht(
+                    self.filtered_signal,
+                    fs=self.fs,
+                    min_duration=float(min_duration),
+                    max_duration=max_dur,
+                    energy_threshold=float(hht_energy_threshold),
+                    temporal_compactness=float(hht_temporal_compactness),
+                    resolution_per_second=int(hht_resolution),
+                    return_spectrum=True
+                )
+                
+                self.segments = result['segments']
+                spectrum = result['spectrum']
+                time_axis = result['time']
+                freq_axis = result['frequency']
+                detection_mask = result['detection_mask']
+                time_energy = result['time_energy']
+                
+                # Get detailed segment information
+                progress(0.6, desc="Extracting segment information...")
+                self.segment_data = segment_signal(
+                    self.filtered_signal,
+                    self.segments,
+                    fs=self.fs,
+                    include_metadata=True
+                )
+                
+                # Create multi-panel visualization
+                progress(0.8, desc="Creating visualization...")
+                fig, axes = plt.subplots(3, 1, figsize=(12, 14))
+                
+                # Panel 1: Hilbert Spectrum with detection mask
+                ax1 = axes[0]
+                im = ax1.pcolormesh(time_axis, freq_axis, spectrum, shading='auto', cmap='jet', alpha=0.8)
+                # Overlay detection mask
+                ax1.contour(time_axis, freq_axis, detection_mask, levels=[0.5], colors='white', linewidths=2)
+                ax1.set_xlabel('Time (s)')
+                ax1.set_ylabel('Frequency (Hz)')
+                ax1.set_title('Hilbert Spectrum with Detected Regions (white contour)')
+                plt.colorbar(im, ax=ax1, label='Log Amplitude')
+                
+                # Panel 2: Time energy profile with detection
+                ax2 = axes[1]
+                time_bins = np.arange(len(time_energy))
+                ax2.plot(time_axis, time_energy, 'b-', linewidth=1, label='Time Energy')
+                # Mark detected regions
+                active_bins = result['active_time_bins']
+                ax2.fill_between(time_axis, 0, time_energy, where=active_bins, alpha=0.3, color='red', label='Detected')
+                ax2.set_xlabel('Time (s)')
+                ax2.set_ylabel('Energy')
+                ax2.set_title('Time-Integrated Energy Profile')
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+                
+                # Panel 3: Original signal with detected segments
+                ax3 = axes[2]
+                time = np.arange(len(self.filtered_signal)) / self.fs
+                ax3.plot(time, self.filtered_signal, 'k-', linewidth=0.5, alpha=0.5, label='Filtered Signal')
+                
+                # Highlight detected segments
+                colors = plt.cm.Set1(np.linspace(0, 1, max(len(self.segments), 1)))
+                for i, (start, end) in enumerate(self.segments):
+                    ax3.axvspan(start/self.fs, end/self.fs, alpha=0.3, color=colors[i % len(colors)],
+                              label=f'Segment {i+1}' if i < 5 else '')
+                
+                ax3.set_xlabel('Time (s)')
+                ax3.set_ylabel('Amplitude')
+                ax3.set_title(f'Detected Muscle Activity Segments on Original Signal ({len(self.segments)} segments)')
+                ax3.grid(True, alpha=0.3)
+                if self.segments:
+                    ax3.legend(loc='upper right', ncol=2)
+                
+                plt.tight_layout()
+                
+                # Create info text
+                progress(0.9, desc="Formatting results...")
+                info = f"✅ **HHT Detection**: {len(self.segments)} muscle activity segments detected:\n\n"
+                info += f"**Spectrum parameters:**\n"
+                info += f"- Resolution: {spectrum.shape[1]} time bins × {spectrum.shape[0]} freq bins\n"
+                info += f"- Frequency range: {freq_axis[0]:.1f} - {freq_axis[-1]:.1f} Hz\n"
+                info += f"- Energy threshold: {hht_energy_threshold*100:.0f}th percentile\n"
+                info += f"- Temporal compactness: {hht_temporal_compactness:.2f}\n\n"
+                
+                for i, seg in enumerate(self.segment_data[:10], 1):
+                    info += f"**Segment {i}**: {seg['start_time']:.3f}s - {seg['end_time']:.3f}s "
+                    info += f"(duration: {seg['duration']:.3f}s, peak: {seg['peak_amplitude']:.3f}, RMS: {seg['rms']:.3f})\n"
+                
+                if len(self.segment_data) > 10:
+                    info += f"\n... and {len(self.segment_data) - 10} more segments"
+            
+            progress(1.0, desc="Complete!")
+            return info.strip(), fig
+        except Exception as e:
+            import traceback
+            return f"❌ Error detecting activity: {str(e)}\n{traceback.format_exc()}", None
+    
+    def detect_batch_activity(self, detection_method, min_duration, max_duration, sensitivity, n_detectors, fusion_method, 
+                             use_multi_detector, use_clustering, detector_sens_str, classification_threshold,
+                             use_tkeo, merge_threshold, max_merge_count,
+                             hht_energy_threshold, hht_temporal_compactness, hht_resolution, progress=gr.Progress()):
+        """Detect muscle activity in all batch-filtered files using PELT or HHT algorithm."""
+        try:
+            if not self.batch_filtered:
+                return "❌ Please apply batch filters first", None
+            
+            self.batch_segments = []
+            total_segments = 0
+            
+            progress(0.1, desc="Starting batch detection...")
+            
+            # Convert max_duration
+            max_dur = float(max_duration) if max_duration and max_duration > 0 else None
+            
+            if detection_method == "PELT":
+                # Parse individual detector sensitivities if provided
+                detector_sensitivities = None
+                if use_multi_detector and detector_sens_str and detector_sens_str.strip():
+                    try:
+                        detector_sensitivities = [float(x.strip()) for x in detector_sens_str.split(',')]
+                        if len(detector_sensitivities) != n_detectors:
+                            return f"❌ Number of detector sensitivities ({len(detector_sensitivities)}) must match number of detectors ({n_detectors})", None
+                    except ValueError:
+                        return "❌ Invalid detector sensitivities format. Use comma-separated numbers", None
+                
+                for i, data in enumerate(self.batch_filtered):
+                    progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']} (PELT)...")
+                    
+                    # Detect muscle activity using PELT method
+                    segments = detect_muscle_activity(
+                        data['filtered'],
+                        fs=self.fs,
+                        method="combined",
+                        min_duration=float(min_duration),
+                        max_duration=max_dur,
+                        sensitivity=float(sensitivity),
+                        n_detectors=int(n_detectors),
+                        detector_sensitivities=detector_sensitivities,
+                        fusion_method=fusion_method,
+                        use_multi_detector=use_multi_detector,
+                        classify_segments=True,
+                        use_clustering=use_clustering,
+                        classification_threshold=float(classification_threshold),
+                        use_tkeo=use_tkeo,
+                        merge_threshold=float(merge_threshold),
+                        max_merge_count=int(max_merge_count)
+                    )
+                    
+                    # Get detailed segment information
+                    segment_data = segment_signal(
+                        data['filtered'],
+                        segments,
+                        fs=self.fs,
+                        include_metadata=True
+                    )
+                    
+                    self.batch_segments.append({
+                        'filename': data['filename'],
+                        'filtered': data['filtered'],
+                        'segments': segments,
+                        'segment_data': segment_data
+                    })
+                    total_segments += len(segments)
+            
+            else:  # HHT method
+                for i, data in enumerate(self.batch_filtered):
+                    progress((i + 1) / len(self.batch_filtered) * 0.7, desc=f"Detecting in {data['filename']} (HHT)...")
+                    
+                    # Detect muscle activity using HHT method
+                    segments = detect_activity_hht(
+                        data['filtered'],
+                        fs=self.fs,
+                        min_duration=float(min_duration),
+                        max_duration=max_dur,
+                        energy_threshold=float(hht_energy_threshold),
+                        temporal_compactness=float(hht_temporal_compactness),
+                        resolution_per_second=int(hht_resolution),
+                        return_spectrum=False  # Don't return spectrum for batch processing
+                    )
+                    
+                    # Get detailed segment information
+                    segment_data = segment_signal(
+                        data['filtered'],
+                        segments,
+                        fs=self.fs,
+                        include_metadata=True
+                    )
+                    
+                    self.batch_segments.append({
+                        'filename': data['filename'],
+                        'filtered': data['filtered'],
+                        'segments': segments,
+                        'segment_data': segment_data
+                    })
+                    total_segments += len(segments)
             
             progress(0.8, desc="Creating visualization...")
             
@@ -574,7 +705,7 @@ class EMGProcessorGUI:
 ✅ Batch detection complete!
 - Files processed: {len(self.batch_segments)}
 - Total segments detected: {total_segments}
-- Method: {method}
+- Method: {detection_method}
 
 **Detection results:**
 """
@@ -1509,6 +1640,180 @@ The CSV contains all extracted features for each segment.
             import traceback
             return f"❌ Error exporting features: {str(e)}\n{traceback.format_exc()}"
     
+    def analyze_segment_features_hht(self, file_objs, fs, value_column, has_header, skip_rows,
+                                     n_freq_bins, normalize_length, use_ceemdan, progress=gr.Progress()):
+        """
+        Perform batch HHT analysis on uploaded sEMG segment files.
+        Each segment is independently processed with HHT and features are extracted.
+        """
+        try:
+            if file_objs is None or len(file_objs) == 0:
+                return "❌ Please upload segment files", None
+            
+            progress(0.1, desc="Loading segment files...")
+            
+            # Load all segment files
+            segments = []
+            filenames = []
+            
+            for file_obj in file_objs:
+                try:
+                    signal, df = load_signal_file(
+                        file_obj.name,
+                        value_column=int(value_column),
+                        has_header=has_header,
+                        skip_rows=int(skip_rows)
+                    )
+                    segments.append(signal)
+                    filenames.append(os.path.basename(file_obj.name))
+                except Exception as e:
+                    print(f"Warning: Failed to load {file_obj.name}: {e}")
+            
+            if len(segments) == 0:
+                return "❌ No valid segment files loaded", None
+            
+            progress(0.2, desc=f"Computing HHT for {len(segments)} segment(s)...")
+            
+            # Perform batch HHT analysis
+            self.segment_features_hht = batch_hht_analysis(
+                segments,
+                fs=float(fs),
+                n_freq_bins=int(n_freq_bins),
+                normalize_length=int(normalize_length),
+                use_ceemdan=use_ceemdan
+            )
+            
+            # Store filenames for export
+            self.segment_features_hht['filenames'] = filenames
+            self.segment_features_hht['fs'] = float(fs)
+            
+            progress(0.8, desc="Creating visualization...")
+            
+            # Create visualization with a subset of spectra
+            spectra_list = self.segment_features_hht['spectra']
+            features_list = self.segment_features_hht['features']
+            time_axis = self.segment_features_hht['time']
+            freq_axis = self.segment_features_hht['frequency']
+            
+            n_show = min(6, len(spectra_list))
+            n_cols = 2
+            n_rows = (n_show + 1) // 2
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, n_rows * 4))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            
+            for i in range(n_show):
+                row, col = i // n_cols, i % n_cols
+                ax = axes[row, col]
+                
+                spectrum = spectra_list[i]
+                
+                im = ax.pcolormesh(time_axis, freq_axis, spectrum, shading='auto', cmap='jet')
+                ax.set_xlabel('Time (normalized)')
+                ax.set_ylabel('Frequency (Hz)')
+                ax.set_title(f'{filenames[i]} (Seg {i+1})', fontsize=10)
+                plt.colorbar(im, ax=ax, label='Log Amplitude')
+            
+            # Hide unused subplots
+            for i in range(n_show, n_rows * n_cols):
+                row, col = i // n_cols, i % n_cols
+                axes[row, col].axis('off')
+            
+            plt.tight_layout()
+            
+            progress(1.0, desc="Complete!")
+            
+            # Create summary info
+            info = f"""
+✅ Batch HHT Analysis Complete!
+
+**Summary:**
+- Total segments: {len(segments)}
+- Decomposition: {"CEEMDAN" if use_ceemdan else "EMD"}
+- Spectrum size: {n_freq_bins} × {normalize_length}
+- Frequency range: 20-450 Hz
+
+**Features Summary (first 4 segments):**
+"""
+            for i, (features, filename) in enumerate(zip(features_list[:4], filenames[:4])):
+                info += f"\n*{filename}:*\n"
+                info += f"  WL={features['WL']:.2f}, ZC={features['ZC']}, SSC={features['SSC']}\n"
+                info += f"  MDF={features['MDF']:.1f}Hz, MNF={features['MNF']:.1f}Hz, IMNF={features['IMNF']:.1f}Hz\n"
+                info += f"  RMS={features['RMS']:.4f}, WIRE51={features['WIRE51']:.2f}\n"
+            
+            if len(segments) > 4:
+                info += f"\n... and {len(segments) - 4} more segments"
+            
+            return info.strip(), fig
+            
+        except Exception as e:
+            import traceback
+            return f"❌ Error in batch HHT analysis: {str(e)}\n{traceback.format_exc()}", None
+    
+    def export_segment_features_hht_csv(self, output_path, progress=gr.Progress()):
+        """Export HHT features from uploaded segments to CSV."""
+        try:
+            if not hasattr(self, 'segment_features_hht') or self.segment_features_hht is None:
+                return "❌ Please run HHT analysis first"
+            
+            progress(0.2, desc="Preparing HHT features for export...")
+            
+            features_list = self.segment_features_hht['features']
+            filenames = self.segment_features_hht['filenames']
+            
+            # Create DataFrame
+            df_data = []
+            for i, features in enumerate(features_list):
+                row = {
+                    'Segment': i + 1,
+                    'Filename': filenames[i],
+                    'WL': features['WL'],
+                    'ZC': features['ZC'],
+                    'SSC': features['SSC'],
+                    'RMS': features['RMS'],
+                    'MAV': features['MAV'],
+                    'VAR': features['VAR'],
+                    'MDF': features['MDF'],
+                    'MNF': features['MNF'],
+                    'IMNF': features['IMNF'],
+                    'PKF': features['PKF'],
+                    'TTP': features['TTP'],
+                    'DI': features['DI'],
+                    'WIRE51': features['WIRE51']
+                }
+                df_data.append(row)
+            
+            df = pd.DataFrame(df_data)
+            
+            progress(0.6, desc="Writing CSV file...")
+            
+            # Handle output path - if it's a directory, append default filename
+            if os.path.isdir(output_path) or (not output_path.endswith('.csv') and not os.path.exists(output_path)):
+                # It's a directory path, add default filename
+                output_path = os.path.join(output_path, 'segment_hht_features.csv')
+            
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+            
+            # Export to CSV
+            df.to_csv(output_path, index=False)
+            
+            progress(1.0, desc="Complete!")
+            
+            return f"""
+✅ HHT features exported successfully!
+
+**Output file:** {output_path}
+**Segments:** {len(features_list)}
+**Features per segment:** {len(df.columns) - 2}
+
+The CSV contains HHT-extracted features for each segment.
+"""
+        except Exception as e:
+            import traceback
+            return f"❌ Error exporting HHT features: {str(e)}\n{traceback.format_exc()}"
+    
     def export_data(self, output_dir, export_full, export_segments, 
                    subject_id, fatigue_level, quality_rating, action_type, notes,
                    export_hht, export_augmented, custom_prefix, progress=gr.Progress()):
@@ -1815,34 +2120,53 @@ def create_gui():
             # Tab 3: Detect Activity
             with gr.Tab("🎯 Detect Activity / 检测肌肉活动"):
                 gr.Markdown("""
-                ### Advanced PELT-based Muscle Activity Detection
+                ### Muscle Activity Detection
                 
-                **New Algorithm Features:**
+                **Two Detection Methods Available:**
+                
+                **1. PELT Algorithm** (Pruned Exact Linear Time)
                 - Energy-based adaptive penalty zones (low energy = more sensitive)
                 - Multi-dimensional features (time, frequency, complexity domains)
                 - Multi-detector ensemble with individual sensitivity control
                 - Activity/Non-activity classification (filters out rest periods)
                 - Intelligent merging of dense events (gaps < 50ms)
                 
-                **Sensitivity**: Lower = more sensitive (more segments), Higher = stricter (fewer segments)
+                **2. HHT Algorithm** (Hilbert-Huang Transform)
+                - Computes full-signal Hilbert spectrum
+                - Detects high-energy stripes characteristic of muscle activity
+                - Maps detected patterns back to time domain
+                - Frequency range: 20-450 Hz (sEMG effective range)
+                - Dynamic resolution scaling with signal duration
                 
-                **Multi-Detector**: Enable ensemble of detectors with individual sensitivities for robust detection
-                
-                **Activity Classification**: Automatically filters out non-activity segments after PELT detection
-                
-                **Max Duration**: Limits segment length by splitting long detections (0 = no limit)
+                **Choose one method based on your needs:**
+                - PELT: Fast, robust for general sEMG signals
+                - HHT: More sensitive to frequency-domain features, good for complex patterns
                 """)
                 
                 with gr.Tabs():
                     with gr.Tab("Single File"):
                         with gr.Row():
                             with gr.Column(scale=1):
+                                # Method selection
+                                detection_method_input = gr.Radio(
+                                    ["PELT", "HHT"],
+                                    value="PELT",
+                                    label="Detection Method",
+                                    info="Choose between PELT and HHT algorithms"
+                                )
+                                
+                                # Common parameters
+                                gr.Markdown("**Common Parameters:**")
                                 min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                               label="Minimum segment duration (s)")
                                 max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
                                                               label="Maximum segment duration (s, 0=no limit)")
+                                
+                                # PELT-specific parameters
+                                gr.Markdown("**PELT Algorithm Parameters:**")
                                 sensitivity_input = gr.Slider(0.1, 5.0, value=1.5, step=0.1,
-                                                             label="Base Detection Sensitivity")
+                                                             label="Base Detection Sensitivity",
+                                                             info="Only for PELT. Lower = more sensitive")
                                 
                                 gr.Markdown("**Multi-Detector Ensemble Settings:**")
                                 use_multi_detector_input = gr.Checkbox(value=True, label="Enable Multi-Detector Ensemble")
@@ -1865,7 +2189,7 @@ def create_gui():
                                 classification_threshold_input = gr.Slider(
                                     -2.0, 2.0, value=0.5, step=0.1,
                                     label="Classification Strictness",
-                                    info="Negative = very lenient, 0 = median, Positive = strict. Can be negative for signals with high-amplitude bursts."
+                                    info="Negative = very lenient, 0 = median, Positive = strict"
                                 )
                                 use_clustering_input = gr.Checkbox(
                                     value=False, 
@@ -1873,7 +2197,7 @@ def create_gui():
                                     info="K-means clustering (slower but automatic)"
                                 )
                                 
-                                gr.Markdown("**Advanced Detection Settings:**")
+                                gr.Markdown("**Advanced PELT Settings:**")
                                 use_tkeo_input = gr.Checkbox(
                                     value=True,
                                     label="Enable TKEO Preprocessing",
@@ -1890,6 +2214,24 @@ def create_gui():
                                     info="Maximum PELT segments merged into one event (prevents merging independent actions)"
                                 )
                                 
+                                # HHT-specific parameters
+                                gr.Markdown("**HHT Algorithm Parameters:**")
+                                hht_energy_threshold_input = gr.Slider(
+                                    0.5, 0.9, value=0.65, step=0.05,
+                                    label="Energy Threshold Percentile",
+                                    info="Only for HHT. Higher = more selective detection (0.5-0.9)"
+                                )
+                                hht_temporal_compactness_input = gr.Slider(
+                                    0.1, 0.7, value=0.3, step=0.05,
+                                    label="Temporal Compactness",
+                                    info="Only for HHT. Minimum energy density in time (0.1-0.7)"
+                                )
+                                hht_resolution_input = gr.Slider(
+                                    64, 256, value=128, step=32,
+                                    label="Resolution per Second",
+                                    info="Only for HHT. Time bins per second (64-256)"
+                                )
+                                
                                 detect_btn = gr.Button("Detect Activity", variant="primary")
                             
                             with gr.Column(scale=2):
@@ -1898,18 +2240,27 @@ def create_gui():
                         
                         detect_btn.click(
                             fn=processor.detect_activity,
-                            inputs=[min_duration_input, max_duration_input, sensitivity_input, 
+                            inputs=[detection_method_input, min_duration_input, max_duration_input, sensitivity_input, 
                                    n_detectors_input, fusion_method_input, use_multi_detector_input,
                                    use_clustering_input, detector_sens_input, classification_threshold_input,
-                                   use_tkeo_input, merge_threshold_input, max_merge_count_input],
+                                   use_tkeo_input, merge_threshold_input, max_merge_count_input,
+                                   hht_energy_threshold_input, hht_temporal_compactness_input, hht_resolution_input],
                             outputs=[detect_info, detect_plot]
                         )
                     
                     with gr.Tab("Batch Detection / 批量检测"):
-                        gr.Markdown("### Detect activity in all batch-filtered files using PELT")
+                        gr.Markdown("### Detect activity in all batch-filtered files")
                         
                         with gr.Row():
                             with gr.Column(scale=1):
+                                # Method selection for batch
+                                batch_detection_method_input = gr.Radio(
+                                    ["PELT", "HHT"],
+                                    value="PELT",
+                                    label="Detection Method",
+                                    info="Choose between PELT and HHT algorithms"
+                                )
+                                
                                 batch_min_duration_input = gr.Slider(0.01, 10.0, value=0.1, step=0.01,
                                                                     label="Minimum segment duration (s)")
                                 batch_max_duration_input = gr.Slider(0, 30.0, value=0, step=1.0,
@@ -1960,6 +2311,24 @@ def create_gui():
                                     info="Maximum PELT segments merged into one event"
                                 )
                                 
+                                # HHT-specific parameters for batch
+                                gr.Markdown("**HHT Algorithm Parameters:**")
+                                batch_hht_energy_threshold_input = gr.Slider(
+                                    0.5, 0.9, value=0.65, step=0.05,
+                                    label="Energy Threshold Percentile",
+                                    info="Only for HHT. Higher = more selective"
+                                )
+                                batch_hht_temporal_compactness_input = gr.Slider(
+                                    0.1, 0.7, value=0.3, step=0.05,
+                                    label="Temporal Compactness",
+                                    info="Only for HHT. Minimum energy density"
+                                )
+                                batch_hht_resolution_input = gr.Slider(
+                                    64, 256, value=128, step=32,
+                                    label="Resolution per Second",
+                                    info="Only for HHT. Time bins per second"
+                                )
+                                
                                 batch_detect_btn = gr.Button("🎯 Detect in All Files", variant="primary")
                             
                             with gr.Column(scale=2):
@@ -1968,10 +2337,11 @@ def create_gui():
                         
                         batch_detect_btn.click(
                             fn=processor.detect_batch_activity,
-                            inputs=[batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
+                            inputs=[batch_detection_method_input, batch_min_duration_input, batch_max_duration_input, batch_sensitivity_input, 
                                    batch_n_detectors_input, batch_fusion_method_input, batch_use_multi_detector_input,
                                    batch_use_clustering_input, batch_detector_sens_input, batch_classification_threshold_input,
-                                   batch_use_tkeo_input, batch_merge_threshold_input, batch_max_merge_count_input],
+                                   batch_use_tkeo_input, batch_merge_threshold_input, batch_max_merge_count_input,
+                                   batch_hht_energy_threshold_input, batch_hht_temporal_compactness_input, batch_hht_resolution_input],
                             outputs=[batch_detect_info, batch_detect_plot]
                         )
                         
@@ -2056,74 +2426,141 @@ def create_gui():
                 gr.Markdown("""
                 ### sEMG Segment Feature Analysis (sEMG分段特征分析)
                 
-                Analyze sEMG features from single or multiple segment CSV files.
+                Analyze sEMG features from uploaded segment CSV/MAT files.
                 Each uploaded file should contain one sEMG segment.
                 
-                **Features extracted:**
-                - Time domain: WL, ZC, SSC, RMS, MAV, VAR
-                - Frequency domain: MDF, MNF, IMNF, PKF, TTP
-                - Fatigue indicators: DI (Dimitrov Index), WIRE51
-                
-                **Visualizations:**
-                - Feature trends across segments
-                - Statistical summaries
-                - Export to CSV for further analysis
+                **Two analysis modes:**
+                1. **Basic Feature Analysis**: Extract time/frequency features (WL, ZC, SSC, MDF, MNF, etc.)
+                2. **HHT Analysis**: Compute Hilbert-Huang Transform for each segment + features
                 """)
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("**Upload Segment Files**")
-                        segment_files_input = gr.File(
-                            label="Select Segment Files (选择分段文件 CSV/MAT)", 
-                            file_types=['.csv', '.mat'],
-                            file_count="multiple"
-                        )
-                        segment_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
-                        segment_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
-                        segment_header_input = gr.Checkbox(value=True, label="Files have header row")
-                        segment_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
-                                                           info="For files with 2 header rows, set this to 1")
+                with gr.Tabs():
+                    with gr.Tab("Basic Feature Analysis"):
+                        gr.Markdown("""
+                        **Features extracted:**
+                        - Time domain: WL, ZC, SSC, RMS, MAV, VAR
+                        - Frequency domain: MDF, MNF, IMNF, PKF, TTP
+                        - Fatigue indicators: DI (Dimitrov Index), WIRE51
+                        """)
                         
-                        analyze_features_btn = gr.Button("📊 Analyze Features", variant="primary")
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Upload Segment Files**")
+                                segment_files_input = gr.File(
+                                    label="Select Segment Files (选择分段文件 CSV/MAT)", 
+                                    file_types=['.csv', '.mat'],
+                                    file_count="multiple"
+                                )
+                                segment_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
+                                segment_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
+                                segment_header_input = gr.Checkbox(value=True, label="Files have header row")
+                                segment_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0,
+                                                                   info="For files with 2 header rows, set this to 1")
+                                
+                                analyze_features_btn = gr.Button("📊 Analyze Features", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                feature_analysis_info = gr.Textbox(label="Feature Analysis Results", lines=20)
+                                feature_trend_plot = gr.Plot(label="Feature Trends Across Segments")
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("### Feature Data Table & Export")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                feature_table_display = gr.Dataframe(
+                                    label="Extracted Features (可查看所有特征值)",
+                                    interactive=False
+                                )
+                        
+                        # Single click handler that updates all outputs
+                        analyze_features_btn.click(
+                            fn=processor.analyze_segment_features,
+                            inputs=[segment_files_input, segment_fs_input, segment_column_input, 
+                                   segment_header_input, segment_skip_rows_input],
+                            outputs=[feature_analysis_info, feature_trend_plot, feature_table_display]
+                        )
+                        
+                        gr.Markdown("### Export Features to CSV")
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                feature_csv_output_path = gr.Textbox(
+                                    value="./output/segment_features_analysis.csv", 
+                                    label="Output CSV Path",
+                                    info="Directory path or full file path (.csv)"
+                                )
+                                export_segment_features_btn = gr.Button("💾 Export Features to CSV", variant="secondary")
+                            with gr.Column(scale=2):
+                                feature_export_status = gr.Textbox(label="Export Status", lines=5)
+                        
+                        export_segment_features_btn.click(
+                            fn=processor.export_segment_features_csv,
+                            inputs=[feature_csv_output_path],
+                            outputs=[feature_export_status]
+                        )
                     
-                    with gr.Column(scale=2):
-                        feature_analysis_info = gr.Textbox(label="Feature Analysis Results", lines=20)
-                        feature_trend_plot = gr.Plot(label="Feature Trends Across Segments")
-                
-                gr.Markdown("---")
-                gr.Markdown("### Feature Data Table & Export")
-                
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        feature_table_display = gr.Dataframe(
-                            label="Extracted Features (可查看所有特征值)",
-                            interactive=False
+                    with gr.Tab("HHT Batch Analysis"):
+                        gr.Markdown("""
+                        ### Hilbert-Huang Transform Batch Processing
+                        
+                        **Compute HHT for each uploaded segment independently:**
+                        - Each segment gets its own HHT decomposition
+                        - Hilbert spectrum computed for each segment
+                        - Features extracted from HHT results
+                        - All segments processed with uniform resolution
+                        
+                        **Note:** This is independent from event detection HHT (they are decoupled).
+                        """)
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("**Upload Segment Files**")
+                                hht_segment_files_input = gr.File(
+                                    label="Select Segment Files (选择分段文件 CSV/MAT)", 
+                                    file_types=['.csv', '.mat'],
+                                    file_count="multiple"
+                                )
+                                hht_segment_fs_input = gr.Number(value=1000, label="Sampling Frequency (Hz)", precision=0)
+                                hht_segment_column_input = gr.Number(value=1, label="Signal Column Index", precision=0)
+                                hht_segment_header_input = gr.Checkbox(value=True, label="Files have header row")
+                                hht_segment_skip_rows_input = gr.Number(value=0, label="Skip rows (跳过行数)", precision=0)
+                                
+                                gr.Markdown("**HHT Parameters**")
+                                hht_segment_freq_bins = gr.Number(value=256, label="Frequency Bins", precision=0)
+                                hht_segment_norm_length = gr.Number(value=256, label="Normalized Length", precision=0)
+                                hht_segment_ceemdan = gr.Checkbox(value=True, label="Use CEEMDAN (recommended)")
+                                
+                                analyze_hht_btn = gr.Button("🔬 Compute HHT for All Segments", variant="primary")
+                            
+                            with gr.Column(scale=2):
+                                hht_analysis_info = gr.Textbox(label="HHT Analysis Results", lines=20)
+                                hht_spectra_plot = gr.Plot(label="Hilbert Spectra (First 6 segments)")
+                        
+                        analyze_hht_btn.click(
+                            fn=processor.analyze_segment_features_hht,
+                            inputs=[hht_segment_files_input, hht_segment_fs_input, hht_segment_column_input,
+                                   hht_segment_header_input, hht_segment_skip_rows_input,
+                                   hht_segment_freq_bins, hht_segment_norm_length, hht_segment_ceemdan],
+                            outputs=[hht_analysis_info, hht_spectra_plot]
                         )
-                
-                # Single click handler that updates all outputs
-                analyze_features_btn.click(
-                    fn=processor.analyze_segment_features,
-                    inputs=[segment_files_input, segment_fs_input, segment_column_input, 
-                           segment_header_input, segment_skip_rows_input],
-                    outputs=[feature_analysis_info, feature_trend_plot, feature_table_display]
-                )
-                
-                gr.Markdown("### Export Features to CSV")
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        feature_csv_output_path = gr.Textbox(
-                            value="./output/segment_features_analysis.csv", 
-                            label="Output CSV Path"
+                        
+                        gr.Markdown("### Export HHT Features to CSV")
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                hht_csv_output_path = gr.Textbox(
+                                    value="./output", 
+                                    label="Output Directory or CSV Path",
+                                    info="Directory path or full file path (.csv). Default filename: segment_hht_features.csv"
+                                )
+                                export_hht_features_btn = gr.Button("💾 Export HHT Features to CSV", variant="secondary")
+                            with gr.Column(scale=2):
+                                hht_export_status = gr.Textbox(label="Export Status", lines=5)
+                        
+                        export_hht_features_btn.click(
+                            fn=processor.export_segment_features_hht_csv,
+                            inputs=[hht_csv_output_path],
+                            outputs=[hht_export_status]
                         )
-                        export_segment_features_btn = gr.Button("💾 Export Features to CSV", variant="secondary")
-                    with gr.Column(scale=2):
-                        feature_export_status = gr.Textbox(label="Export Status", lines=5)
-                
-                export_segment_features_btn.click(
-                    fn=processor.export_segment_features_csv,
-                    inputs=[feature_csv_output_path],
-                    outputs=[feature_export_status]
-                )
             
             # Tab 5: Segment Feature Analysis (already added above)
             
