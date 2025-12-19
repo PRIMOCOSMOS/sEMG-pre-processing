@@ -641,7 +641,7 @@ def compute_hilbert_spectrum(
     # Perform CEEMDAN for robust decomposition
     try:
         imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
-    except Exception:
+    except (ValueError, RuntimeError) as e:
         # Fallback to standard EMD if CEEMDAN fails
         imfs = emd_decomposition(signal)
     
