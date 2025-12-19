@@ -22,14 +22,14 @@ from . import hht as hht_module
 # HHT detection constants
 HHT_MIN_TIME_BINS = 128  # Minimum time bins for HHT resolution
 HHT_MAX_TIME_BINS = 2048  # Maximum time bins for HHT resolution
-HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.5  # Factor for adaptive energy threshold
+HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.3  # Factor for adaptive energy threshold - lower values increase detection sensitivity
 HHT_MERGE_GAP_MS = 50  # Gap in milliseconds for merging nearby segments
 
 # HHT algorithm parameters - thresholds and bounds
 HHT_MIN_ENERGY_THRESHOLD = 0.3  # Minimum allowed adjusted energy threshold (percentile)
 HHT_MAX_ENERGY_THRESHOLD = 0.95  # Maximum allowed adjusted energy threshold (percentile)
-HHT_NOISE_FLOOR_PERCENTILE = 10  # Percentile for minimum adaptive threshold (noise floor)
-HHT_MAX_THRESHOLD_PERCENTILE = 70  # Percentile for maximum adaptive threshold
+HHT_NOISE_FLOOR_PERCENTILE = 5  # Percentile for minimum adaptive threshold (noise floor)
+HHT_MAX_THRESHOLD_PERCENTILE = 60  # Percentile for maximum adaptive threshold
 HHT_MIN_COMPACTNESS = 0.1  # Minimum allowed temporal compactness
 HHT_MAX_COMPACTNESS = 0.8  # Maximum allowed temporal compactness
 HHT_LOCAL_WINDOW_MIN_SIZE = 5  # Minimum size for local contrast window
@@ -3037,8 +3037,8 @@ def detect_activity_hht(
     fs: float,
     min_duration: float = 0.1,
     max_duration: Optional[float] = None,
-    energy_threshold: float = 0.65,
-    temporal_compactness: float = 0.3,
+    energy_threshold: float = 0.4,
+    temporal_compactness: float = 0.15,
     min_freq: float = 20.0,
     max_freq: float = 450.0,
     resolution_per_second: int = 128,
@@ -3056,12 +3056,24 @@ def detect_activity_hht(
     high-energy stripes (characteristic of muscle activity), and maps detected
     time segments back to the original signal.
     
-    Algorithm (Enhanced):
-    1. Compute HHT of the entire signal with dynamic resolution
-    2. Apply improved adaptive thresholding with local-global energy comparison
-    3. Detect temporally compact energy patterns (muscle events)
-    4. Map detected patterns back to time domain with user-adjustable sensitivity
-    5. Apply duration constraints and segment merging
+    Algorithm (Enhanced with Baseline Resting State):
+    1. Compute HHT of the entire signal with dynamic resolution using CEEMDAN
+    2. Compute time-integrated energy profile from Hilbert spectrum
+    3. Estimate baseline (resting state) energy from lower percentiles
+    4. Set threshold relative to baseline rather than global statistics
+    5. Detect temporally compact energy patterns (muscle events)
+    6. Map detected patterns back to time domain with user-adjustable sensitivity
+    7. Apply duration constraints and segment merging
+    
+    Key Innovation - Baseline Resting State Approach:
+    The HHT spectrum shows clear baseline (resting) energy with minimal variation,
+    while muscle activities appear as distinct elevations above baseline. The 
+    detection threshold is set relative to this baseline, ensuring that any 
+    sustained elevation above the "calm" resting state is detected. This approach:
+    - Detects weak activities that would be missed by global statistics
+    - Is not skewed by high-intensity peaks
+    - Adapts to the signal's inherent baseline level
+    - Captures complete muscle action segments (rising, peak, falling phases)
     
     Parameters:
     -----------
@@ -3076,11 +3088,11 @@ def detect_activity_hht(
         Maximum duration of muscle activity in seconds (default: None = no limit)
         Typical dumbbell lift actions are usually 1-10 seconds
     energy_threshold : float, optional
-        Percentile threshold for high-energy detection (0-1, default: 0.65)
-        Higher = more selective (fewer events), lower = more sensitive (more events)
+        Percentile threshold for high-energy detection (0-1, default: 0.4)
+        Used for spectrum high-energy mask in compactness filtering
     temporal_compactness : float, optional
-        Minimum ratio of time bins that must have high energy (0-1, default: 0.3)
-        This ensures detected regions are temporally compact (not scattered noise)
+        Minimum ratio of time bins that must have high energy (0-1, default: 0.15)
+        Lower values include broader segments containing muscle activity, not just instantaneous peaks
     min_freq : float, optional
         Minimum frequency for HHT analysis (default: 20.0 Hz for sEMG)
     max_freq : float, optional
@@ -3089,8 +3101,10 @@ def detect_activity_hht(
         Time resolution per second (default: 128, i.e., 128 time bins per second)
         Total resolution scales with signal duration
     adaptive_threshold_factor : float, optional
-        Base factor for adaptive energy threshold calculation (default: 0.5)
-        This is modified by the sensitivity parameter
+        **DEPRECATED - Not used in baseline approach (kept for API compatibility)**
+        This parameter is not used in the new baseline resting state detection.
+        Will be removed in a future version.
+        For controlling sensitivity, use the 'sensitivity' parameter instead.
     merge_gap_ms : float, optional
         Gap in milliseconds for merging nearby segments (default: 50ms)
     return_spectrum : bool, optional
@@ -3098,9 +3112,9 @@ def detect_activity_hht(
     sensitivity : float, optional
         User-adjustable detection sensitivity (default: 1.0)
         Range: 0.1 (very sensitive, detects weak events) to 3.0 (very strict)
-        - Lower values detect more events with lower energy
-        - Higher values only detect high-energy events
-        This parameter inversely affects the detection threshold
+        - Lower values reduce baseline margin, detecting more events
+        - Higher values increase baseline margin, only detecting stronger events
+        Controls the margin above baseline: threshold = baseline_mean + (2.0/sensitivity) * baseline_std
     local_contrast_weight : float, optional
         Weight for local contrast in energy evaluation (default: 0.3)
         Range: 0.0 (pure global) to 1.0 (pure local)
@@ -3122,19 +3136,37 @@ def detect_activity_hht(
                 'frequency': Frequency axis array
                 'detection_mask': Boolean mask of detected regions on spectrum
                 'time_energy': Time-integrated energy profile
+                'combined_energy': Combined global+local energy
                 'active_time_bins': Boolean array of active time bins
-                'threshold_info': Dict with threshold calculation details
+                'threshold_info': Dict with threshold calculation details including:
+                    - baseline_mean, baseline_std: Resting state statistics
+                    - baseline_threshold: Threshold relative to baseline
+                    - adaptive_threshold: Final threshold after safety bounds
     
     Notes:
     ------
     - Signal should be preprocessed (filtered) before detection
+    - Uses CEEMDAN decomposition for robust IMF extraction
     - Resolution dynamically scales: for 2-4s signal → 256-512 time bins
     - Uses average pooling logic, no interpolation (consistent with existing HHT)
     - Frequency range limited to sEMG effective range (20-450 Hz)
     - High-energy stripes in spectrum indicate muscle activity
-    - The sensitivity parameter allows users to tune detection strictness
+    - Baseline approach detects all activities above resting state, regardless of intensity
     - Local contrast weight enables detection of events that stand out locally
       even if they are not the highest energy globally
+    
+    Examples:
+    ---------
+    >>> # Basic usage
+    >>> segments = detect_activity_hht(signal, fs=1000, min_duration=0.5)
+    
+    >>> # More sensitive (detects weaker activities)
+    >>> segments = detect_activity_hht(signal, fs=1000, sensitivity=0.7)
+    
+    >>> # Get full results with spectrum for visualization
+    >>> result = detect_activity_hht(signal, fs=1000, return_spectrum=True)
+    >>> segments = result['segments']
+    >>> spectrum = result['spectrum_log']
     """
     
     signal_length = len(data)
@@ -3198,25 +3230,38 @@ def detect_activity_hht(
     # Weight can be adjusted by user (local_contrast_weight)
     combined_energy = (1 - local_contrast_weight) * time_energy_norm + local_contrast_weight * local_contrast_norm
     
-    # Compute adaptive threshold based on signal characteristics and sensitivity
-    # Sensitivity inversely affects the threshold:
-    # - sensitivity < 1.0: lower threshold, more sensitive (detects weaker events)
-    # - sensitivity > 1.0: higher threshold, more strict (only strong events)
-    energy_mean = np.mean(combined_energy)
-    energy_std = np.std(combined_energy)
+    # ===== BASELINE RESTING STATE APPROACH =====
+    # Key insight: HHT spectrum shows clear baseline (resting state) vs activity
+    # In resting state, energy remains near baseline with minimal variation
+    # Any sustained elevation above baseline indicates muscle activity
+    # This approach is more robust than global statistics which can be skewed by strong peaks
     
-    # Adjust threshold factor based on sensitivity
-    # Lower sensitivity = lower threshold = more events detected
-    adjusted_threshold_factor = adaptive_threshold_factor * sensitivity
-    adaptive_threshold = energy_mean + adjusted_threshold_factor * energy_std
+    # 1. Estimate baseline (resting state) energy level
+    # Use lower percentiles to capture the typical resting energy
+    # Sort energy values and take lower portion as baseline candidates
+    sorted_energy = np.sort(combined_energy)
+    baseline_percentile = 30  # Use lower 30% of energy values to estimate baseline
+    baseline_sample_size = max(10, int(len(sorted_energy) * baseline_percentile / 100))
+    baseline_energy = sorted_energy[:baseline_sample_size]
     
-    # Ensure threshold is reasonable (not too low or too high)
-    # At minimum, threshold should be above noise floor
-    # At maximum, should not exceed a reasonable level to allow some detections
-    min_threshold = np.percentile(combined_energy, HHT_NOISE_FLOOR_PERCENTILE)
-    max_threshold = np.percentile(combined_energy, HHT_MAX_THRESHOLD_PERCENTILE)
-    adaptive_threshold = np.clip(adaptive_threshold, min_threshold, max_threshold)
+    # Calculate baseline statistics
+    baseline_mean = np.mean(baseline_energy)
+    baseline_std = np.std(baseline_energy)
     
+    # 2. Set threshold relative to baseline rather than global mean
+    # The threshold is: baseline + margin above typical baseline variation
+    # This ensures we detect any activity that rises above the "calm" resting state
+    # Sensitivity parameter controls the margin
+    baseline_margin_factor = 2.0 / sensitivity  # Lower sensitivity = smaller margin = more sensitive
+    baseline_threshold = baseline_mean + baseline_margin_factor * baseline_std
+    
+    # 3. Add safety bounds to prevent extreme thresholds
+    # Still use percentiles as safety bounds, but they're now less restrictive
+    min_safe_threshold = np.percentile(combined_energy, HHT_NOISE_FLOOR_PERCENTILE)
+    max_safe_threshold = np.percentile(combined_energy, HHT_MAX_THRESHOLD_PERCENTILE)
+    adaptive_threshold = np.clip(baseline_threshold, min_safe_threshold, max_safe_threshold)
+    
+    # 4. Apply threshold to detect active regions
     active_time_bins = combined_energy > adaptive_threshold
     
     # 5. Find contiguous active regions using connected component analysis
@@ -3350,13 +3395,15 @@ def detect_activity_hht(
         
         # Threshold information for debugging/display
         threshold_info = {
-            'global_threshold': threshold,
+            'spectrum_percentile_threshold': threshold,  # Percentile threshold used for spectrum high-energy mask
             'adaptive_threshold': adaptive_threshold,
             'sensitivity': sensitivity,
             'adjusted_energy_threshold': adjusted_energy_threshold,
             'adjusted_compactness': adjusted_compactness,
-            'energy_mean': energy_mean,
-            'energy_std': energy_std
+            'baseline_mean': baseline_mean,
+            'baseline_std': baseline_std,
+            'baseline_threshold': baseline_threshold,
+            'baseline_margin_factor': baseline_margin_factor
         }
         
         return {

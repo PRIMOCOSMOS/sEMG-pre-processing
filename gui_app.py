@@ -514,12 +514,11 @@ class EMGProcessorGUI:
                 # Panel 1: Hilbert Spectrum with colored logarithmic display
                 ax1 = axes[0]
                 # Use log-scaled spectrum for better visualization
-                im = ax1.pcolormesh(time_axis, freq_axis, spectrum_log, shading='auto', cmap='jet', alpha=0.9)
-                # Overlay detection mask with white contour
-                ax1.contour(time_axis, freq_axis, detection_mask, levels=[0.5], colors='white', linewidths=2)
+                # Show original HHT result as logarithmic colored spectrum only (no white bands)
+                im = ax1.pcolormesh(time_axis, freq_axis, spectrum_log, shading='auto', cmap='jet')
                 ax1.set_xlabel('Time (s)', fontsize=11)
                 ax1.set_ylabel('Frequency (Hz)', fontsize=11)
-                ax1.set_title('Hilbert Spectrum (Log Scale) with Detected Regions', fontsize=12, fontweight='bold')
+                ax1.set_title('Hilbert Spectrum (Log Scale)', fontsize=12, fontweight='bold')
                 cbar = plt.colorbar(im, ax=ax1)
                 cbar.set_label('Log Amplitude', fontsize=10)
                 

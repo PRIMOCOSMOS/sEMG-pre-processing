@@ -583,11 +583,12 @@ def compute_hilbert_spectrum(
     Compute Hilbert Spectrum (time-frequency representation) using HHT.
     
     IMPROVEMENTS (2024):
+    - Uses CEEMDAN decomposition for robust IMF extraction
     - Uses average pooling instead of interpolation to avoid high-frequency artifacts
     - Frequency axis maps to meaningful sEMG range (20-450Hz by default)
     
     This function performs:
-    1. EMD decomposition to get IMFs
+    1. CEEMDAN decomposition to get IMFs (Complete Ensemble EMD with Adaptive Noise)
     2. Hilbert transform on each IMF
     3. Construction of time-frequency spectrum
     
@@ -637,8 +638,12 @@ def compute_hilbert_spectrum(
     # Initialize spectrum at original time resolution
     spectrum = np.zeros((n_freq_bins, n_samples))
     
-    # Perform EMD
-    imfs = emd_decomposition(signal)
+    # Perform CEEMDAN for robust decomposition
+    try:
+        imfs = ceemdan_decomposition(signal, n_ensembles=DEFAULT_CEEMDAN_ENSEMBLES)
+    except (ValueError, RuntimeError) as e:
+        # Fallback to standard EMD if CEEMDAN fails
+        imfs = emd_decomposition(signal)
     
     # Process each IMF
     for imf in imfs[:-1]:  # Exclude residue

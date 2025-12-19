@@ -211,7 +211,37 @@ def apply_tkeo(signal):
 
 \subsection{HHT-Based Event Detection}
 
-The HHT method detects events by analyzing the Hilbert spectrum for high-energy time-frequency patterns.
+The HHT method detects events by analyzing the Hilbert spectrum for high-energy time-frequency patterns. This approach is particularly well-suited for non-stationary sEMG signals where muscle activity manifests as concentrated energy in time-frequency space.
+
+\subsubsection{Algorithm Overview}
+
+The HHT-based detection algorithm follows these steps:
+\begin{enumerate}
+    \item Compute full-signal HHT using CEEMDAN for robust IMF decomposition
+    \item Generate Hilbert spectrum with frequency range mapped to valid sEMG band (20-450 Hz)
+    \item Compute time-integrated energy profile
+    \item Apply adaptive thresholding with local-global energy comparison
+    \item Filter detected regions by temporal compactness
+    \item Map detected time bins back to original signal indices
+\end{enumerate}
+
+\subsubsection{CEEMDAN-Based Decomposition}
+
+For improved robustness, the algorithm uses CEEMDAN instead of standard EMD:
+\begin{equation}
+\text{IMFs} = \text{CEEMDAN}(x(t), M, \epsilon_0)
+\end{equation}
+where $M$ is the number of ensembles (typically 30-50) and $\epsilon_0$ is the initial noise amplitude. CEEMDAN provides:
+\begin{itemize}
+    \item Reduced mode mixing through noise-assisted analysis
+    \item More stable IMF decomposition across different signals
+    \item Better separation of frequency components
+\end{itemize}
+
+The Hilbert spectrum is then computed from the CEEMDAN-derived IMFs:
+\begin{equation}
+S(f, t) = \sum_{i=1}^{N_{IMF}} a_i(t) \cdot \delta(f - f_i(t))
+\end{equation}
 
 \subsubsection{Energy-Based Detection}
 
@@ -221,13 +251,64 @@ E(t) = \sum_f S(f, t)
 \end{equation}
 where $S(f, t)$ is the Hilbert spectrum amplitude at frequency $f$ and time $t$.
 
-\subsubsection{Adaptive Thresholding}
+\subsubsection{Baseline Resting State Adaptive Thresholding}
 
-The detection threshold adapts to signal characteristics:
+The algorithm uses a novel baseline resting state approach for threshold determination. This method is based on the key observation that in the HHT spectrum, resting (inactive) periods show clear, stable baseline energy with minimal variation, while muscle activities appear as distinct elevations above this baseline.
+
+\textbf{Baseline Estimation:}
+
+Instead of using global energy statistics (which can be skewed by high-intensity peaks), the algorithm estimates the baseline from the lower portion of the energy distribution:
 \begin{equation}
-\theta_{adaptive} = \mu_E + \alpha \cdot \sigma_E
+E_{baseline} = \{e \in E_{sorted} : e \leq P_{30}(E)\}
 \end{equation}
-where $\mu_E$ and $\sigma_E$ are the mean and standard deviation of the energy profile, and $\alpha$ is the adaptive threshold factor.
+where $P_{30}(E)$ is the 30th percentile of combined energy values. This captures the typical resting state energy.
+
+\textbf{Baseline Statistics:}
+
+From the baseline energy subset, we compute:
+\begin{align}
+\mu_{baseline} &= \text{mean}(E_{baseline}) \\
+\sigma_{baseline} &= \text{std}(E_{baseline})
+\end{align}
+
+\textbf{Baseline-Relative Threshold:}
+
+The detection threshold is set relative to the baseline, not the global mean:
+\begin{equation}
+\theta_{baseline} = \mu_{baseline} + \frac{2.0}{s} \cdot \sigma_{baseline}
+\end{equation}
+where $s$ is the sensitivity parameter. This ensures that:
+\begin{itemize}
+    \item Any sustained elevation above the "calm" resting state is detected
+    \item Weak muscle activities are not rejected simply for having low absolute energy
+    \item The threshold adapts to the signal's inherent baseline level
+    \item Lower sensitivity ($s < 1$) reduces the margin, making detection more sensitive
+\end{itemize}
+
+\textbf{Safety Bounds:}
+
+To prevent extreme thresholds, the baseline threshold is clipped within percentile bounds:
+\begin{equation}
+\theta_{adaptive} = \text{clip}(\theta_{baseline}, P_5(E), P_{60}(E))
+\end{equation}
+
+\textbf{Key Advantages:}
+
+\begin{enumerate}
+    \item \textbf{Robust to Peak Intensity Variation}: The threshold is not influenced by the presence of very strong peaks, allowing weak activities to be detected alongside strong ones
+    \item \textbf{Adaptive to Signal Baseline}: Automatically adjusts to different baseline noise levels across recordings
+    \item \textbf{Physiologically Meaningful}: Directly reflects the rest-vs-activity dichotomy visible in the HHT spectrum
+    \item \textbf{Inclusive Event Capture}: Detects all activities above resting state, not just the strongest events
+\end{enumerate}
+
+\textbf{Improved Default Parameters:}
+\begin{itemize}
+    \item Energy threshold percentile: 0.4 (for spectrum high-energy mask)
+    \item Temporal compactness: 0.15 (captures segments containing peaks, not just peaks themselves)
+    \item Baseline percentile: 30 (uses lower 30\% of energy values for baseline estimation)
+\end{itemize}
+
+The baseline approach ensures that detected segments span the full duration of muscle actions (typically several seconds), capturing rising phase, peak, and falling phase, rather than only instantaneous peak moments.
 
 \subsubsection{Local Contrast Energy}
 
@@ -235,7 +316,7 @@ To detect locally prominent events, the algorithm computes local contrast:
 \begin{equation}
 C(t) = \max\left(0, \frac{E(t) - \mu_{local}(t)}{\sigma_{local}(t)}\right)
 \end{equation}
-where $\mu_{local}$ and $\sigma_{local}$ are local neighborhood statistics.
+where $\mu_{local}$ and $\sigma_{local}$ are local neighborhood statistics computed over a sliding window of size $W = \max(5, N_{bins}/20)$.
 
 \subsubsection{Combined Energy Criterion}
 
@@ -243,7 +324,13 @@ The final detection criterion combines global and local energy:
 \begin{equation}
 E_{combined}(t) = (1 - w) \cdot \tilde{E}(t) + w \cdot \tilde{C}(t)
 \end{equation}
-where $w$ is the local contrast weight parameter and $\tilde{E}$, $\tilde{C}$ are normalized versions.
+where $w$ is the local contrast weight parameter (default: 0.3) and $\tilde{E}$, $\tilde{C}$ are normalized versions:
+\begin{align}
+\tilde{E}(t) &= E(t) / \max(E) \\
+\tilde{C}(t) &= C(t) / \max(C)
+\end{align}
+
+This combined approach enables detection of both globally prominent events and locally significant events that may not have the highest absolute energy.
 
 \subsubsection{Sensitivity Parameter}
 
@@ -253,18 +340,25 @@ The user-adjustable sensitivity parameter $s$ modifies the detection threshold:
 \end{equation}
 \begin{itemize}
     \item $s < 1$: More sensitive (lower threshold, detects weaker events)
-    \item $s = 1$: Default sensitivity
+    \item $s = 1$: Default sensitivity (balanced detection)
     \item $s > 1$: Less sensitive (higher threshold, only strong events)
 \end{itemize}
 
+The sensitivity inversely affects the threshold: lower sensitivity values make the detector more responsive to low-energy muscle activations.
+
 \subsubsection{Temporal Compactness Filtering}
 
-Detected regions are filtered by their temporal compactness:
+Detected regions are filtered by their temporal compactness to distinguish true muscle activity from scattered noise:
 \begin{equation}
 \text{compactness} = \frac{\sum_t \mathbf{1}_{E(t) > \theta_{high}}}{T_{segment}}
 \end{equation}
 
-Only segments with compactness above a threshold are retained as true muscle activity events.
+where $\theta_{high}$ is computed from a percentile of the spectrum (adjusted by sensitivity). The compactness threshold is adaptive:
+\begin{equation}
+\tau_{compact} = \min\left(0.8, \max\left(0.1, \frac{0.2}{s}\right)\right)
+\end{equation}
+
+Only segments with compactness above this threshold are retained as true muscle activity events. This ensures that detected regions have sustained energy elevation rather than isolated spikes.
 
 %========================================
 \section{Hilbert-Huang Transform (HHT)}
@@ -312,20 +406,70 @@ where $c_i(t)$ are IMFs and $r_N(t)$ is the residue.
 
 \subsection{CEEMDAN (Complete Ensemble EMD with Adaptive Noise)}
 
-CEEMDAN improves EMD robustness by adding noise-assisted analysis:
+CEEMDAN is an advanced version of EMD that provides more robust and stable signal decomposition. It is the \textbf{mandatory decomposition method} used throughout this library for both event detection and segment analysis.
+
+\subsubsection{Algorithm}
+
+CEEMDAN improves EMD robustness by adding noise-assisted ensemble analysis. The $k$-th IMF is computed as the average of ensemble decompositions:
 \begin{equation}
 \tilde{c}_k = \frac{1}{M} \sum_{m=1}^{M} c_k^{(m)}
 \end{equation}
-where $c_k^{(m)}$ is the $k$-th IMF from the $m$-th ensemble with added noise.
+where $c_k^{(m)}$ is the $k$-th IMF from the $m$-th ensemble trial with added noise:
+\begin{equation}
+x^{(m)}(t) = x(t) + \epsilon_m(t)
+\end{equation}
 
 \subsubsection{Adaptive Noise}
 
-Noise amplitude decreases with IMF level:
+The noise amplitude decreases adaptively with IMF level to balance mode separation and signal fidelity:
 \begin{equation}
 \epsilon_k = \frac{\epsilon_0}{k+1}
 \end{equation}
 
-This provides mode mixing reduction while maintaining signal fidelity.
+where $\epsilon_0$ is the initial noise standard deviation (typically 0.2 times the signal standard deviation), and $k$ is the IMF index.
+
+\subsubsection{Advantages Over Standard EMD}
+
+CEEMDAN provides several critical advantages for sEMG analysis:
+
+\begin{enumerate}
+    \item \textbf{Mode Mixing Reduction}: Prevents adjacent frequency components from appearing in the same IMF
+    \item \textbf{Stability}: Produces consistent IMFs across different trials and signal variations
+    \item \textbf{Physical Meaningfulness}: Each IMF better represents a distinct physiological frequency component
+    \item \textbf{Robustness to Noise}: Ensemble averaging reduces the impact of measurement noise
+\end{enumerate}
+
+\subsubsection{Implementation Parameters}
+
+The library uses optimized CEEMDAN parameters:
+\begin{itemize}
+    \item Number of ensembles $M$: 30 (balance between speed and accuracy)
+    \item Initial noise ratio $\epsilon_0$: 0.2 $\times$ $\sigma_x$ (20\% of signal standard deviation)
+    \item Maximum IMFs: Typically 8-10 for sEMG signals
+    \item Sifting threshold: 0.05 (5\% convergence criterion)
+\end{itemize}
+
+\subsubsection{Usage in Event Detection and Segment Analysis}
+
+CEEMDAN is used in two critical contexts:
+
+\textbf{1. Full-Signal Event Detection:}
+\begin{lstlisting}[style=python]
+# Compute HHT for event detection
+imfs = ceemdan_decomposition(signal, n_ensembles=30)
+spectrum = compute_hilbert_spectrum_from_imfs(imfs, fs)
+segments = detect_events_from_spectrum(spectrum)
+\end{lstlisting}
+
+\textbf{2. Individual Segment Analysis:}
+\begin{lstlisting}[style=python]
+# Analyze each detected segment with CEEMDAN
+for segment in segments:
+    imfs = ceemdan_decomposition(segment, n_ensembles=30)
+    features = extract_features_from_imfs(imfs, fs)
+\end{lstlisting}
+
+This dual usage ensures consistent, robust decomposition at both the detection and analysis stages.
 
 \subsection{Hilbert Transform}
 
