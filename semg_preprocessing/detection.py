@@ -3034,6 +3034,8 @@ def detect_activity_hht(
     adaptive_threshold_factor: float = HHT_ADAPTIVE_THRESHOLD_FACTOR,
     merge_gap_ms: float = HHT_MERGE_GAP_MS,
     return_spectrum: bool = False,
+    sensitivity: float = 1.0,
+    local_contrast_weight: float = 0.3,
     **kwargs
 ) -> Union[List[Tuple[int, int]], Dict[str, Union[List[Tuple[int, int]], np.ndarray]]]:
     """
@@ -3043,12 +3045,12 @@ def detect_activity_hht(
     high-energy stripes (characteristic of muscle activity), and maps detected
     time segments back to the original signal.
     
-    Algorithm:
+    Algorithm (Enhanced):
     1. Compute HHT of the entire signal with dynamic resolution
-    2. Identify high-energy regions in the Hilbert spectrum
+    2. Apply improved adaptive thresholding with local-global energy comparison
     3. Detect temporally compact energy patterns (muscle events)
-    4. Map detected patterns back to time domain
-    5. Extract segments from original signal
+    4. Map detected patterns back to time domain with user-adjustable sensitivity
+    5. Apply duration constraints and segment merging
     
     Parameters:
     -----------
@@ -3058,11 +3060,13 @@ def detect_activity_hht(
         Sampling frequency in Hz
     min_duration : float, optional
         Minimum duration of muscle activity in seconds (default: 0.1)
+        Muscle actions like dumbbell lifts typically require at least 0.5-1.0 seconds
     max_duration : float, optional
         Maximum duration of muscle activity in seconds (default: None = no limit)
+        Typical dumbbell lift actions are usually 1-10 seconds
     energy_threshold : float, optional
         Percentile threshold for high-energy detection (0-1, default: 0.65)
-        Higher = more selective, lower = more sensitive
+        Higher = more selective (fewer events), lower = more sensitive (more events)
     temporal_compactness : float, optional
         Minimum ratio of time bins that must have high energy (0-1, default: 0.3)
         This ensures detected regions are temporally compact (not scattered noise)
@@ -3074,12 +3078,22 @@ def detect_activity_hht(
         Time resolution per second (default: 128, i.e., 128 time bins per second)
         Total resolution scales with signal duration
     adaptive_threshold_factor : float, optional
-        Factor for adaptive energy threshold calculation (default: 0.5)
-        Higher = more strict, lower = more sensitive
+        Base factor for adaptive energy threshold calculation (default: 0.5)
+        This is modified by the sensitivity parameter
     merge_gap_ms : float, optional
         Gap in milliseconds for merging nearby segments (default: 50ms)
     return_spectrum : bool, optional
         If True, return dict with segments and spectrum data for visualization
+    sensitivity : float, optional
+        User-adjustable detection sensitivity (default: 1.0)
+        Range: 0.1 (very sensitive, detects weak events) to 3.0 (very strict)
+        - Lower values detect more events with lower energy
+        - Higher values only detect high-energy events
+        This parameter inversely affects the detection threshold
+    local_contrast_weight : float, optional
+        Weight for local contrast in energy evaluation (default: 0.3)
+        Range: 0.0 (pure global) to 1.0 (pure local)
+        Higher values emphasize local energy contrast over global threshold
     **kwargs : dict
         Additional arguments (for compatibility)
     
@@ -3092,9 +3106,13 @@ def detect_activity_hht(
             Dict with keys:
                 'segments': List of (start_index, end_index) tuples
                 'spectrum': Full Hilbert spectrum matrix (freq_bins x time_bins)
+                'spectrum_log': Log-scaled spectrum for visualization
                 'time': Time axis array
                 'frequency': Frequency axis array
                 'detection_mask': Boolean mask of detected regions on spectrum
+                'time_energy': Time-integrated energy profile
+                'active_time_bins': Boolean array of active time bins
+                'threshold_info': Dict with threshold calculation details
     
     Notes:
     ------
@@ -3103,7 +3121,9 @@ def detect_activity_hht(
     - Uses average pooling logic, no interpolation (consistent with existing HHT)
     - Frequency range limited to sEMG effective range (20-450 Hz)
     - High-energy stripes in spectrum indicate muscle activity
-    - adaptive_threshold_factor and merge_gap_ms are configurable for different signals
+    - The sensitivity parameter allows users to tune detection strictness
+    - Local contrast weight enables detection of events that stand out locally
+      even if they are not the highest energy globally
     """
     
     signal_length = len(data)
@@ -3128,32 +3148,67 @@ def detect_activity_hht(
         normalize_length=target_time_bins
     )
     
-    # Detect high-energy regions in spectrum
-    # Strategy: look for temporally compact high-energy patterns
+    # Create log-scaled spectrum for visualization (improved display)
+    epsilon = 1e-10
+    spectrum_log = np.log1p(spectrum / (np.percentile(spectrum[spectrum > 0], 5) + epsilon)) if np.any(spectrum > 0) else spectrum.copy()
     
-    # 1. Threshold spectrum at percentile
-    threshold = np.percentile(spectrum, energy_threshold * 100)
+    # ===== IMPROVED ENERGY-BASED DETECTION =====
+    # Strategy: Combine global percentile threshold with local contrast analysis
+    # This allows detection of events that are locally prominent even if not globally highest
+    
+    # 1. Threshold spectrum at percentile (adjusted by sensitivity)
+    # Lower sensitivity = lower percentile threshold = more sensitive detection
+    adjusted_energy_threshold = energy_threshold * sensitivity
+    adjusted_energy_threshold = np.clip(adjusted_energy_threshold, 0.3, 0.95)  # Keep in reasonable range
+    threshold = np.percentile(spectrum, adjusted_energy_threshold * 100)
     high_energy_mask = spectrum > threshold
     
     # 2. Compute time-integrated energy (sum over frequency at each time bin)
     time_energy = np.sum(spectrum, axis=0)
     
-    # 3. Detect active time regions using energy profile
-    # Normalize energy
+    # 3. Compute local contrast energy for improved detection
+    # This helps detect events that stand out locally even if not highest globally
+    local_window_size = max(5, target_time_bins // 20)  # About 5% of signal for local context
+    local_contrast = _compute_local_energy_contrast(time_energy, local_window_size)
+    
+    # 4. Detect active time regions using combined global and local criteria
+    # Normalize both energy metrics
     if np.max(time_energy) > 0:
         time_energy_norm = time_energy / np.max(time_energy)
     else:
         time_energy_norm = time_energy
     
-    # Find regions where energy exceeds a threshold
-    # Use adaptive threshold based on signal characteristics
-    energy_mean = np.mean(time_energy_norm)
-    energy_std = np.std(time_energy_norm)
-    adaptive_threshold = energy_mean + adaptive_threshold_factor * energy_std  # Configurable sensitivity
+    if np.max(local_contrast) > 0:
+        local_contrast_norm = local_contrast / np.max(local_contrast)
+    else:
+        local_contrast_norm = local_contrast
     
-    active_time_bins = time_energy_norm > adaptive_threshold
+    # Combine global and local energy metrics
+    # Weight can be adjusted by user (local_contrast_weight)
+    combined_energy = (1 - local_contrast_weight) * time_energy_norm + local_contrast_weight * local_contrast_norm
     
-    # 4. Find contiguous active regions using connected component analysis
+    # Compute adaptive threshold based on signal characteristics and sensitivity
+    # Sensitivity inversely affects the threshold:
+    # - sensitivity < 1.0: lower threshold, more sensitive (detects weaker events)
+    # - sensitivity > 1.0: higher threshold, more strict (only strong events)
+    energy_mean = np.mean(combined_energy)
+    energy_std = np.std(combined_energy)
+    
+    # Adjust threshold factor based on sensitivity
+    # Lower sensitivity = lower threshold = more events detected
+    adjusted_threshold_factor = adaptive_threshold_factor * sensitivity
+    adaptive_threshold = energy_mean + adjusted_threshold_factor * energy_std
+    
+    # Ensure threshold is reasonable (not too low or too high)
+    # At minimum, threshold should be above noise floor (e.g., 10th percentile)
+    # At maximum, should not exceed median to allow some detections
+    min_threshold = np.percentile(combined_energy, 10)
+    max_threshold = np.percentile(combined_energy, 70)
+    adaptive_threshold = np.clip(adaptive_threshold, min_threshold, max_threshold)
+    
+    active_time_bins = combined_energy > adaptive_threshold
+    
+    # 5. Find contiguous active regions using connected component analysis
     # Convert boolean mask to segments
     segments_in_bins = []
     in_segment = False
@@ -3173,8 +3228,12 @@ def detect_activity_hht(
     if in_segment:
         segments_in_bins.append((start_bin, len(active_time_bins)))
     
-    # 5. Filter segments by temporal compactness
+    # 6. Filter segments by temporal compactness
     # Check if high-energy patterns are compact within detected regions
+    # Adjust compactness threshold based on sensitivity
+    adjusted_compactness = temporal_compactness / sensitivity
+    adjusted_compactness = np.clip(adjusted_compactness, 0.1, 0.8)  # Keep reasonable
+    
     filtered_segments = []
     for start_bin, end_bin in segments_in_bins:
         segment_length = end_bin - start_bin
@@ -3186,10 +3245,10 @@ def detect_activity_hht(
         has_high_energy = np.any(segment_mask, axis=0)  # Time bins with any high energy
         compactness = np.sum(has_high_energy) / segment_length
         
-        if compactness >= temporal_compactness:
+        if compactness >= adjusted_compactness:
             filtered_segments.append((start_bin, end_bin))
     
-    # 6. Map time bins back to original signal indices
+    # 7. Map time bins back to original signal indices
     # Time bins correspond to normalized time axis
     bin_to_sample_ratio = signal_length / target_time_bins
     
@@ -3204,7 +3263,7 @@ def detect_activity_hht(
         
         segments_in_samples.append((start_sample, end_sample))
     
-    # 7. Apply duration constraints
+    # 8. Apply duration constraints
     min_samples = int(min_duration * fs)
     segments_filtered = []
     
@@ -3219,17 +3278,37 @@ def detect_activity_hht(
         if max_duration is not None and max_duration > min_duration:
             max_samples = int(max_duration * fs)
             if duration_samples > max_samples:
-                # Split into multiple segments
-                for split_start in range(start, end, max_samples):
-                    split_end = min(split_start + max_samples, end)
-                    if split_end - split_start >= min_samples:
-                        segments_filtered.append((split_start, split_end))
+                # Split into multiple segments at energy minima
+                segment_energy = time_energy_norm[int(start / bin_to_sample_ratio):int(end / bin_to_sample_ratio)]
+                if len(segment_energy) > 1:
+                    # Find local minima for natural split points
+                    split_points = _find_energy_split_points(
+                        data[start:end], fs, max_samples, min_samples
+                    )
+                    
+                    if split_points:
+                        prev_split = 0
+                        for sp in split_points:
+                            if sp - prev_split >= min_samples:
+                                segments_filtered.append((start + prev_split, start + sp))
+                            prev_split = sp
+                        # Add final segment
+                        if end - start - prev_split >= min_samples:
+                            segments_filtered.append((start + prev_split, end))
+                    else:
+                        # Fallback: simple uniform split
+                        for split_start in range(start, end, max_samples):
+                            split_end = min(split_start + max_samples, end)
+                            if split_end - split_start >= min_samples:
+                                segments_filtered.append((split_start, split_end))
+                else:
+                    segments_filtered.append((start, end))
             else:
                 segments_filtered.append((start, end))
         else:
             segments_filtered.append((start, end))
     
-    # 8. Merge nearby segments (optional, similar to PELT merging)
+    # 9. Merge nearby segments with energy-aware logic
     # Merge segments with configurable gap
     merge_gap_samples = int(merge_gap_ms / 1000.0 * fs)
     if len(segments_filtered) > 1:
@@ -3239,8 +3318,14 @@ def detect_activity_hht(
             gap = start - last_end
             
             if gap <= merge_gap_samples:
-                # Merge with previous
-                merged_segments[-1] = (last_start, end)
+                # Check if the merged segment would exceed max_duration
+                merged_duration = end - last_start
+                if max_duration is None or merged_duration <= int(max_duration * fs):
+                    # Merge with previous
+                    merged_segments[-1] = (last_start, end)
+                else:
+                    # Don't merge if it would exceed max duration
+                    merged_segments.append((start, end))
             else:
                 merged_segments.append((start, end))
         segments_filtered = merged_segments
@@ -3252,14 +3337,127 @@ def detect_activity_hht(
         for start_bin, end_bin in filtered_segments:
             detection_mask[:, start_bin:end_bin] = True
         
+        # Threshold information for debugging/display
+        threshold_info = {
+            'global_threshold': threshold,
+            'adaptive_threshold': adaptive_threshold,
+            'sensitivity': sensitivity,
+            'adjusted_energy_threshold': adjusted_energy_threshold,
+            'adjusted_compactness': adjusted_compactness,
+            'energy_mean': energy_mean,
+            'energy_std': energy_std
+        }
+        
         return {
             'segments': segments_filtered,
             'spectrum': spectrum,
+            'spectrum_log': spectrum_log,
             'time': time_axis,
             'frequency': freq_axis,
             'detection_mask': detection_mask,
             'time_energy': time_energy,
-            'active_time_bins': active_time_bins
+            'combined_energy': combined_energy,
+            'active_time_bins': active_time_bins,
+            'threshold_info': threshold_info
         }
     else:
         return segments_filtered
+
+
+def _compute_local_energy_contrast(energy_profile: np.ndarray, window_size: int) -> np.ndarray:
+    """
+    Compute local energy contrast for each time bin.
+    
+    This measures how much the energy at each time point stands out compared
+    to its local neighborhood. High values indicate locally prominent events.
+    
+    Parameters:
+    -----------
+    energy_profile : np.ndarray
+        Time-integrated energy at each time bin
+    window_size : int
+        Size of local window for computing neighborhood statistics
+    
+    Returns:
+    --------
+    np.ndarray
+        Local contrast values (same length as energy_profile)
+    """
+    n = len(energy_profile)
+    contrast = np.zeros(n)
+    
+    for i in range(n):
+        # Define local window
+        start = max(0, i - window_size)
+        end = min(n, i + window_size + 1)
+        
+        # Local neighborhood statistics (excluding center)
+        neighborhood = np.concatenate([energy_profile[start:i], energy_profile[i+1:end]])
+        
+        if len(neighborhood) > 0:
+            local_mean = np.mean(neighborhood)
+            local_std = np.std(neighborhood) + 1e-10
+            
+            # Contrast: how many std above local mean
+            contrast[i] = max(0, (energy_profile[i] - local_mean) / local_std)
+    
+    return contrast
+
+
+def _find_energy_split_points(
+    segment_data: np.ndarray,
+    fs: float,
+    max_samples: int,
+    min_samples: int
+) -> List[int]:
+    """
+    Find optimal split points for long segments based on energy minima.
+    
+    Parameters:
+    -----------
+    segment_data : np.ndarray
+        Signal data for the segment
+    fs : float
+        Sampling frequency
+    max_samples : int
+        Maximum segment length
+    min_samples : int
+        Minimum segment length
+    
+    Returns:
+    --------
+    List[int]
+        List of split point indices within the segment
+    """
+    # Compute RMS envelope
+    window_size = int(fs / 10)  # 100ms window
+    if window_size < 1:
+        window_size = 1
+    kernel = np.ones(window_size) / window_size
+    rms_envelope = np.sqrt(np.convolve(segment_data ** 2, kernel, mode='same'))
+    
+    split_points = []
+    segment_length = len(segment_data)
+    
+    if segment_length <= max_samples:
+        return []
+    
+    # Find local minima as potential split points
+    current_pos = 0
+    while current_pos + max_samples < segment_length:
+        # Look for minimum in the region around max_samples
+        search_start = max(current_pos + min_samples, current_pos + max_samples // 2)
+        search_end = min(current_pos + max_samples + max_samples // 2, segment_length - min_samples)
+        
+        if search_end <= search_start:
+            # Fallback: just split at max_samples
+            split_points.append(current_pos + max_samples)
+            current_pos = current_pos + max_samples
+        else:
+            # Find minimum energy point
+            search_region = rms_envelope[search_start:search_end]
+            min_idx = np.argmin(search_region) + search_start
+            split_points.append(min_idx)
+            current_pos = min_idx
+    
+    return split_points
