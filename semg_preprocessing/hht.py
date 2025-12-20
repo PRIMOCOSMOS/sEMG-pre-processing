@@ -68,6 +68,13 @@ def _compute_choi_williams_distribution(
         - cwd: Choi-Williams Distribution (freq_bins x time_bins)
         - time_axis: Time axis in seconds
         - freq_axis: Frequency axis in Hz
+    
+    Raises:
+    -------
+    ValueError
+        If signal is empty, too short, or parameters are invalid
+    RuntimeError
+        If CWD computation encounters numerical issues
         
     References:
     -----------
@@ -75,60 +82,111 @@ def _compute_choi_williams_distribution(
     of multicomponent signals using exponential kernels." IEEE Transactions on
     Acoustics, Speech, and Signal Processing, 37(6), 862-871.
     """
+    # Input validation
+    if signal is None or len(signal) == 0:
+        raise ValueError("Signal cannot be None or empty")
+    
+    if not isinstance(signal, np.ndarray):
+        signal = np.array(signal)
+    
+    if signal.ndim != 1:
+        raise ValueError(f"Signal must be 1D array, got {signal.ndim}D")
+    
     n_samples = len(signal)
     
+    # Require minimum signal length for meaningful CWD computation
+    MIN_SIGNAL_LENGTH = 16  # Minimum samples for meaningful frequency analysis
+    if n_samples < MIN_SIGNAL_LENGTH:
+        raise ValueError(f"Signal too short ({n_samples} samples), need at least {MIN_SIGNAL_LENGTH}")
+    
+    # Validate sampling frequency
+    if fs <= 0:
+        raise ValueError(f"Sampling frequency must be positive, got {fs}")
+    
+    # Validate sigma
+    if sigma <= 0:
+        raise ValueError(f"Sigma must be positive, got {sigma}")
+    
+    # Set default bin counts with reasonable bounds
     if n_freq_bins is None:
-        n_freq_bins = n_samples
+        n_freq_bins = min(n_samples, 512)  # Cap at 512 for efficiency
+    else:
+        n_freq_bins = max(4, min(n_freq_bins, n_samples))  # Ensure reasonable range
+    
     if n_time_bins is None:
-        n_time_bins = n_samples
+        n_time_bins = min(n_samples, 512)  # Cap at 512 for efficiency
+    else:
+        n_time_bins = max(1, min(n_time_bins, n_samples))  # Ensure reasonable range
+    
+    # Check for signal energy - avoid processing zero/near-zero signals
+    signal_energy = np.sum(signal ** 2)
+    if signal_energy < EPSILON:
+        raise ValueError("Signal has insufficient energy for CWD analysis")
     
     # Time and frequency axes
-    time_axis = np.arange(n_time_bins) / fs
-    freq_axis = np.fft.fftfreq(n_freq_bins, 1/fs)[:n_freq_bins//2]
+    try:
+        time_axis = np.arange(n_time_bins) / fs
+        freq_axis = np.fft.fftfreq(n_freq_bins, 1/fs)[:n_freq_bins//2]
+    except Exception as e:
+        raise RuntimeError(f"Failed to create time/frequency axes: {e}")
     
     # Initialize CWD matrix
     cwd = np.zeros((n_freq_bins//2, n_time_bins))
     
     # Compute analytic signal for complex conjugate
-    analytic = hilbert(signal)
+    try:
+        analytic = hilbert(signal)
+    except Exception as e:
+        raise RuntimeError(f"Hilbert transform failed: {e}")
+    
+    # Validate analytic signal
+    if not np.all(np.isfinite(analytic)):
+        raise RuntimeError("Hilbert transform produced non-finite values")
     
     # For computational efficiency, we use the Wigner-Ville distribution
     # with Choi-Williams kernel applied in the ambiguity domain
-    for t_idx in range(n_time_bins):
-        # Map to signal index
-        t = int(t_idx * n_samples / n_time_bins)
-        t = min(t, n_samples - 1)
-        
-        # Compute instantaneous autocorrelation function
-        max_tau = min(t, n_samples - 1 - t, n_freq_bins // 2)
-        
-        if max_tau > 0:
-            autocorr = np.zeros(2 * max_tau + 1, dtype=complex)
+    try:
+        for t_idx in range(n_time_bins):
+            # Map to signal index
+            t = int(t_idx * n_samples / n_time_bins)
+            t = min(t, n_samples - 1)
             
-            for tau_idx, tau in enumerate(range(-max_tau, max_tau + 1)):
-                if 0 <= t + tau < n_samples and 0 <= t - tau < n_samples:
-                    # Apply Choi-Williams kernel: exp(-τ²/(4σ))
-                    # For instantaneous autocorrelation (θ = 0)
-                    kernel_weight = np.exp(-tau**2 / (4.0 * sigma))
-                    autocorr[tau_idx] = (analytic[t + tau] * 
-                                        np.conj(analytic[t - tau]) * 
-                                        kernel_weight)
+            # Compute instantaneous autocorrelation function
+            max_tau = min(t, n_samples - 1 - t, n_freq_bins // 2)
             
-            # Fourier transform to get frequency content
-            # Resize or zero-pad to n_freq_bins
-            if len(autocorr) <= n_freq_bins:
-                # Zero-pad
-                autocorr_padded = np.zeros(n_freq_bins, dtype=complex)
-                start_idx = (n_freq_bins - len(autocorr)) // 2
-                autocorr_padded[start_idx:start_idx + len(autocorr)] = autocorr
-            else:
-                # Truncate to n_freq_bins
-                start_idx = (len(autocorr) - n_freq_bins) // 2
-                autocorr_padded = autocorr[start_idx:start_idx + n_freq_bins]
-            
-            # FFT and take real positive frequencies
-            freq_content = np.fft.fft(autocorr_padded)
-            cwd[:, t_idx] = np.abs(freq_content[:n_freq_bins//2])
+            if max_tau > 0:
+                autocorr = np.zeros(2 * max_tau + 1, dtype=complex)
+                
+                for tau_idx, tau in enumerate(range(-max_tau, max_tau + 1)):
+                    if 0 <= t + tau < n_samples and 0 <= t - tau < n_samples:
+                        # Apply Choi-Williams kernel: exp(-τ²/(4σ))
+                        # For instantaneous autocorrelation (θ = 0)
+                        kernel_weight = np.exp(-tau**2 / (4.0 * sigma))
+                        autocorr[tau_idx] = (analytic[t + tau] * 
+                                            np.conj(analytic[t - tau]) * 
+                                            kernel_weight)
+                
+                # Fourier transform to get frequency content
+                # Resize or zero-pad to n_freq_bins
+                if len(autocorr) <= n_freq_bins:
+                    # Zero-pad
+                    autocorr_padded = np.zeros(n_freq_bins, dtype=complex)
+                    start_idx = (n_freq_bins - len(autocorr)) // 2
+                    autocorr_padded[start_idx:start_idx + len(autocorr)] = autocorr
+                else:
+                    # Truncate to n_freq_bins
+                    start_idx = (len(autocorr) - n_freq_bins) // 2
+                    autocorr_padded = autocorr[start_idx:start_idx + n_freq_bins]
+                
+                # FFT and take real positive frequencies
+                freq_content = np.fft.fft(autocorr_padded)
+                cwd[:, t_idx] = np.abs(freq_content[:n_freq_bins//2])
+    except Exception as e:
+        raise RuntimeError(f"CWD computation loop failed: {e}")
+    
+    # Validate output
+    if not np.all(np.isfinite(cwd)):
+        raise RuntimeError("CWD contains non-finite values")
     
     return cwd, time_axis, freq_axis
 
@@ -1445,51 +1503,85 @@ def extract_semg_features(
     #
     # Physical meaning: IMNF represents the time-varying center frequency of the signal,
     # which decreases with muscle fatigue as the power spectrum shifts to lower frequencies.
+    
+    # Initialize IMNF to MNF as safe default
+    imnf = mnf
+    
+    # Attempt CWD-based IMNF calculation with robust error handling
     try:
-        # Compute Choi-Williams Distribution
-        # Use reduced resolution for computational efficiency
-        n_time_cwd = min(128, n_samples)
-        n_freq_cwd = min(256, n_samples)
-        
-        cwd, time_cwd, freq_cwd = _compute_choi_williams_distribution(
-            signal, fs, sigma=1.0, 
-            n_freq_bins=n_freq_cwd, 
-            n_time_bins=n_time_cwd
-        )
-        
-        # Filter to valid sEMG frequency range
-        freq_mask_cwd = (freq_cwd >= SEMG_LOW_FREQ_CUTOFF) & (freq_cwd <= SEMG_HIGH_FREQ_CUTOFF)
-        valid_freqs_cwd = freq_cwd[freq_mask_cwd]
-        valid_cwd = cwd[freq_mask_cwd, :]
-        
-        # Compute instantaneous mean frequency at each time point
-        # IMF(t) = ∫ f · CWD(f,t) df / ∫ CWD(f,t) df
-        inst_mean_freqs = []
-        for t_idx in range(valid_cwd.shape[1]):
-            power_at_t = valid_cwd[:, t_idx]
-            total_power_at_t = np.sum(power_at_t)
-            if total_power_at_t > EPSILON:
-                imf_at_t = np.sum(valid_freqs_cwd * power_at_t) / total_power_at_t
-                inst_mean_freqs.append(imf_at_t)
-        
-        # IMNF = time-averaged instantaneous mean frequency
-        # Weight by total power at each time point for robust averaging
-        if len(inst_mean_freqs) > 0:
-            time_weights = np.sum(valid_cwd, axis=0)
-            total_weight = np.sum(time_weights)
-            if total_weight > EPSILON:
-                imnf = np.average(inst_mean_freqs, weights=time_weights)
-            else:
-                imnf = np.mean(inst_mean_freqs)
-            
-            # Ensure reasonable frequency range
-            imnf = np.clip(imnf, SEMG_LOW_FREQ_CUTOFF, SEMG_HIGH_FREQ_CUTOFF)
+        # Check signal length requirement for CWD
+        MIN_CWD_SAMPLES = 16  # Minimum samples for meaningful CWD
+        if n_samples < MIN_CWD_SAMPLES:
+            # Signal too short for CWD, use MNF directly
+            pass
         else:
-            imnf = mnf  # Fallback to MNF
+            # Compute Choi-Williams Distribution
+            # Use reduced resolution for computational efficiency
+            # Ensure minimum resolution while capping at signal length
+            n_time_cwd = max(32, min(128, n_samples))  # At least 32 time bins
+            n_freq_cwd = max(64, min(256, n_samples))  # At least 64 freq bins
             
+            try:
+                cwd, time_cwd, freq_cwd = _compute_choi_williams_distribution(
+                    signal, fs, sigma=1.0, 
+                    n_freq_bins=n_freq_cwd, 
+                    n_time_bins=n_time_cwd
+                )
+            except (ValueError, RuntimeError) as cwd_error:
+                # Specific CWD computation error - log and use MNF fallback
+                # In production, this would log: f"CWD computation failed: {cwd_error}"
+                pass
+            else:
+                # CWD computed successfully, now extract IMNF
+                # Filter to valid sEMG frequency range
+                freq_mask_cwd = (freq_cwd >= SEMG_LOW_FREQ_CUTOFF) & (freq_cwd <= SEMG_HIGH_FREQ_CUTOFF)
+                valid_freqs_cwd = freq_cwd[freq_mask_cwd]
+                valid_cwd = cwd[freq_mask_cwd, :]
+                
+                # Verify we have valid frequency bins
+                if len(valid_freqs_cwd) == 0 or valid_cwd.shape[0] == 0:
+                    # No valid frequency bins in sEMG range
+                    pass
+                else:
+                    # Compute instantaneous mean frequency at each time point
+                    # IMF(t) = ∫ f · CWD(f,t) df / ∫ CWD(f,t) df
+                    inst_mean_freqs = []
+                    for t_idx in range(valid_cwd.shape[1]):
+                        power_at_t = valid_cwd[:, t_idx]
+                        total_power_at_t = np.sum(power_at_t)
+                        if total_power_at_t > EPSILON:
+                            imf_at_t = np.sum(valid_freqs_cwd * power_at_t) / total_power_at_t
+                            # Validate computed IMF value
+                            if np.isfinite(imf_at_t) and SEMG_LOW_FREQ_CUTOFF <= imf_at_t <= SEMG_HIGH_FREQ_CUTOFF:
+                                inst_mean_freqs.append(imf_at_t)
+                    
+                    # IMNF = time-averaged instantaneous mean frequency
+                    # Weight by total power at each time point for robust averaging
+                    if len(inst_mean_freqs) > 0:
+                        time_weights = np.sum(valid_cwd, axis=0)
+                        # Only use weights for time points where we computed valid IMF
+                        # This requires matching lengths
+                        if len(time_weights) >= len(inst_mean_freqs):
+                            # Trim weights to match inst_mean_freqs if needed
+                            time_weights = time_weights[:len(inst_mean_freqs)]
+                        
+                        total_weight = np.sum(time_weights)
+                        if total_weight > EPSILON:
+                            imnf_candidate = np.average(inst_mean_freqs, weights=time_weights)
+                        else:
+                            imnf_candidate = np.mean(inst_mean_freqs)
+                        
+                        # Validate final IMNF value
+                        if np.isfinite(imnf_candidate):
+                            # Ensure reasonable frequency range
+                            imnf = np.clip(imnf_candidate, SEMG_LOW_FREQ_CUTOFF, SEMG_HIGH_FREQ_CUTOFF)
+                        # else: keep imnf = mnf (default)
+                    # else: keep imnf = mnf (no valid instantaneous frequencies computed)
     except Exception as e:
-        # Fallback to MNF if CWD-based calculation fails
-        imnf = mnf
+        # Catch-all for any unexpected errors
+        # In production, this would log: f"Unexpected error in IMNF calculation: {e}"
+        # Keep imnf = mnf (already set as default)
+        pass
     
     # 9. WIRE51 - Wavelet Index of Reliability Estimation
     # 

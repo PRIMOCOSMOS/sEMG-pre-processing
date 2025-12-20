@@ -26,11 +26,11 @@ HHT_ADAPTIVE_THRESHOLD_FACTOR = 0.3  # Factor for adaptive energy threshold - lo
 HHT_MERGE_GAP_MS = 50  # Gap in milliseconds for merging nearby segments
 
 # HHT algorithm parameters - thresholds and bounds
-HHT_MIN_ENERGY_THRESHOLD = 0.3  # Minimum allowed adjusted energy threshold (percentile)
+HHT_MIN_ENERGY_THRESHOLD = 0.1  # Minimum allowed adjusted energy threshold (percentile) - EXTENDED for extreme cases
 HHT_MAX_ENERGY_THRESHOLD = 0.95  # Maximum allowed adjusted energy threshold (percentile)
-HHT_NOISE_FLOOR_PERCENTILE = 5  # Percentile for minimum adaptive threshold (noise floor)
-HHT_MAX_THRESHOLD_PERCENTILE = 60  # Percentile for maximum adaptive threshold
-HHT_MIN_COMPACTNESS = 0.1  # Minimum allowed temporal compactness
+HHT_NOISE_FLOOR_PERCENTILE = 3  # Percentile for minimum adaptive threshold (noise floor) - LOWERED for extreme sensitivity
+HHT_MAX_THRESHOLD_PERCENTILE = 70  # Percentile for maximum adaptive threshold - INCREASED for wider range
+HHT_MIN_COMPACTNESS = 0.05  # Minimum allowed temporal compactness - LOWERED for broader detection
 HHT_MAX_COMPACTNESS = 0.8  # Maximum allowed temporal compactness
 HHT_LOCAL_WINDOW_MIN_SIZE = 5  # Minimum size for local contrast window
 HHT_LOCAL_WINDOW_FRACTION = 20  # Fraction of signal for local context (1/20 = 5%)
