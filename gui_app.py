@@ -2260,9 +2260,9 @@ def create_gui():
                                     info="Lower = detect more events (0.5=sensitive), Higher = stricter (2.0=strict)"
                                 )
                                 hht_energy_threshold_input = gr.Slider(
-                                    0.5, 0.9, value=0.65, step=0.05,
+                                    0.1, 0.95, value=0.65, step=0.05,
                                     label="Energy Threshold Percentile",
-                                    info="Only for HHT. Higher = more selective detection (0.5-0.9)"
+                                    info="Extended range: 0.1=very sensitive, 0.95=very strict"
                                 )
                                 hht_local_contrast_weight_input = gr.Slider(
                                     0.0, 0.7, value=0.3, step=0.1,
@@ -2368,9 +2368,9 @@ def create_gui():
                                     info="Lower = detect more events, Higher = stricter"
                                 )
                                 batch_hht_energy_threshold_input = gr.Slider(
-                                    0.5, 0.9, value=0.65, step=0.05,
+                                    0.1, 0.95, value=0.65, step=0.05,
                                     label="Energy Threshold Percentile",
-                                    info="Only for HHT. Higher = more selective"
+                                    info="Extended range: 0.1=very sensitive, 0.95=very strict"
                                 )
                                 batch_hht_local_contrast_weight_input = gr.Slider(
                                     0.0, 0.7, value=0.3, step=0.1,
