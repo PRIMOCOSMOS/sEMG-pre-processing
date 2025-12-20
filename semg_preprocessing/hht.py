@@ -17,6 +17,13 @@ from scipy.interpolate import interp1d
 DEFAULT_CEEMDAN_ENSEMBLES = 30  # Default number of ensembles for CEEMDAN (30 for speed, 50 for accuracy)
 EPSILON = 1e-10  # Small value for numerical stability (avoiding division by zero)
 
+# CWD computation constants
+MIN_CWD_SIGNAL_LENGTH = 16  # Minimum signal length for meaningful CWD analysis
+MIN_CWD_TIME_BINS = 32  # Minimum time resolution for CWD
+DEFAULT_CWD_TIME_BINS = 128  # Default time resolution for CWD
+MIN_CWD_FREQ_BINS = 64  # Minimum frequency resolution for CWD
+DEFAULT_CWD_FREQ_BINS = 256  # Default frequency resolution for CWD
+
 # sEMG frequency filtering constants
 SEMG_LOW_FREQ_CUTOFF = 20.0  # Hz - Exclude DC and low-freq artifacts (motion, baseline drift)
                               # sEMG content is typically in 20-450 Hz range
@@ -95,9 +102,8 @@ def _compute_choi_williams_distribution(
     n_samples = len(signal)
     
     # Require minimum signal length for meaningful CWD computation
-    MIN_SIGNAL_LENGTH = 16  # Minimum samples for meaningful frequency analysis
-    if n_samples < MIN_SIGNAL_LENGTH:
-        raise ValueError(f"Signal too short ({n_samples} samples), need at least {MIN_SIGNAL_LENGTH}")
+    if n_samples < MIN_CWD_SIGNAL_LENGTH:
+        raise ValueError(f"Signal too short ({n_samples} samples), need at least {MIN_CWD_SIGNAL_LENGTH}")
     
     # Validate sampling frequency
     if fs <= 0:
@@ -1510,16 +1516,15 @@ def extract_semg_features(
     # Attempt CWD-based IMNF calculation with robust error handling
     try:
         # Check signal length requirement for CWD
-        MIN_CWD_SAMPLES = 16  # Minimum samples for meaningful CWD
-        if n_samples < MIN_CWD_SAMPLES:
+        if n_samples < MIN_CWD_SIGNAL_LENGTH:
             # Signal too short for CWD, use MNF directly
             pass
         else:
             # Compute Choi-Williams Distribution
             # Use reduced resolution for computational efficiency
             # Ensure minimum resolution while capping at signal length
-            n_time_cwd = max(32, min(128, n_samples))  # At least 32 time bins
-            n_freq_cwd = max(64, min(256, n_samples))  # At least 64 freq bins
+            n_time_cwd = max(MIN_CWD_TIME_BINS, min(DEFAULT_CWD_TIME_BINS, n_samples))
+            n_freq_cwd = max(MIN_CWD_FREQ_BINS, min(DEFAULT_CWD_FREQ_BINS, n_samples))
             
             try:
                 cwd, time_cwd, freq_cwd = _compute_choi_williams_distribution(
@@ -1546,6 +1551,8 @@ def extract_semg_features(
                     # Compute instantaneous mean frequency at each time point
                     # IMF(t) = ∫ f · CWD(f,t) df / ∫ CWD(f,t) df
                     inst_mean_freqs = []
+                    valid_time_indices = []  # Track which time indices have valid IMF
+                    
                     for t_idx in range(valid_cwd.shape[1]):
                         power_at_t = valid_cwd[:, t_idx]
                         total_power_at_t = np.sum(power_at_t)
@@ -1554,17 +1561,16 @@ def extract_semg_features(
                             # Validate computed IMF value
                             if np.isfinite(imf_at_t) and SEMG_LOW_FREQ_CUTOFF <= imf_at_t <= SEMG_HIGH_FREQ_CUTOFF:
                                 inst_mean_freqs.append(imf_at_t)
+                                valid_time_indices.append(t_idx)
                     
                     # IMNF = time-averaged instantaneous mean frequency
                     # Weight by total power at each time point for robust averaging
                     if len(inst_mean_freqs) > 0:
-                        time_weights = np.sum(valid_cwd, axis=0)
-                        # Only use weights for time points where we computed valid IMF
-                        # This requires matching lengths
-                        if len(time_weights) >= len(inst_mean_freqs):
-                            # Trim weights to match inst_mean_freqs if needed
-                            time_weights = time_weights[:len(inst_mean_freqs)]
+                        # Extract weights only for time points where we computed valid IMF
+                        all_time_weights = np.sum(valid_cwd, axis=0)
+                        time_weights = all_time_weights[valid_time_indices]
                         
+                        # Now weights and inst_mean_freqs have matching lengths
                         total_weight = np.sum(time_weights)
                         if total_weight > EPSILON:
                             imnf_candidate = np.average(inst_mean_freqs, weights=time_weights)
